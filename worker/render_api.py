@@ -60,7 +60,7 @@ def _default_args():
         original_room=None,
         artwork_reference=None,
         output_dir="",
-        provider="bfl",
+        provider="apiyi_gpt_image2_vip",
         erase_dilate_pixels=10,
         seed=None,
         safety_tolerance=None,
@@ -80,7 +80,7 @@ def _default_args():
         finalize_policy="qa_advisory",
         guarantee_final_hd=True,
     )
-def run_pipeline(result_zip: str, output_dir: str, provider: str = "bfl", limit: int | None = None) -> Dict[str, Any]:
+def run_pipeline(result_zip: str, output_dir: str, provider: str = "apiyi_gpt_image2_vip", limit: int | None = None) -> Dict[str, Any]:
     args = _default_args()
     # 调用者覆盖：必要字段 + worker 层有意与脚本默认不同的字段
     args.hanging_zip = str(result_zip)

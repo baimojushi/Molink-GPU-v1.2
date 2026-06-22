@@ -239,9 +239,10 @@ def _qa_quality_score(qa: dict[str, Any] | None) -> float:
 
 
 def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
-    provider_name = str(args.provider or "bfl").strip().lower()
+    provider_name = str(args.provider or "apiyi_gpt_image2_vip").strip().lower()
     provider = build_image_edit_provider(provider_name)
     using_mock_provider = _is_mock_provider(provider_name)
+    using_apiyi_gpt_image2_vip = provider_name in {"apiyi_gpt_image2_vip", "gpt_image2_vip", "gpt-image-2-vip", "apiyi"}
     if using_mock_provider:
         print(_red(MOCK_PROVIDER_WARNING), file=sys.stderr)
     output_dir = Path(args.output_dir).resolve()
@@ -260,13 +261,17 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             "source_zip": str(Path(args.hanging_zip).resolve()),
             "provider": provider_name,
             "provider_warning": MOCK_PROVIDER_WARNING if using_mock_provider else None,
+            "render_provider": provider_name,
+            "cleanup_provider": "bfl_erase_v1" if using_apiyi_gpt_image2_vip else provider_name,
             "started_at_epoch": time.time(),
             "manifest_scope": manifest.get("scope"),
             "manifest_version": manifest.get("version"),
             "input_item_count": len(items),
             "erase_order": "original_room_then_hardpaste_after_erase",
-            "flux2_mask_required": True,
-            "flux2_mask_sent": True,
+            "flux2_mask_required": not using_apiyi_gpt_image2_vip,
+            "flux2_mask_sent": not using_apiyi_gpt_image2_vip,
+            "final_render_mask_required": not using_apiyi_gpt_image2_vip,
+            "final_render_contract": "gpt-image-2-vip /v1/images/edits prompt-constrained edit; API does not support mask inpainting" if using_apiyi_gpt_image2_vip else "masked FLUX.2 edit",
             "outputs": [],
             "errors": [],
             "warnings": ([{
@@ -595,9 +600,17 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                 selected_flux_file_ok = _is_nonempty_image_file(selected_render_result.image)
                 selected_trace = dict(selected_render_result.trace or {})
                 selected_mask_sent = bool(selected_trace.get("mask_sent_to_flux2"))
+                selected_apiyi_gpt_image2_vip = bool(selected_trace.get("apiyi_images_edit_request")) and str(selected_trace.get("provider")) == "apiyi_gpt_image2_vip"
+                selected_mask_enforced_locally = bool(selected_trace.get("mask_enforced_locally") or selected_trace.get("mask_local_composite"))
+                selected_edit_scope_ok = selected_mask_sent or (selected_apiyi_gpt_image2_vip and selected_mask_enforced_locally)
+                selected_edit_scope = (
+                    "mask_sent"
+                    if selected_mask_sent
+                    else ("gpt_image2_vip_mask_local_composite" if selected_mask_enforced_locally else "unmasked_unknown")
+                )
                 allow_qa_advisory_final = finalize_policy in {"qa_advisory", "lax", "always_final"}
                 should_finalize_flux = (
-                    selected_mask_sent
+                    selected_edit_scope_ok
                     and not qa_hard_blocked
                     and (qa_passed or (guarantee_final_hd and allow_qa_advisory_final and selected_flux_file_ok))
                 )
@@ -615,6 +628,10 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                     "guarantee_final_hd": guarantee_final_hd,
                     "selected_flux_file_ok": selected_flux_file_ok,
                     "selected_flux2_mask_sent": selected_mask_sent,
+                    "selected_apiyi_gpt_image2_vip": selected_apiyi_gpt_image2_vip,
+                    "selected_mask_enforced_locally": selected_mask_enforced_locally,
+                    "selected_edit_scope": selected_edit_scope,
+                    "selected_edit_scope_ok": selected_edit_scope_ok,
                     "never_silent_hardpaste_success": True,
                     "hardpaste_delivery_allowed": False,
                 }
@@ -627,7 +644,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                             "asset_id": asset_id,
                             "mode": "flux_qa_advisory_accepted",
                             "message": (
-                                f"FLUX render QA did not pass for {asset_id}, but a masked non-empty Flux render was produced; "
+                                f"Final render QA did not pass for {asset_id}, but a non-empty final render was produced under the configured edit scope; "
                                 "QA is advisory and the render was promoted to final_hd. Severe artwork-identity QA remains a hard gate."
                             ),
                             "qa": selected_render_size_qa,
@@ -645,8 +662,8 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                     production_usable = False
                     aggregate["warnings"].append({
                         "asset_id": asset_id,
-                        "mode": "flux_unavailable_or_strict_gate",
-                        "message": f"No deliverable masked FLUX image was available for {asset_id}; hardpaste preview saved for manual review",
+                        "mode": "final_render_unavailable_or_strict_gate",
+                        "message": f"No deliverable final render was available for {asset_id}; hardpaste preview saved for manual review",
                         "qa": selected_render_size_qa,
                         "qa_hard_block_reasons": qa_hard_block_reasons,
                         "selected_flux2_mask_sent": selected_mask_sent,
@@ -671,6 +688,8 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                     "flux2_input_mode": flux2_input_mode,
                     "render_input_semantics": render_input_semantics,
                     "flux2_mask_sent": selected_mask_sent,
+                    "final_render_edit_scope": selected_edit_scope,
+                    "selected_apiyi_gpt_image2_vip": selected_apiyi_gpt_image2_vip,
                     "flux2_edit_mask_path": str(flux2_edit_mask),
                     "flux2_edit_mask_source": flux2_edit_mask_source,
                     "art_region_mask_usage": "front_region_mask_for_core_qa; flux2_edit_mask sent_to_flux2",
@@ -717,12 +736,12 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def parse_args(argv=None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run official BFL processing for approved hanging assets.")
+    parser = argparse.ArgumentParser(description="Run cleanup + final image render for approved hanging assets.")
     parser.add_argument("--hanging-zip", required=True, help="Zip returned by /analyze_hanging_mvp")
     parser.add_argument("--original-room", default=None, help="Optional original room image override for legacy manifests")
     parser.add_argument("--artwork-reference", default=None, help="Original artwork image override for legacy manifests")
     parser.add_argument("--output-dir", required=True, help="Directory for final_hd images and traces")
-    parser.add_argument("--provider", default="bfl", choices=["bfl", "mock"], help="Use bfl for official API, mock for local dry run")
+    parser.add_argument("--provider", default="apiyi_gpt_image2_vip", choices=["apiyi_gpt_image2_vip", "gpt_image2_vip", "bfl", "mock"], help="Use apiyi_gpt_image2_vip for GPT Image 2 VIP final render, bfl for original FLUX.2 render, mock for dry run")
     parser.add_argument("--erase-dilate-pixels", type=int, default=10)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--safety-tolerance", type=int, default=None)

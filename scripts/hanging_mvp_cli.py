@@ -137,9 +137,10 @@ Artwork Hanging MVP 服务链路
    输入：房间图、Metric3D ZIP、艺术品图、semantics_json、rules_json。
    输出：hanging_v1_result.zip，包含 client_result.json、plan.json、flux_inputs/manifest.json、hard-paste/mask/debug 资产。
 
-4. BFL/mock 图像编辑脚本
+4. GPT Image 2 VIP / BFL / mock 图像编辑脚本
    输入：hanging_v1_result.zip、provider、QA 参数、可选 original-room/artwork-reference。
-   输出：flux_result_bfl 或 mock 目录，包含 edit_trace.json、final_hd/、partial_review/。
+   默认 GPT Image 2 VIP 接口不接收 mask 字段，adapter 会用 flux2_edit_mask 做本地裁剪与回贴，避免整图重绘。
+   输出：flux_result_apiyi_gpt_image2_vip、flux_result_bfl 或 mock 目录，包含 edit_trace.json、final_hd/、partial_review/。
 
 推荐：python3 scripts/hanging_mvp_cli.py run --interactive
 """.strip()
@@ -179,7 +180,7 @@ def _interactive_fill(args: argparse.Namespace) -> argparse.Namespace:
     args.start_services = _prompt_bool("运行前启动/复用本地三项 API", True if args.start_services is None else args.start_services)
     args.skip_bfl = not _prompt_bool("运行 BFL/mock 图像编辑阶段", not args.skip_bfl)
     if not args.skip_bfl:
-        args.provider = _prompt_text("图像编辑 provider bfl/mock", args.provider or "bfl")
+        args.provider = _prompt_text("图像编辑 provider apiyi_gpt_image2_vip/bfl/mock", args.provider or "apiyi_gpt_image2_vip")
         limit_text = _prompt_text("BFL 处理候选数量限制，留空表示全部", "" if args.bfl_limit is None else str(args.bfl_limit))
         args.bfl_limit = int(limit_text) if limit_text else None
         args.dual_ab_compare = _prompt_bool("额外运行 dual A/B 对比渲染", bool(args.dual_ab_compare))
@@ -279,8 +280,8 @@ def run(args: argparse.Namespace) -> None:
         print(f"[done] {output_dir}")
         return
 
-    provider = (args.provider or "bfl").strip().lower()
-    bfl_out = output_dir / ("flux_result_bfl" if provider == "bfl" else "flux_result_mock")
+    provider = (args.provider or "apiyi_gpt_image2_vip").strip().lower()
+    bfl_out = output_dir / ("flux_result_bfl" if provider == "bfl" else ("flux_result_mock" if provider == "mock" else "flux_result_apiyi_gpt_image2_vip"))
     cmd = [
         sys.executable,
         str(ROOT / "scripts" / "run_bfl_hanging_flux_pipeline.py"),
@@ -317,7 +318,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_services.add_argument("--with-auto-update", action="store_true", help="Include auto_update daemon")
     p_services.set_defaults(func=services)
 
-    p_run = sub.add_parser("run", help="Run Metric3D → Semantic → Hanging → optional BFL/mock")
+    p_run = sub.add_parser("run", help="Run Metric3D → Semantic → Hanging → optional final image edit")
     p_run.add_argument("--interactive", action="store_true", help="Prompt for missing paths and parameters")
     p_run.add_argument("--room", help="Room image path")
     p_run.add_argument("--artwork", help="Artwork image path")
@@ -338,9 +339,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.set_defaults(start_services=None)
     p_run.add_argument("--start-auto-update", action="store_true", help="Also start auto_update daemon")
     p_run.add_argument("--skip-bfl", action="store_true", help="Stop after local v1 pipeline")
-    p_run.add_argument("--provider", default="bfl", choices=["bfl", "mock"], help="Image edit provider")
+    p_run.add_argument("--provider", default="apiyi_gpt_image2_vip", choices=["apiyi_gpt_image2_vip", "gpt_image2_vip", "bfl", "mock"], help="Image edit provider")
     p_run.add_argument("--bfl-limit", type=int, default=None, help="Process only first N manifest items")
-    p_run.add_argument("--dual-ab-compare", action="store_true", help="Run extra BFL dual A/B comparison render")
+    p_run.add_argument("--dual-ab-compare", action="store_true", help="Run extra dual A/B comparison render")
     p_run.add_argument("--continue-on-error", action="store_true", help="Continue image edit loop on item errors")
     p_run.set_defaults(func=run)
     return parser

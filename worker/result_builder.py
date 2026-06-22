@@ -197,7 +197,7 @@ def build(
         "partial_review_images": partial_images,
         "error": None,
         "metrics": {
-            "render_provider": (job.get("render") or {}).get("provider", "bfl"),
+            "render_provider": (job.get("render") or {}).get("provider", "apiyi_gpt_image2_vip"),
             "render_elapsed_s": render_aggregate.get("elapsed_s"),
             "production_usable_output_count": usable,
             "final_url_count": final_url_count,

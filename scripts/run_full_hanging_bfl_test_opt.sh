@@ -6,8 +6,8 @@ ROOM="${ROOM:-/root/room-exif.jpg}"
 METRIC_ZIP="${METRIC_ZIP:-}"
 SEMANTICS_JSON="${SEMANTICS_JSON:-}"
 ARTWORK="${ARTWORK:-/root/artwork.png}"
-PROVIDER="${PROVIDER:-bfl}"  # bfl by default; mock requires ALLOW_MOCK=1
-RUN_ID="${RUN_ID:-room-exif_bfl_$(date +%Y%m%d_%H%M%S)}"
+PROVIDER="${PROVIDER:-apiyi_gpt_image2_vip}"  # GPT Image 2 VIP final render by default; mock requires ALLOW_MOCK=1
+RUN_ID="${RUN_ID:-room-exif_render_$(date +%Y%m%d_%H%M%S)}"
 HANGING_RUNS_ROOT="${HANGING_RUNS_ROOT:-/root/autodl-fs/hanging_runs}"
 OUT_ROOT="${OUT_ROOT:-${HANGING_RUNS_ROOT}/${RUN_ID}}"
 HANGING_ZIP="$OUT_ROOT/hanging_v1_result.zip"
@@ -16,7 +16,7 @@ FLUX_OUT="$OUT_ROOT/flux_result"
 cd "$ROOT"
 export PYTHONPATH="$ROOT:${PYTHONPATH:-}"
 [ -f "$ROOT/.env.bfl" ] && source "$ROOT/.env.bfl"
-PROVIDER="${PROVIDER:-bfl}"
+PROVIDER="${PROVIDER:-apiyi_gpt_image2_vip}"
 PROVIDER_LOWER="$(printf '%s' "$PROVIDER" | tr '[:upper:]' '[:lower:]')"
 RED=$'\033[31m'
 RESET=$'\033[0m'
@@ -25,7 +25,7 @@ if [ "$PROVIDER_LOWER" = "mock" ] || [ "$PROVIDER_LOWER" = "dry_run" ] || [ "$PR
     printf '%s\n' "${RED}[ERR] Refusing provider=$PROVIDER in production test script. Set ALLOW_MOCK=1 only for explicit dry-run diagnostics.${RESET}" >&2
     exit 64
   fi
-  printf '%s\n' "${RED}🔴 WARNING: PROVIDER=$PROVIDER is a MOCK/NO-OP dry run. Results are copied inputs, not BFL outputs.${RESET}" >&2
+  printf '%s\n' "${RED}🔴 WARNING: PROVIDER=$PROVIDER is a MOCK/NO-OP dry run. Results are copied inputs, not production image-edit outputs.${RESET}" >&2
 fi
 
 mkdir -p "$OUT_ROOT" "$FLUX_OUT" "$ROOT/logs" "$ROOT/run"

@@ -44,17 +44,16 @@ def render_hanging(
     output_name: str | None = None,
     metadata: Mapping[str, Any] | None = None,
 ) -> ImageEditResult:
-    """Run final FLUX.2 render with an explicit edit mask.
+    """Run final render with an explicit bounded-edit mask.
 
-    The production contract is now: final FLUX.2 may only edit the provided
-    mask region.  The target image remains the deterministic hard-paste canvas,
-    while the mask covers the mounted artwork plus a small edge/shadow band.
-    This prevents whole-image rewrites, duplicated paintings, or restoration of
-    erased people/clutter elsewhere in the room.
+    The production contract is: final rendering may only affect the provided
+    mask region. Providers that support native inpainting may send the mask to
+    the remote model. Providers without a mask field, such as API易 GPT Image 2
+    VIP image-edit, must enforce the same contract locally by crop/composite.
     """
     mask_meta = {
-        "flux2_edit_mask": str(art_mask) if art_mask else None,
-        "usage": "sent_to_flux2_edit_mask_and_used_for_mask_anchored_qa" if art_mask else "missing_required_flux2_edit_mask",
+        "final_edit_mask": str(art_mask) if art_mask else None,
+        "usage": "bounded_final_render_mask_for_provider_and_mask_anchored_qa" if art_mask else "missing_required_final_edit_mask",
     }
     refs = list(references or [])
     if artwork_reference is not None:
@@ -72,6 +71,7 @@ def render_hanging(
                 "task": "render_hanging",
                 "masks": mask_meta,
                 "flux2_mask_sent": bool(art_mask),
+                "final_edit_mask_available": bool(art_mask),
                 **(metadata or {}),
             },
         )

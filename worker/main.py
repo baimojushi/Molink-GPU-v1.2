@@ -248,7 +248,7 @@ class Worker:
                     return
 
                 await self.progress(ws, job, "render", "running", 65, "几何分析完成，正在生成高保真效果图…")
-                render_provider = (job.get("render") or {}).get("provider", "bfl")
+                render_provider = (job.get("render") or {}).get("provider", "apiyi_gpt_image2_vip")
                 limit = (job.get("render") or {}).get("global_limit")
                 flux_out = work_dir / "flux_out"
                 render_aggregate = await asyncio.to_thread(

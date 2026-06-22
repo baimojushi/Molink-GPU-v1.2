@@ -9,13 +9,13 @@ ROOT="${ROOT:-/opt/molink/hanging}"
 # One-command chain:
 #   1. Start required MVP APIs only by default: Metric3D → Semantic → Hanging
 #   2. Run v1 full pipeline
-#   3. Optionally run BFL real API pipeline
+#   3. Optionally run image edit pipeline
 #
 # Flags:
-#   --skip-bfl              skip BFL stage
-#   --bfl-limit N           process only first N BFL manifest items
-#   --dual-ab-compare       add the extra BFL A/B render; default is off to save queue time
-#   --continue-on-error     continue BFL item loop on item errors
+#   --skip-bfl              skip image edit stage
+#   --bfl-limit N           process only first N render manifest items
+#   --dual-ab-compare       add the extra image-edit A/B render; default is off to save queue time
+#   --continue-on-error     continue image-edit item loop on item errors
 #   --no-start-services     assume APIs are already running
 ###############################################################################
 
@@ -86,7 +86,7 @@ echo "  Full Hanging Pipeline"
 echo "  room:     $ROOM_IMAGE"
 echo "  artwork:  $ARTWORK_IMAGE"
 echo "  out_dir:  $OUT_DIR"
-echo "  bfl:      $RUN_BFL"
+echo "  image_edit: $RUN_BFL"
 echo "  dual_ab:  $DUAL_AB_COMPARE"
 echo "=========================================="
 
@@ -141,7 +141,7 @@ bash "$ROOT/scripts/run_v1_full_pipeline.sh" "$ROOM_IMAGE" "$ARTWORK_IMAGE" "$OU
 echo "[ok:v1] pipeline complete"
 
 ###############################################################################
-# Stage 2: BFL real API pipeline
+# Stage 2: GPT Image 2 VIP / BFL image edit pipeline
 ###############################################################################
 HANGING_ZIP="$OUT_DIR/hanging_v1_result.zip"
 if [ ! -f "$HANGING_ZIP" ]; then
@@ -151,25 +151,25 @@ fi
 
 if [ "$RUN_BFL" = false ]; then
   echo ""
-  echo "[2/3] Skipping BFL real API (flag --skip-bfl)"
+  echo "[2/3] Skipping image edit stage (flag --skip-bfl)"
 else
   echo ""
-  echo "[2/3] Running BFL real API pipeline"
+  echo "[2/3] Running image edit pipeline"
 
   BFL_ENV="$ROOT/.env.bfl"
   if [ ! -f "$BFL_ENV" ]; then
-    echo "[warn] .env.bfl not found at $BFL_ENV; skipping BFL real API"
+    echo "[warn] .env.bfl not found at $BFL_ENV; skipping image edit stage"
   else
     set -a
     # shellcheck disable=SC1090
     source "$BFL_ENV"
     set +a
 
-    BFL_DIR="$OUT_DIR/flux_result_bfl"
+    BFL_DIR="$OUT_DIR/flux_result_apiyi_gpt_image2_vip"
     BFL_ARGS=(
       --hanging-zip "$HANGING_ZIP"
       --output-dir "$BFL_DIR"
-      --provider bfl
+      --provider "${PROVIDER:-apiyi_gpt_image2_vip}"
     )
     if [ "$CONTINUE_ON_ERROR" = true ]; then
       BFL_ARGS+=(--continue-on-error)
@@ -185,8 +185,8 @@ else
     fi
 
     python3 "$ROOT/scripts/run_bfl_hanging_flux_pipeline.py" \
-      "${BFL_ARGS[@]}" 2>&1 | tee -a "$OUT_DIR/03_bfl_real.log"
-    echo "[ok:bfl] real API pipeline complete"
+      "${BFL_ARGS[@]}" 2>&1 | tee -a "$OUT_DIR/03_image_edit.log"
+    echo "[ok:image-edit] pipeline complete"
   fi
 fi
 
@@ -223,10 +223,10 @@ if os.path.exists(hanging_zip):
                 score_text = str(score)
             print(f"  {item.get('asset_id')}: score={score_text}")
 
-bfl_trace = os.path.join(out, "flux_result_bfl", "edit_trace.json")
+bfl_trace = os.path.join(out, "flux_result_apiyi_gpt_image2_vip", "edit_trace.json")
 if os.path.exists(bfl_trace):
     t = json.loads(open(bfl_trace, encoding="utf-8").read())
-    print(f"BFL: provider={t.get('provider')}, outputs={len(t.get('outputs', []))}, mask_sent={t.get('flux2_mask_sent')}")
+    print(f"image_edit: provider={t.get('provider')}, outputs={len(t.get('outputs', []))}, final_contract={t.get('final_render_contract')}")
     for o in t.get("outputs", []):
         print(f"  {o.get('asset_id')}: QA={o.get('render_size_qa_status', '?')}")
 PY

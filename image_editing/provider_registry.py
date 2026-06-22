@@ -2,10 +2,13 @@ from __future__ import annotations
 
 from .providers.base import ImageEditProvider
 from .providers.bfl import BflImageEditProvider, MockImageEditProvider
+from .providers.apiyi_gpt_image2 import ApiyiGptImage2VipRenderProvider, APIYI_GPT_IMAGE2_VIP_ALIASES
 
 
 def build_image_edit_provider(name: str) -> ImageEditProvider:
     key = (name or "bfl").strip().lower()
+    if key in APIYI_GPT_IMAGE2_VIP_ALIASES:
+        return ApiyiGptImage2VipRenderProvider.from_env()
     if key in {"bfl", "bfl_official", "bfl_flux2"}:
         return BflImageEditProvider.from_env()
     if key in {"mock", "dry_run", "noop"}:

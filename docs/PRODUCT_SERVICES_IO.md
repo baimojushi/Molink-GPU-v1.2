@@ -7,7 +7,7 @@
 核心产物面向两个使用者：
 
 - 前端/业务端：读取 `client_result.json`，展示候选墙面、安装高度、风险等级和可用预览。
-- 渲染/运营端：读取 `flux_inputs/manifest.json` 和配套图像资产，交给 BFL 或 mock provider 生成最终图。
+- 渲染/运营端：读取 `flux_inputs/manifest.json` 和配套图像资产，交给 API易 GPT Image 2 VIP、BFL 或 mock provider 生成最终图。
 
 ## 服务与脚本输入输出
 
@@ -19,18 +19,18 @@
 | Semantic MVP API | `GET /health`，端口 `6011` | 无 | JSON：状态、VLM 模式、SAM 运行状态 | 语义服务健康检查。 |
 | Semantic MVP API | `POST /parse_semantics_mvp` | `room_image` 房间图；可选 `metric3d_zip`；可选 `semantic_seed_json`；`scene_profile`；`vlm_mode`；`sam_enable`；`sam_refine_labels`；`sam_max_side`；`return_debug_assets` | 默认 JSON：`objects`、`object_inventory`、尺寸、警告；开启 debug 时返回 ZIP：`semantics.json`、`semantic_wall_debug.png` | 单端点支持两种调用：无 `metric3d_zip` 时生成原图坐标的 VLM+SAM seed；带 `metric3d_zip` 和 seed 时跳过 VLM/SAM，只做 Metric3D 坐标对齐和墙面几何后处理。 |
 | Hanging MVP API | `GET /health`，端口 `6010` | 无 | JSON：状态和导出策略 | 悬挂规划服务健康检查。 |
-| Hanging MVP API | `POST /analyze_hanging_mvp` | `room_image`；`metric3d_zip`；`artwork_image`；可选 `artwork_mask`；`semantics_json`；`rules_json` | ZIP：`plan.json`、`client_result.json`、`flux_inputs/manifest.json`、候选 hard-paste 图、mask、prompt、debug 资产 | 选择安全挂画位置，生成前端可读结果和 BFL 输入包。 |
-| BFL 图像编辑流水线 | `python3 scripts/run_bfl_hanging_flux_pipeline.py` | `--hanging-zip`；`--output-dir`；`--provider bfl|mock`；可选 `--original-room`、`--artwork-reference`、QA 参数、`--limit`、`--dual-ab-compare` | 目录：`edit_trace.json`、每个候选的 `edit_trace.json`、`final_hd/`、`partial_review/` | 调用 erase 和 FLUX.2 edit。adapter 对上层是同步阻塞返回；BFL 官方任务本身仍可能在服务端排队。 |
-| 一体化 CLI | `python3 scripts/hanging_mvp_cli.py run` | `--room`；`--artwork`；`--output-dir`；`--rules-json`；`--scene-profile`；`--vlm-mode`；`--sam-enable/--no-sam`；`--skip-bfl`；`--provider`；交互模式可逐项输入 | 同 `run_v1_full_pipeline.sh` 和可选 BFL 输出 | 推荐人机入口。显式路径和参数可通过命令行传入；缺省值可在交互模式中确认。 |
+| Hanging MVP API | `POST /analyze_hanging_mvp` | `room_image`；`metric3d_zip`；`artwork_image`；可选 `artwork_mask`；`semantics_json`；`rules_json` | ZIP：`plan.json`、`client_result.json`、`flux_inputs/manifest.json`、候选 hard-paste 图、mask、prompt、debug 资产 | 选择安全挂画位置，生成前端可读结果和图像编辑输入包。 |
+| 图像编辑流水线 | `python3 scripts/run_bfl_hanging_flux_pipeline.py` | `--hanging-zip`；`--output-dir`；`--provider apiyi_gpt_image2_vip|bfl|mock`；可选 `--original-room`、`--artwork-reference`、QA 参数、`--limit`、`--dual-ab-compare` | 目录：`edit_trace.json`、每个候选的 `edit_trace.json`、`final_hd/`、`partial_review/` | 默认 provider 使用 API易 `gpt-image-2-vip` 的 `/v1/images/edits` 作为最终渲染；cleanup/erase 仍调用 BFL erase-v1。GPT Image 2 VIP 图片编辑接口没有 `mask` 字段，provider 会把 `flux2_edit_mask` 外接框裁成图1，调用接口后再通过原 mask 回贴到完整画布。`bfl` provider 保留原 FLUX.2 edit 回滚路径。 |
+| 一体化 CLI | `python3 scripts/hanging_mvp_cli.py run` | `--room`；`--artwork`；`--output-dir`；`--rules-json`；`--scene-profile`；`--vlm-mode`；`--sam-enable/--no-sam`；`--skip-bfl`；`--provider`；交互模式可逐项输入 | 同 `run_v1_full_pipeline.sh` 和可选 图像编辑输出 | 推荐人机入口。显式路径和参数可通过命令行传入；缺省值可在交互模式中确认。 |
 
 ## 本次启动链路优化
 
 1. 一次性推理默认只启动 `metric3d,semantic,hanging` 三个 API。
 2. `run_v1_full_pipeline.sh` 默认启用局部同步优化：Metric3D `/analyze_geometry` 和 Semantic `/parse_semantics_mvp` 的 VLM+SAM seed 同时发起。Metric3D 返回后，同一个 semantic 端点用 `semantic_seed_json` 快速完成坐标对齐和几何墙面后处理。关闭方式：`SEMANTIC_PARALLEL=false bash scripts/run_v1_full_pipeline.sh ...`。
 3. semantic 服务没有新增 VLM-only/finalize 路由。接口仍是 `/parse_semantics_mvp`，新增可选表单字段 `semantic_seed_json`。无 `metric3d_zip` 的调用输出 `coordinate_space=original`、`semantic_pipeline_stage=raw_original`；带 `metric3d_zip` 和 seed 的调用输出 `coordinate_space=processed`、`semantic_pipeline_stage=final_metric_aligned`。
-4. `run_full_hanging_pipeline.sh` 增加 `--no-start-services`、`--dual-ab-compare`。默认跳过 dual A/B 额外渲染，减少一次 BFL 排队任务。
-5. BFL provider 保持同步阻塞语义：`erase()` 和 `edit()` 提交任务后轮询到结果再返回。这样上层脚本不需要管理异步任务状态。服务端队列由 BFL 控制，客户端不能直接消除；本仓库通过减少非必要任务和把必要任务直连串起来降低总耗时。
-6. 新增 `scripts/hanging_mvp_cli.py`，支持交互式补全房间图、艺术品图、输出目录、VLM/SAM/BFL 参数，减少手写 curl 和多脚本切换。
+4. `run_full_hanging_pipeline.sh` 增加 `--no-start-services`、`--dual-ab-compare`。默认跳过 dual A/B 额外渲染，减少一次额外渲染任务。
+5. 图像编辑 provider 保持同步阻塞语义：`erase()` 和 `edit()` 都在 provider 内完成远端调用并返回本地图片。默认 `apiyi_gpt_image2_vip` provider 使用 BFL erase-v1 做清理，最终 render 调 API易 `/v1/images/edits`。该接口只接收 `model/prompt/image/size`，不接收 `mask/quality/n`；mask 局部重绘由本地 adapter 完成：按 mask bbox 裁剪图1、模型编辑局部 crop、再用原 mask feather 回贴。
+6. 新增 `scripts/hanging_mvp_cli.py`，支持交互式补全房间图、艺术品图、输出目录、VLM/SAM/图像编辑参数，减少手写 curl 和多脚本切换。
 
 ## 推荐命令
 
@@ -50,14 +50,14 @@ python3 scripts/hanging_mvp_cli.py run \
   --skip-bfl
 ```
 
-非交互式，跑 BFL 但不跑额外 dual A/B：
+非交互式，跑默认 GPT Image 2 VIP 最终渲染但不跑额外 dual A/B：
 
 ```bash
 python3 scripts/hanging_mvp_cli.py run \
   --room /path/to/room.jpg \
   --artwork /path/to/artwork.png \
   --output-dir /root/hanging_runs/demo_bfl \
-  --provider bfl
+  --provider apiyi_gpt_image2_vip
 ```
 
 需要 A/B 验证时再显式开启：
@@ -67,7 +67,7 @@ python3 scripts/hanging_mvp_cli.py run \
   --room /path/to/room.jpg \
   --artwork /path/to/artwork.png \
   --output-dir /root/hanging_runs/demo_ab \
-  --provider bfl \
+  --provider apiyi_gpt_image2_vip \
   --dual-ab-compare \
   --bfl-limit 1
 ```
