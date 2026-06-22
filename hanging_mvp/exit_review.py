@@ -1,0 +1,197 @@
+from __future__ import annotations
+
+import base64
+import io
+import json
+import logging
+import os
+import re
+from typing import Any, Mapping
+
+import requests
+from PIL import Image
+
+from .rules_access import rule_value
+
+logger = logging.getLogger(__name__)
+
+
+def _image_array_to_data_url(image_rgb) -> str:
+    img = Image.fromarray(image_rgb.astype("uint8")).convert("RGB")
+    b = io.BytesIO()
+    img.save(b, format="JPEG", quality=92)
+    return "data:image/jpeg;base64," + base64.b64encode(b.getvalue()).decode("utf-8")
+
+
+def _extract_json(text: str) -> dict[str, Any]:
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*", "", text).strip()
+        text = re.sub(r"```$", "", text).strip()
+    try:
+        data = json.loads(text)
+    except Exception:
+        m = re.search(r"\{.*\}", text, flags=re.S)
+        if not m:
+            raise
+        data = json.loads(m.group(0))
+    if not isinstance(data, dict):
+        raise ValueError("review VLM did not return a JSON object")
+    return data
+
+
+def _vlm_configured() -> bool:
+    return bool(os.getenv("VLM_API_URL", "").strip() and os.getenv("VLM_API_KEY", "").strip() and os.getenv("VLM_MODEL", "").strip())
+
+
+def _call_openai_compatible_review(image_rgb, candidate: Mapping[str, Any]) -> dict[str, Any]:
+    api_url = os.getenv("VLM_API_URL", "").strip()
+    api_key = os.getenv("VLM_API_KEY", "").strip()
+    model = os.getenv("VLM_MODEL", "").strip()
+    prompt = {
+        "task": "Review whether this hard-pasted artwork placement is safe to send to final photorealistic Flux rendering.",
+        "candidate": {
+            "candidate_id": candidate.get("candidate_id"),
+            "wall_id": candidate.get("wall_id"),
+            "risk_level": candidate.get("risk_level"),
+            "score": candidate.get("score"),
+            "soft_risk_reasons": candidate.get("soft_risk_reasons", []),
+        },
+        "approve_when": [
+            "artwork is visibly on a solid wall, not on a door, window, mirror, floor, ceiling, person, opening or major obstruction",
+            "artwork is not severely clipped by image boundary",
+            "perspective and scale are plausible enough for a final image edit model to refine",
+        ],
+        "reject_when": [
+            "artwork is placed on a structural object, opening, person or impossible geometry",
+            "major part of the artwork is off-wall or occluded",
+            "hard paste creates an obviously invalid target for final rendering",
+        ],
+        "return_json_only": {"approved": True, "confidence": 0.0, "reasons": ["..."]},
+    }
+    payload = {
+        "model": model,
+        "temperature": 0,
+        "messages": [
+            {"role": "system", "content": "You are a strict visual QA reviewer for wall-art placement. Return JSON only."},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": json.dumps(prompt, ensure_ascii=False)},
+                    {"type": "image_url", "image_url": {"url": _image_array_to_data_url(image_rgb)}},
+                ],
+            },
+        ],
+    }
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    resp = requests.post(api_url, headers=headers, json=payload, timeout=float(os.getenv("VLM_TIMEOUT_S", "120")))
+    resp.raise_for_status()
+    text = resp.json()["choices"][0]["message"]["content"]
+    return _extract_json(text)
+
+
+def review_hardpaste_exit(image_rgb, candidate: Mapping[str, Any], rules: Mapping[str, Any]) -> dict[str, Any]:
+    """Exit gate for hard-pasted assets before they enter Flux rendering.
+
+    Low-risk candidates pass by metadata. High-risk candidates can be reviewed by
+    an OpenAI-compatible VLM when configured. Unreviewed high-risk candidates are
+    blocked by default so the Flux batch script only sees approved hard-pastes.
+    """
+    requires_review = bool(candidate.get("requires_hardpaste_vlm_review"))
+    review_all = bool(rule_value(rules, ["exit_review", "review_all_hardpaste"], False))
+    min_conf = float(rule_value(rules, ["exit_review", "min_vlm_confidence"], 0.55))
+    block_unreviewed = bool(rule_value(rules, ["exit_review", "block_unreviewed_required_vlm"], True))
+    mode = str(rule_value(rules, ["exit_review", "hardpaste_vlm_mode"], os.getenv("HARDPASTE_EXIT_REVIEW_MODE", "auto"))).strip().lower()
+
+    if not requires_review and not review_all:
+        return {
+            "enabled": True,
+            "required": False,
+            "mode": mode,
+            "status": "approved_by_geometry_gate",
+            "approved": True,
+            "approved_for_flux_render": True,
+            "confidence": None,
+            "reasons": [],
+        }
+
+    if mode in {"off", "disabled", "metadata_only"}:
+        approved = not (requires_review and block_unreviewed)
+        return {
+            "enabled": True,
+            "required": requires_review,
+            "mode": mode,
+            "status": "blocked_unreviewed" if not approved else "approved_without_vlm_by_rule",
+            "approved": approved,
+            "approved_for_flux_render": approved,
+            "confidence": None,
+            "reasons": ["vlm_review_disabled"],
+        }
+
+    if not _vlm_configured():
+        approved = not (requires_review and block_unreviewed)
+        return {
+            "enabled": True,
+            "required": requires_review,
+            "mode": mode,
+            "status": "pending_vlm_review_not_configured" if not approved else "approved_without_vlm_no_config",
+            "approved": approved,
+            "approved_for_flux_render": approved,
+            "confidence": None,
+            "reasons": ["VLM_API_URL, VLM_API_KEY and VLM_MODEL are not all configured"],
+        }
+
+    try:
+        data = _call_openai_compatible_review(image_rgb, candidate)
+        confidence = float(data.get("confidence", 0.0) or 0.0)
+        approved = bool(data.get("approved")) and confidence >= min_conf
+        return {
+            "enabled": True,
+            "required": requires_review,
+            "mode": "openai_compatible",
+            "status": "approved_by_vlm" if approved else "rejected_by_vlm",
+            "approved": approved,
+            "approved_for_flux_render": approved,
+            "confidence": confidence,
+            "min_confidence": min_conf,
+            "reasons": data.get("reasons", []),
+        }
+    except requests.exceptions.RequestException as exc:
+        logger.warning("hardpaste exit VLM request failed", exc_info=True)
+        return {
+            "enabled": True,
+            "required": requires_review,
+            "mode": "openai_compatible",
+            "status": "vlm_review_error_blocked",
+            "approved": False,
+            "approved_for_flux_render": False,
+            "confidence": None,
+            "error_type": "vlm_network_or_http_error",
+            "reasons": [str(exc)],
+        }
+    except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        logger.warning("hardpaste exit VLM response parsing failed", exc_info=True)
+        return {
+            "enabled": True,
+            "required": requires_review,
+            "mode": "openai_compatible",
+            "status": "vlm_review_error_blocked",
+            "approved": False,
+            "approved_for_flux_render": False,
+            "confidence": None,
+            "error_type": "vlm_response_or_configuration_error",
+            "reasons": [str(exc)],
+        }
+    except Exception as exc:
+        logger.exception("hardpaste exit VLM failed unexpectedly")
+        return {
+            "enabled": True,
+            "required": requires_review,
+            "mode": "openai_compatible",
+            "status": "vlm_review_error_blocked",
+            "approved": False,
+            "approved_for_flux_render": False,
+            "confidence": None,
+            "error_type": "vlm_unexpected_error",
+            "reasons": [str(exc)],
+        }

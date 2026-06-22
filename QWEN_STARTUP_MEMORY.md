@@ -1,0 +1,1 @@
+/root/autodl-tmp/qwen_metric3d/run/QWEN_STARTUP_MEMORY.md

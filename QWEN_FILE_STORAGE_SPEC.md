@@ -1,0 +1,1 @@
+/root/autodl-tmp/qwen_metric3d/docs/METRIC3D_FILE_STORAGE_SPEC.md

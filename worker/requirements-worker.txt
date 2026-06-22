@@ -1,0 +1,4 @@
+# worker 运行依赖（与三段服务同机，复用其 Python 环境）
+websockets>=12.0
+httpx>=0.27.0
+boto3>=1.34.0

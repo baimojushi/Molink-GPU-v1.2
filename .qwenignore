@@ -1,0 +1,17 @@
+
+# Data-disk symlink policy
+data_disk_logs/**
+data_disk_tmp/**
+data_disk_backups/**
+data_disk_codex-cli/**
+
+# Heavy model/checkpoint/cache artifacts
+*.pt
+*.pth
+*.onnx
+*.engine
+*.safetensors
+*.ckpt
+*.bin
+*.cache
+*.log

@@ -1,0 +1,50 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+logs/
+run/
+outputs/
+.last_good_sha
+*.log
+
+.env
+.env.*
+!.env*.example
+
+*.zip
+*.npy
+
+*.png
+*.jpg
+*.jpeg
+!tests/assets/**
+!docs/assets/**
+
+.DS_Store
+.vscode/
+.idea/
+
+*.bak
+*.bak_*
+*.bak.*
+data_disk_outputs/
+data_disk_backups/
+data_disk_codex-cli/
+data_disk_logs/
+data_disk_pictures/
+data_disk_tmp/
+
+# Qwen local secret
+.qwen/.env
+.env
+
+# Qwen Code local migration backup; may contain sensitive configuration
+.qwen/settings.json.orig
+
+# Qwen hook local backups
+.qwen/hooks/*.backup.*
+
+# Patch deployment backups
+.patch_backups/

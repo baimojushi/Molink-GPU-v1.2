@@ -1,0 +1,437 @@
+{
+  "scene_profile": "gallery",
+  "camera": {
+    "distortion_policy": {
+      "fov_warning_deg": 70,
+      "fov_strong_warning_deg": 85,
+      "unknown_distortion_action": "no_undistort_add_penalty",
+      "geometry_confidence_penalty": {
+        "fov_gt_70": 0.1,
+        "fov_gt_85": 0.2
+      }
+    },
+    "floor_normal_filter": {
+      "normal_y_max": {
+        "value": -0.75,
+        "notes": "Metric3D/OpenCV floor-like normals must have camera-y below this value."
+      },
+      "abs_z_max": {
+        "value": 0.45,
+        "notes": "Reject forward-facing normals when estimating gravity from floor pixels."
+      },
+      "min_pixels": {
+        "value": 1000,
+        "notes": "Minimum filtered floor-normal pixels required before gravity estimation is trusted."
+      },
+      "angular_variance_soft_limit_rad": {
+        "value": 0.08,
+        "notes": "Variance above this value reduces gravity confidence."
+      },
+      "full_confidence_pixels": {
+        "value": 5000,
+        "notes": "Filtered pixel count needed for full sample-count confidence."
+      }
+    }
+  },
+  "artwork": {
+    "physical_width_m": null,
+    "physical_height_m": null,
+    "fallback_target_width_rule_by_support": {
+      "floor": {
+        "type": "absolute_by_scene",
+        "default_width_m": 0.8,
+        "gallery_default_width_m": 0.8,
+        "min_width_m": 0.45,
+        "max_width_m": 1.2
+      },
+      "unknown": {
+        "type": "wall_width_ratio",
+        "ratio": 0.22,
+        "min_width_m": 0.45,
+        "max_width_m": 1.0
+      }
+    },
+    "has_frame": "auto"
+  },
+  "support_surface_constraints": {
+    "max_distance_to_wall_m": {
+      "value": 0.1
+    },
+    "distance_statistic": {
+      "value": "percentile_20"
+    },
+    "min_touch_ratio": {
+      "value": 0.08
+    },
+    "horizontal_normal_angle_deg": {
+      "value": 20
+    },
+    "axis_neighborhood_extra_margin_m": {
+      "value": 0.2
+    },
+    "min_valid_points": {
+      "value": 200
+    },
+    "min_floor_valid_points": {
+      "value": 50,
+      "notes": "Floor support-context probe minimum, separated from generic support min_valid_points."
+    }
+  },
+  "height_rules": {
+    "sofa": {
+      "initial_center_height_m": 1.35,
+      "max_bottom_gap_to_support_m": 0.15
+    },
+    "floor": {
+      "center_height_above_floor_m": 1.52,
+      "scene_profile_overrides": {
+        "gallery": 1.52,
+        "home": 1.52
+      }
+    },
+    "table": {
+      "center_height_m": 1.35
+    },
+    "cabinet": {
+      "center_height_m": 1.35
+    },
+    "unknown": {
+      "height_mode": "provisional_visual_review_required",
+      "lock_only_vertical_axis": true,
+      "provisional_center_height_above_floor_m": 1.52,
+      "requires_frontend_visual_height_selection": true,
+      "requires_flux_visual_height_refinement": false,
+      "preserve_artwork_scale": true,
+      "notes": "P2 room-corner floor fit is not enabled. Unknown/web-image scale remains a provisional preview and must not be presented as finalized installation height."
+    }
+  },
+  "hard_constraints": {
+    "min_wall_inside_ratio": {
+      "value": 0.97
+    },
+    "max_structural_forbidden_overlap_ratio": {
+      "value": 0.01,
+      "notes": "Deprecated as a direct hard reject when structural_clearance_policy is enabled. Kept for debug/score penalty; hard gate is wall-local artwork-edge clearance > artwork_width/3."
+    },
+    "max_existing_content_overlap_ratio_mvp": {
+      "value": 0.01
+    },
+    "max_foreground_occlusion_ratio": {
+      "value": 0.08
+    },
+    "min_edge_margin_m": {
+      "value": 0.08
+    },
+    "max_plane_depth_error_m": {
+      "value": 0.08,
+      "fov_overrides": {
+        "fov_gt_70_unknown_distortion": 0.12,
+        "fov_gt_85_unknown_distortion": 0.2
+      }
+    },
+    "min_artwork_visible_ratio": {
+      "value": 0.92
+    },
+    "max_quad_aspect_ratio_long_over_short": {
+      "value": 8.0
+    },
+    "min_projected_artwork_border_margin_px_original": {
+      "value": 24
+    },
+    "hard_reject_wall_inside_ratio": {
+      "value": 0.85,
+      "notes": "Primary P1 hard reject threshold. 0.85-0.97 is review risk; >=0.97 auto-pass. opening/recess is an explanation field when solid_wall_mask already excludes holes."
+    },
+    "min_semantic_axis_safe_mask_coverage": {
+      "value": 0.5,
+      "notes": "Drop the entire semantic axis set when coverage is lower; do not clip the VLM s-range. Geometry axes from safe connected components may still be used."
+    },
+    "enforce_edge_corner_support_gate": {
+      "value": true
+    },
+    "min_artwork_edge_support_ratio": {
+      "value": 0.8
+    },
+    "min_artwork_corner_support_ratio": {
+      "value": 0.75
+    },
+    "projection_size_gate_enabled": {
+      "value": false,
+      "notes": "Final policy: no minimum projected artwork width/height/area gate. Tiny artworks and distant safe placements must remain eligible."
+    },
+    "hard_reject_artwork_edge_support_ratio": {
+      "value": 0.5,
+      "notes": "Edge support below this is blocked; 0.50-auto pass threshold is review only."
+    },
+    "hard_reject_artwork_corner_support_ratio": {
+      "value": 0.5,
+      "notes": "Corner support below this is blocked; 0.50-auto pass threshold is review only."
+    }
+  },
+  "forbidden_classes": [
+    "window",
+    "door",
+    "tv",
+    "mirror",
+    "lamp",
+    "track_lighting",
+    "arch",
+    "opening"
+  ],
+  "existing_content_classes": [
+    "existing_art",
+    "wall_clutter",
+    "wall_label",
+    "hook",
+    "nail",
+    "small_shelf",
+    "painting",
+    "poster",
+    "framed_art",
+    "artwork",
+    "green_board",
+    "notice_board"
+  ],
+  "non_support_classes": [
+    "pedestal",
+    "plinth",
+    "display_stand"
+  ],
+  "mvp": {
+    "cleanup_enabled": false,
+    "free_visual_policy": "flux_visual_refine_from_hardpaste",
+    "max_axis_candidates_per_wall": 9
+  },
+  "semantic": {
+    "sam": {
+      "enabled": true,
+      "backend": "sam1",
+      "model_type": "vit_b",
+      "checkpoint": "/opt/models/sam/sam_vit_b_01ec64.pth",
+      "max_image_side": 1536,
+      "refine_wall_default": false,
+      "notes": "VLM boxes remain source; SAM refines support/forbidden/existing-content polygons."
+    }
+  },
+  "floor_wall_intersection": {
+    "priority": [
+      "floor_mask_projected_to_current_wall_plane",
+      "solid_wall_mask_bottom_percentile",
+      "visible_wall_bottom_percentile_fallback"
+    ],
+    "s_margin_m": {
+      "value": 0.35
+    },
+    "min_floor_points": {
+      "value": 150
+    },
+    "max_floor_points": {
+      "value": 80000
+    },
+    "floor_projected_t_percentile": {
+      "value": 50.0
+    },
+    "solid_wall_bottom_percentile": {
+      "value": 2.0
+    },
+    "visible_wall_bottom_percentile": {
+      "value": 2.0
+    },
+    "max_floor_wall_projection_distance_m": {
+      "value": 0.45
+    }
+  },
+  "existing_content_overlap_policy": {
+    "mode": "candidate_wall_cleanup_then_render",
+    "candidate_wall_scope_only": true,
+    "wall_plane_max_distance_m": {
+      "value": 0.2
+    },
+    "off_wall_existing_content_protected": true,
+    "notes": "Existing artwork/wall clutter on the selected candidate wall is removable visual content: it can count as effective wall support and must be passed to cleanup/inpaint. Existing content outside the target wall remains protected.",
+    "allow_cleanup_existing_content_as_wall_support": true
+  },
+  "cleanup_policy": {
+    "enabled": true,
+    "stage": "candidate_wall_cleanup_then_render",
+    "candidate_wall_scope_only": true,
+    "off_wall_existing_content_protected": true,
+    "future_inpaint_mask_definition": "art_region_mask ∩ current_wall_mask ∩ existing_content_mask",
+    "notes": "When a selected candidate overlaps existing art or wall clutter on the target wall, generate a cleanup mask for that overlap before hard paste / Flux render; do not clean non-target walls.",
+    "cleanup_required_overlap_ratio": 0.0,
+    "cleanup_mask_definition": "art_region_mask ∩ current_wall_mask ∩ existing_content_mask",
+    "protected_scope": "all pixels outside current candidate wall mask",
+    "remove_mask_dilate_px": 6,
+    "bfl_erase_dilate_pixels_default": 10,
+    "remove_mask_dilation_stack_note": "remove_mask.png is exported after local morphological dilation by cleanup_policy.remove_mask_dilate_px (default 6px). scripts/run_bfl_hanging_flux_pipeline.py then passes --erase-dilate-pixels to BFL erase-v1 (default 10px), so the effective erase expansion is approximately the two values combined. This is intentional for hooks/signage/small wall clutter; reduce either value for large existing artworks if boundary intrusion is observed.",
+    "remove_mask_dilation_policy": {
+      "local_export_dilate_px": 6,
+      "bfl_erase_api_dilate_pixels_default": 10,
+      "effective_total_dilate_px_approx": 16,
+      "intent": "two-stage expansion: local mask stabilizes semantic-object coverage, BFL server dilation smooths erase boundary",
+      "risk": "large existing artworks may intrude into adjacent wall areas; lower local_export_dilate_px or --erase-dilate-pixels when debugging boundary bleed"
+    }
+  },
+  "structural_clearance_policy": {
+    "mode": "fine_grained_clear_subregion_then_risk_score",
+    "enable_fine_grained_clear_subregions": true,
+    "min_edge_clearance_fraction_of_artwork_width": {
+      "value": 0.3333333333333333
+    },
+    "vertical_overlap_margin_m": {
+      "value": 0.05
+    },
+    "max_structural_wall_plane_distance_m": {
+      "value": 0.75
+    },
+    "min_structural_points_for_clearance": {
+      "value": 20
+    },
+    "allow_low_quality_pass_as_high_risk": true,
+    "high_risk_score_threshold": {
+      "value": 0.72
+    },
+    "medium_risk_score_threshold": {
+      "value": 0.86
+    },
+    "vlm_review_required_for_high_risk": true,
+    "hard_gate": "artwork vertical edges must be farther than artwork_width / 3 from doors/windows/openings/other forbidden structural classes in wall-local horizontal coordinates",
+    "soft_gate": "Opening/recess overlap is an explanation field when solid_wall_mask already excludes holes. Primary support decision uses the safe wall support gate. Geometry quality scores remain ranking/review signals.",
+    "review_stage": "export hard_paste.png and send high-risk placements to VLM visual review before final render/commit",
+    "enabled": true,
+    "generate_gap_center_axes": true,
+    "same_wall_plane_max_distance_m": {
+      "value": 0.75
+    },
+    "notes": "Generate candidate axes at valid gaps between door/window/opening intervals; do not reject an entire wall just because coarse axes are close to a window.",
+    "per_wall_coverage_policy": "Apply only after hard gates. A wall may return wall_has_no_safe_candidate=true instead of forcing an unsafe render."
+  },
+  "foreground_occlusion_policy": {
+    "enabled": true,
+    "wall_proximity_threshold_m": {
+      "value": 0.15
+    },
+    "person_not_near_wall_action": "ignore_for_placement_and_send_to_flux_cleanup",
+    "person_near_wall_action": "treat_as_real_close_wall_obstruction",
+    "cleanup_mask_definition": "art_region_mask ∩ current_wall_mask ∩ foreground/person_mask when median distance to target wall plane > 15cm"
+  },
+  "flux_export": {
+    "per_wall_bfl_limit": 2,
+    "global_final_render_limit": 4,
+    "nms_center_distance_fraction_of_artwork_width": 0.65,
+    "notes": "Official BFL manifest is selected after hardpaste exit gate: max 2 candidates per wall and max 4 total final renders. Same-wall NMS uses center distance plus projected polygon IoU.",
+    "nms_polygon_iou_threshold": 0.25
+  },
+  "flux_render": {
+    "extra_prompt": "",
+    "art_region_mask_usage": "qa_only_not_sent_to_flux2",
+    "prompt_policy": "conservative_local_edit_keep_artwork_mask_anchor_fixed_no_flux_generated_frame",
+    "notes": "FLUX.2 Pro edit payload does not include a mask/edit-region field; bbox/polygon are prompt instructions and art_region_mask is post-render QA/debug only.",
+    "frame_geometry_policy": "precomposed_only_no_flux_generated_frame",
+    "raw_original_dual_reference_allowed": false,
+    "safe_dual_reference_policy": "erased_room_only_for_clearable_wall_attached_non_art_cleanup_without_people_or_existing_art",
+    "render_size_qa": {
+      "method": "mask_anchored_core_ssim_and_forbidden_outer_guard",
+      "geometry_anchor": "art_region_mask_from_hardpaste",
+      "bbox_redetection_used_for_decision": false,
+      "core_erode_px": 2,
+      "allowed_frame_shadow_px": 6,
+      "forbidden_outer_guard_px": 20,
+      "changed_pixel_delta": 18.0,
+      "min_core_masked_ssim": 0.96,
+      "max_core_color_delta": 10.0,
+      "max_forbidden_outer_guard_changed_ratio": 0.12,
+      "fallback_product_semantics": "Do not silently replace failed Flux render with hard-paste success. Return PARTIAL_HARDPASTE_REVIEW."
+    },
+    "finalization_policy": {
+      "raw_flux_must_pass_mask_anchored_qa": true,
+      "never_silent_replace_failed_flux_with_hardpaste_success": true
+    }
+  },
+  "exit_review": {
+    "hardpaste_vlm_mode": "auto",
+    "block_unreviewed_required_vlm": true,
+    "min_vlm_confidence": 0.55,
+    "review_all_hardpaste": false,
+    "when_vlm_missing": "block_review_required_candidates",
+    "log_unreviewed_block_reason": true
+  },
+  "room_corner_floor_fit": {
+    "implementation_status": "spec_only_not_enabled_in_production",
+    "enabled": false,
+    "min_valid_wall_planes": 2,
+    "min_wall_normal_angle_deg": 15.0,
+    "min_wall_ransac_inlier_ratio": 0.6,
+    "max_corner_gravity_angle_deg": 15.0,
+    "floor_side_extent_percentile": 3.0,
+    "floor_line_sampling": "wall RANSAC inlier points projected along g_hat_cam; use p3 floor-side extent; never treat visible safe-mask bottom as a finalized metric floor",
+    "single_wall_degrade": "height_band_base=unknown; metric_height_finalized=false; requires_visual_height_selection=true",
+    "visual_center_band_base": "estimated_full_wall_height_m_only_never_visible_safe_mask_height"
+  },
+  "hardpaste_quality": {
+    "antialias_mode": "supersampled_rgba_lanczos",
+    "supersample_scale": 8,
+    "max_canvas_side_px": 8192,
+    "policy": "small artworks are allowed; hard-paste quality is improved with supersampling instead of projection-size rejection"
+  },
+  "semantic_object_inventory": {
+    "required_roles": [
+      "existing_content",
+      "foreground"
+    ],
+    "per_wall_high_res_crop_enabled": false,
+    "empty_inventory_action": "trace_warning_do_not_assume_no_cleanup_needed",
+    "labels_existing_content": [
+      "existing_art",
+      "wall_clutter",
+      "wall_label",
+      "hook",
+      "nail",
+      "small_shelf",
+      "painting",
+      "poster",
+      "framed_art",
+      "artwork",
+      "green_board",
+      "notice_board"
+    ],
+    "foreground_labels": [
+      "person",
+      "human",
+      "people",
+      "foreground_object",
+      "plant",
+      "chair"
+    ]
+  },
+  "artwork_mount": {
+    "auto_detect_frame": true,
+    "frame_detection_min_confidence": 0.72,
+    "precompose_frame_sides_when_detected": true,
+    "default_frame_depth_m": 0.025,
+    "min_frame_depth_m": 0.012,
+    "max_frame_depth_m": 0.055,
+    "max_visible_side_faces": 2,
+    "min_side_face_area_px": 3,
+    "min_side_face_width_px": 1.5,
+    "edge_sample_px": 12,
+    "side_shading_strength": 0.18,
+    "clip_side_faces_to_front_span": true,
+    "side_face_span_pad_px": 0.35
+  },
+  "render_qa": {
+    "qa_allowed_frame_shadow_px": 8
+  },
+  "candidate_ranking": {
+    "wall_center_composition_weight": 0.32,
+    "wall_corner_soft_penalty_weight": 0.12,
+    "notes": "Ranks against full visible wall extent. No 2D empty-space search or empty-space bonus is applied; existing wall art can remain cleanup/erase scope."
+  },
+  "candidate_diversity": {
+    "projected_duplicate_suppression_enabled": true,
+    "projected_duplicate_iou_threshold": 0.25,
+    "projected_duplicate_center_distance_fraction_of_artwork_width": 0.65,
+    "projected_duplicate_center_distance_floor_px": 12,
+    "notes": "Suppress same-wall candidates that become visually duplicate after projection, even if their wall-local axis_s values differ."
+  }
+}

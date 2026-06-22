@@ -1,0 +1,64 @@
+{
+  "context": {
+    "fileName": [
+      "QWEN.md",
+      "QWEN_FILE_STORAGE_SPEC.md",
+      "QWEN_STARTUP_MEMORY.md"
+    ],
+    "fileFiltering": {
+      "respectGitIgnore": true,
+      "respectQwenIgnore": true
+    }
+  },
+  "permissions": {
+    "allow": [
+      "Read(//opt/metric3d_api/**)",
+      "Edit(//opt/metric3d_api/**)",
+      "Read(//root/autodl-tmp/qwen_metric3d/docs/**)",
+      "Edit(//root/autodl-tmp/qwen_metric3d/docs/**)",
+      "Bash(unzip *)",
+      "Read(//root/autodl-tmp/qwen_metric3d/artifacts/packages/patch_temp_v7/**)",
+      "Bash(mkdir *)",
+      "Bash(cp *)",
+      "Bash(python *)",
+      "Bash(python3 *)",
+      "Bash(/root/autodl-tmp/qwen_metric3d/bin/python3 *)",
+      "Bash(curl *)",
+      "Read(//root/autodl-tmp/qwen_metric3d/artifacts/packages/patch_temp_v7_new/**)",
+      "Read(//root/autodl-tmp/qwen_metric3d/artifacts/packages/patch_temp_safety_dual/**)",
+      "Bash(source *)",
+      "Bash(echo *)",
+      "Bash(find *)",
+      "Bash(sort)",
+      "Bash(bash *)",
+      "Bash(tail *)",
+      "Bash(conda *)",
+      "Bash(rm *)",
+      "Read(//root/autodl-tmp/tmp/artwork_hanging_final_p1_p3_p2contract_patch_pkg/artwork_hanging_final_p1_p3_p2contract_patch/**)",
+      "Bash(1)",
+      "Bash(/root/autodl-tmp/pictures/qwen/room-exif.jpg)",
+      "Bash(/root/autodl-tmp/pictures/qwen/artwork51.2×67.8cm.png)",
+      "Bash(51.2)",
+      "Bash(67.8)",
+      "Bash(configs/rules_v1.json)",
+      "Bash(gallery)",
+      "Bash(auto)",
+      "Bash(y)",
+      "Bash(n)",
+      "Bash(eof)",
+      "Skill(patch-deployment-with-baseline-divergence)",
+      "Bash(pip cache *)",
+      "Bash(set *)",
+      "Bash(. *)"
+    ],
+    "deny": [
+      "Read(//opt/metric3d_api/.qwen/.env)",
+      "Edit(//opt/metric3d_api/.qwen/.env)",
+      "Read(//root/autodl-tmp/qwen_metric3d/secrets/**)",
+      "Edit(//root/autodl-tmp/qwen_metric3d/secrets/**)",
+      "Read(//root/.ssh/**)",
+      "Edit(//root/.ssh/**)"
+    ]
+  },
+  "$version": 4
+}
