@@ -311,11 +311,21 @@ def _composite_photometric_crop(
         )
         photometric_arr = np.clip(orig_arr + delta, 0, 255)
 
-        # Only the visible artwork object may change, and only by low-frequency
-        # achromatic lightness transfer. No generated pixels are pasted over the
-        # artwork, and nothing outside the artwork object is modified.
+        # The visible artwork object is geometry / intrinsic-color locked: it
+        # receives only low-frequency achromatic lightness transfer, so GPT
+        # Image cannot squash, recolor, or repaint the pasted artwork.
         object_w = np.clip(object_alpha * edit_alpha, 0.0, 1.0)[..., None]
-        out_arr = orig_arr * (1.0 - object_w) + photometric_arr * object_w
+
+        # Outside the artwork object but still inside the edit mask, keep the
+        # model-generated wall/contact-shadow pixels. This is where GPT Image
+        # usually produces the best cast shadow and wall integration, and it
+        # must not be pasted back to the hard-paste wall.
+        shadow_w = np.clip(edit_alpha - object_alpha, 0.0, 1.0)[..., None]
+        out_arr = (
+            orig_arr * (1.0 - np.clip(object_w + shadow_w, 0.0, 1.0))
+            + photometric_arr * object_w
+            + np.asarray(generated_rgb, dtype=np.float32) * shadow_w
+        )
 
         out_crop = Image.fromarray(np.clip(out_arr, 0, 255).astype(np.uint8), mode="RGB")
         base.paste(out_crop, (bbox[0], bbox[1]))
@@ -324,7 +334,7 @@ def _composite_photometric_crop(
 
     return {
         "composited": True,
-        "mode": "photometric_intrinsic_color_preserving_composite",
+        "mode": "photometric_intrinsic_color_preserving_shadow_composite",
         "bbox": list(bbox),
         "crop_size": list(crop_size),
         "generated_size": list(generated_size),
@@ -332,7 +342,7 @@ def _composite_photometric_crop(
         "core_mask_available": core_mask_available,
         "hardpaste_core_pixel_restore": False,
         "core_treatment": "low_frequency_achromatic_luminance_transfer_only",
-        "edge_treatment": "no_generated_pixels_pasted_outside_artwork_object",
+        "edge_treatment": "generated_shadow_pixels_preserved_outside_artwork_object_within_edit_mask",
         "edge_feather_px": int(edge_feather_px),
         "core_feather_px": int(core_feather_px),
         "core_protection_px": int(core_protection_px),
@@ -429,8 +439,9 @@ class ApiyiGptImage2Client:
         output_scope = "whole_image"
         composite_trace: dict[str, Any] = {"composited": False}
         object_mask_source = (
-            request.metadata.get("art_region_mask_path")
+            request.metadata.get("render_object_mask_path")
             or request.metadata.get("mount_mask_path")
+            or request.metadata.get("art_region_mask_path")
             or request.metadata.get("qa_art_mask_path")
             or request.metadata.get("front_region_mask_path")
         )
@@ -482,7 +493,7 @@ class ApiyiGptImage2Client:
                     stem=image.stem,
                 )
             mask_trace.update({
-                "mask_enforcement": "local_crop_then_photometric_artwork_only_composite" if photometric_mode else "local_crop_then_mask_composite",
+                "mask_enforcement": "local_crop_then_photometric_artwork_lock_and_shadow_composite" if photometric_mode else "local_crop_then_mask_composite",
                 "mask_enforced_locally": True,
                 "edit_crop_path": str(local["crop_path"]),
                 "mask_crop_path": str(local["mask_crop_path"]),

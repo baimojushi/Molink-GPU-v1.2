@@ -23,6 +23,26 @@ def _truthy_env(name: str, default: str = "1") -> bool:
     return str(value).strip().lower() not in {"", "0", "false", "no", "off"}
 
 
+def _job_requested_render_provider(job: Dict[str, Any]) -> str:
+    render = job.get("render") if isinstance(job.get("render"), dict) else {}
+    return str(
+        render.get("provider")
+        or render.get("render_provider")
+        or job.get("render_provider")
+        or job.get("hanging_provider")
+        or "apiyi_gpt_image2_vip"
+    )
+
+
+def _actual_render_provider(render_aggregate: Dict[str, Any], job: Dict[str, Any]) -> str:
+    return str(
+        render_aggregate.get("render_provider")
+        or render_aggregate.get("provider")
+        or _job_requested_render_provider(job)
+        or "apiyi_gpt_image2_vip"
+    )
+
+
 def _normalize_partial_asset_id(value: Any) -> str:
     text = str(value or "")
     for suffix in PARTIAL_REVIEW_SUFFIXES:
@@ -197,7 +217,9 @@ def build(
         "partial_review_images": partial_images,
         "error": None,
         "metrics": {
-            "render_provider": (job.get("render") or {}).get("provider", "apiyi_gpt_image2_vip"),
+            "render_provider": _actual_render_provider(render_aggregate, job),
+            "actual_render_provider": _actual_render_provider(render_aggregate, job),
+            "requested_render_provider": _job_requested_render_provider(job),
             "render_elapsed_s": render_aggregate.get("elapsed_s"),
             "production_usable_output_count": usable,
             "final_url_count": final_url_count,
@@ -220,5 +242,9 @@ def build_failed_payload(job: Dict[str, Any], client_result: Dict[str, Any]) -> 
         "not_recommended": client_result.get("not_recommended", []),
         "partial_review_images": [],
         "error": None,
-        "metrics": {"render_provider": (job.get("render") or {}).get("provider", "bfl")},
+        "metrics": {
+            "render_provider": _job_requested_render_provider(job),
+            "actual_render_provider": _job_requested_render_provider(job),
+            "requested_render_provider": _job_requested_render_provider(job),
+        },
     }

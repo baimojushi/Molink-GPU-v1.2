@@ -46,6 +46,46 @@ GPU_COUNT = int(os.getenv("GPU_COUNT", "1"))
 IDLE_TIMEOUT_S = int(os.getenv("IDLE_TIMEOUT_S", "300"))
 WORKER_VERSION = "1.0.0"
 
+DEFAULT_RENDER_PROVIDER = "apiyi_gpt_image2_vip"
+RENDER_PROVIDER_ALIASES = {
+    "apiyi": "apiyi_gpt_image2_vip",
+    "apiyi_gpt_image2_vip": "apiyi_gpt_image2_vip",
+    "gpt_image2_vip": "apiyi_gpt_image2_vip",
+    "gpt-image-2-vip": "apiyi_gpt_image2_vip",
+    "bfl": "bfl",
+    "bfl_official": "bfl",
+    "bfl_flux2": "bfl",
+    "mock": "mock",
+    "dry_run": "mock",
+    "noop": "mock",
+}
+
+
+def normalize_render_provider(value) -> str:
+    raw = str(value or os.getenv("HANGING_RENDER_PROVIDER") or DEFAULT_RENDER_PROVIDER).strip().lower()
+    normalized = RENDER_PROVIDER_ALIASES.get(raw)
+    if normalized:
+        return normalized
+    print(f"[worker] unknown render provider={raw!r}; fallback to {DEFAULT_RENDER_PROVIDER}", flush=True)
+    return DEFAULT_RENDER_PROVIDER
+
+
+def resolve_render_provider(job: dict) -> tuple[str, str]:
+    render = job.get("render") if isinstance(job.get("render"), dict) else {}
+    candidates = [
+        ("render.provider", render.get("provider")),
+        ("render.render_provider", render.get("render_provider")),
+        ("render_provider", job.get("render_provider")),
+        ("hanging_provider", job.get("hanging_provider")),
+        ("provider", job.get("provider")),
+        ("env.HANGING_RENDER_PROVIDER", os.getenv("HANGING_RENDER_PROVIDER")),
+    ]
+    for source, value in candidates:
+        if value is not None and str(value).strip():
+            return normalize_render_provider(value), source
+    return DEFAULT_RENDER_PROVIDER, "default"
+
+
 def _round_cm(value) -> int | None:
     try:
         return round(float(value))
@@ -181,6 +221,12 @@ class Worker:
         print(f"[worker-debug] job_accepted job_id={job.get('job_id')}", flush=True)
 
         diag = diagnostics.DiagnosticsRun.create(job)
+        render_provider, render_provider_source = resolve_render_provider(job)
+        print(
+            f"[worker-debug] render_provider={render_provider} source={render_provider_source} "
+            f"raw_render={(job.get('render') or {}).get('provider') if isinstance(job.get('render'), dict) else None}",
+            flush=True,
+        )
         diag_tasks: list[asyncio.Task] = []
         payload_for_diag: dict | None = None
         run_error: BaseException | None = None
@@ -207,6 +253,9 @@ class Worker:
                     "instance_id": INSTANCE_ID,
                     "gpu_model": GPU_MODEL,
                     "worker_version": WORKER_VERSION,
+                    "render_provider": render_provider,
+                    "render_provider_source": render_provider_source,
+                    "render_provider_raw": (job.get("render") or {}).get("provider") if isinstance(job.get("render"), dict) else None,
                 })
 
                 await self.progress(ws, job, "metric3d", "running", 15, "正在测量空间深度…")
@@ -248,8 +297,7 @@ class Worker:
                     return
 
                 await self.progress(ws, job, "render", "running", 65, "几何分析完成，正在生成高保真效果图…")
-                render_provider = (job.get("render") or {}).get("provider", "apiyi_gpt_image2_vip")
-                limit = (job.get("render") or {}).get("global_limit")
+                limit = (job.get("render") or {}).get("global_limit") if isinstance(job.get("render"), dict) else None
                 flux_out = work_dir / "flux_out"
                 render_aggregate = await asyncio.to_thread(
                     render_api.run_pipeline,

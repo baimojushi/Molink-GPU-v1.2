@@ -36,6 +36,23 @@ def _is_mock_provider(name: str | None) -> bool:
     return str(name or "").strip().lower() in {"mock", "dry_run", "noop"}
 
 
+def _normalize_render_provider_name(name: str | None) -> str:
+    key = str(name or os.getenv("HANGING_RENDER_PROVIDER") or "apiyi_gpt_image2_vip").strip().lower()
+    aliases = {
+        "apiyi": "apiyi_gpt_image2_vip",
+        "apiyi_gpt_image2_vip": "apiyi_gpt_image2_vip",
+        "gpt_image2_vip": "apiyi_gpt_image2_vip",
+        "gpt-image-2-vip": "apiyi_gpt_image2_vip",
+        "bfl": "bfl",
+        "bfl_official": "bfl",
+        "bfl_flux2": "bfl",
+        "mock": "mock",
+        "dry_run": "mock",
+        "noop": "mock",
+    }
+    return aliases.get(key, "apiyi_gpt_image2_vip")
+
+
 def _red(text: str) -> str:
     return f"\033[31m{text}\033[0m"
 
@@ -446,10 +463,12 @@ def _render_failure_diagnosis(
 
 
 def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
-    provider_name = str(args.provider or "apiyi_gpt_image2_vip").strip().lower()
+    requested_provider_name = str(getattr(args, "provider", None) or os.getenv("HANGING_RENDER_PROVIDER") or "apiyi_gpt_image2_vip").strip().lower()
+    provider_name = _normalize_render_provider_name(requested_provider_name)
+    args.provider = provider_name
     provider = build_image_edit_provider(provider_name)
     using_mock_provider = _is_mock_provider(provider_name)
-    using_apiyi_gpt_image2_vip = provider_name in {"apiyi_gpt_image2_vip", "gpt_image2_vip", "gpt-image-2-vip", "apiyi"}
+    using_apiyi_gpt_image2_vip = provider_name == "apiyi_gpt_image2_vip"
     if using_mock_provider:
         print(_red(MOCK_PROVIDER_WARNING), file=sys.stderr)
     output_dir = Path(args.output_dir).resolve()
@@ -467,6 +486,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             "version": 2,
             "source_zip": str(Path(args.hanging_zip).resolve()),
             "provider": provider_name,
+            "requested_provider": requested_provider_name,
             "provider_warning": MOCK_PROVIDER_WARNING if using_mock_provider else None,
             "render_provider": provider_name,
             "cleanup_provider": "bfl_erase_v1" if using_apiyi_gpt_image2_vip else provider_name,
@@ -1033,7 +1053,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--original-room", default=None, help="Optional original room image override for legacy manifests")
     parser.add_argument("--artwork-reference", default=None, help="Original artwork image override for legacy manifests")
     parser.add_argument("--output-dir", required=True, help="Directory for final_hd images and traces")
-    parser.add_argument("--provider", default="apiyi_gpt_image2_vip", choices=["apiyi_gpt_image2_vip", "gpt_image2_vip", "bfl", "mock"], help="Use apiyi_gpt_image2_vip for GPT Image 2 VIP final render, bfl for original FLUX.2 render, mock for dry run")
+    parser.add_argument("--provider", default="apiyi_gpt_image2_vip", choices=["apiyi_gpt_image2_vip", "apiyi", "gpt_image2_vip", "gpt-image-2-vip", "bfl", "mock"], help="Use apiyi_gpt_image2_vip for GPT Image 2 VIP final render, bfl for original FLUX.2 render, mock for dry run")
     parser.add_argument("--erase-dilate-pixels", type=int, default=10)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--safety-tolerance", type=int, default=None)

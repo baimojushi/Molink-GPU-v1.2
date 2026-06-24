@@ -9,6 +9,25 @@ extracted_at: '2026-06-24T20:32:00Z'
 
 The target directory is not a git repository, or `git apply` fails due to baseline divergence, but a `.patch` file (or `.patch.zip`) needs to be deployed.
 
+## Step 0 — Filter cross-repo patches (if applicable)
+
+A patch may contain files from multiple repositories. Before deploying, identify which files belong to the current codebase:
+
+```bash
+grep -n "^--- a/\|^+++ b/" patch_file.patch
+```
+
+Examine the path prefixes. Files with paths matching other repos (e.g. `Molink-page-v1.2-main/`) should be skipped. Only deploy files whose paths exist under the current project root.
+
+Typical pattern: a patch from a full codebase audit contains `Molink-page-v1.2-main/` (page repo, skip) and `Molink-GPU-v1.1-main/` (GPU repo, deploy). Map the prefix to the current project:
+
+```
+Molink-GPU-v1.1-main/scripts/run_bfl_hanging_flux_pipeline.py → scripts/run_bfl_hanging_flux_pipeline.py
+Molink-GPU-v1.1-main/worker/main.py                           → worker/main.py
+```
+
+Only deploy files that map into the current project structure.
+
 ## Step 1 — Locate and read the patch
 
 ```bash

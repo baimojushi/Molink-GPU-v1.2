@@ -18,6 +18,27 @@ if str(_REPO_ROOT) not in sys.path:
 from scripts import run_bfl_hanging_flux_pipeline as bfl  # noqa: E402
 
 
+def normalize_render_provider(value: str | None) -> str:
+    key = str(value or os.getenv("HANGING_RENDER_PROVIDER") or "apiyi_gpt_image2_vip").strip().lower()
+    aliases = {
+        "apiyi": "apiyi_gpt_image2_vip",
+        "apiyi_gpt_image2_vip": "apiyi_gpt_image2_vip",
+        "gpt_image2_vip": "apiyi_gpt_image2_vip",
+        "gpt-image-2-vip": "apiyi_gpt_image2_vip",
+        "bfl": "bfl",
+        "bfl_official": "bfl",
+        "bfl_flux2": "bfl",
+        "mock": "mock",
+        "dry_run": "mock",
+        "noop": "mock",
+    }
+    normalized = aliases.get(key)
+    if normalized:
+        return normalized
+    print(f"[worker/render_api] unknown render provider={key!r}; fallback to apiyi_gpt_image2_vip", flush=True)
+    return "apiyi_gpt_image2_vip"
+
+
 def _call_bfl_parse_args(argv):
     """兼容 bfl.parse_args(argv) 和 bfl.parse_args() 两种签名。"""
     import inspect
@@ -79,13 +100,15 @@ def _default_args():
         continue_on_error=False,
         finalize_policy="qa_advisory",
         guarantee_final_hd=True,
+        render_prompt_upsampling=None,
+        render_mask_scope=os.getenv("MOLINK_RENDER_MASK_SCOPE", "edit_region"),
     )
 def run_pipeline(result_zip: str, output_dir: str, provider: str = "apiyi_gpt_image2_vip", limit: int | None = None) -> Dict[str, Any]:
     args = _default_args()
     # 调用者覆盖：必要字段 + worker 层有意与脚本默认不同的字段
     args.hanging_zip = str(result_zip)
     args.output_dir = str(output_dir)
-    args.provider = provider
+    args.provider = normalize_render_provider(provider)
     # worker 层容错：单张失败继续处理其余张，而非终止整个批次。
     # QA 仅作为质量诊断，不再把有效 Flux 输出挡在 final_hd 外。
     args.continue_on_error = True
