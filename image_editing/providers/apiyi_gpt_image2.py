@@ -261,6 +261,23 @@ def _low_frequency_luma_delta(original: Image.Image, generated: Image.Image, *, 
     return delta[..., None] * float(strength)
 
 
+def _darken_only_luma_transfer(original_arr: np.ndarray, generated_arr: np.ndarray, *, max_darkening: float) -> np.ndarray:
+    """Apply only the darkening part of generated shadow to original pixels.
+
+    This is used in the narrow guard ring around the artwork object.  It keeps
+    contact shadow if the model made that ring darker, but refuses bright
+    generated wall/halo pixels that would create a white seam on the frame edge.
+    """
+    weights = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
+    orig_luma = np.tensordot(original_arr, weights, axes=([-1], [0]))
+    gen_luma = np.tensordot(generated_arr, weights, axes=([-1], [0]))
+    dark_delta = np.minimum(gen_luma - orig_luma, 0.0)
+    clamp = float(max(0.0, max_darkening))
+    if clamp > 0:
+        dark_delta = np.clip(dark_delta, -clamp, 0.0)
+    return np.clip(original_arr + dark_delta[..., None], 0, 255)
+
+
 def _alpha_bbox(alpha: np.ndarray, *, threshold: float = 0.2) -> tuple[int, int, int, int] | None:
     arr = np.asarray(alpha)
     if arr.ndim == 3:
@@ -456,6 +473,7 @@ def _composite_photometric_crop(
     wall_sample_max_delta: float,
     wall_rgb_max_delta: float,
     wall_rgb_correction_strength: float,
+    object_edge_guard_px: int,
 ) -> dict[str, Any]:
     with Image.open(original_path) as original, Image.open(generated_crop_path) as generated, Image.open(edit_mask_crop_path) as edit_mask:
         base = original.convert("RGB")
@@ -526,16 +544,35 @@ def _composite_photometric_crop(
         # The visible artwork object is geometry / intrinsic-color locked: it
         # receives only low-frequency achromatic lightness transfer, so GPT
         # Image cannot squash, recolor, or repaint the pasted artwork.
-        object_w = np.clip(object_alpha * edit_alpha, 0.0, 1.0)[..., None]
+        object_w_2d = np.clip(object_alpha * edit_alpha, 0.0, 1.0)
+        object_w = object_w_2d[..., None]
 
-        # Outside the artwork object but still inside the edit mask, keep the
-        # model-generated wall/contact-shadow pixels after anchor relocation and
-        # wall-RGB correction. This preserves the good projection while removing
-        # crop paste patches.
-        shadow_w = np.clip(edit_alpha - object_alpha, 0.0, 1.0)[..., None]
+        # Protect a narrow ring around the object edge before using generated
+        # wall pixels.  Binary masks are often 1-2 px tighter than the actual
+        # anti-aliased frame edge; without this guard, bright generated wall
+        # pixels can leak onto the darkest contact-shadow / outer-frame edge and
+        # produce a white seam.  In the guard ring we allow only darken-only
+        # shadow transfer, never brightening.
+        object_guard_alpha = _dilate_alpha(object_alpha, int(object_edge_guard_px))
+        guard_w_2d = np.clip((object_guard_alpha - object_alpha) * edit_alpha, 0.0, 1.0)
+        guard_w = guard_w_2d[..., None]
+        guard_shadow_arr = _darken_only_luma_transfer(
+            orig_arr,
+            generated_arr,
+            max_darkening=photometric_max_delta,
+        )
+
+        # Outside the guarded artwork object but still inside the edit mask, keep
+        # the model-generated wall/contact-shadow pixels after anchor relocation
+        # and wall-RGB correction. This preserves the good projection while
+        # removing crop paste patches.
+        shadow_w_2d = np.clip(edit_alpha * (1.0 - object_guard_alpha), 0.0, 1.0)
+        shadow_w = shadow_w_2d[..., None]
+        combined_w = np.clip(object_w + guard_w + shadow_w, 0.0, 1.0)
         out_arr = (
-            orig_arr * (1.0 - np.clip(object_w + shadow_w, 0.0, 1.0))
+            orig_arr * (1.0 - combined_w)
             + photometric_arr * object_w
+            + guard_shadow_arr * guard_w
             + generated_arr * shadow_w
         )
 
@@ -554,7 +591,9 @@ def _composite_photometric_crop(
         "core_mask_available": core_mask_available,
         "hardpaste_core_pixel_restore": False,
         "core_treatment": "low_frequency_achromatic_luminance_transfer_only",
-        "edge_treatment": "generated_shadow_pixels_preserved_after_anchor_relocation_and_wall_rgb_correction",
+        "edge_treatment": "generated_shadow_pixels_preserved_after_anchor_relocation_and_wall_rgb_correction_with_object_edge_guard",
+        "object_edge_guard_px": int(object_edge_guard_px),
+        "guard_treatment": "darken_only_luma_transfer_in_narrow_object_edge_ring",
         "anchor_relocation": relocation_trace,
         "wall_rgb_correction": wall_rgb_trace,
         "edge_feather_px": int(edge_feather_px),
@@ -593,6 +632,7 @@ class ApiyiGptImage2Client:
     wall_sample_max_delta: float = 18.0
     wall_rgb_max_delta: float = 24.0
     wall_rgb_correction_strength: float = 1.0
+    object_edge_guard_px: int = 2
     allow_unmasked_fallback: bool = False
 
     @classmethod
@@ -632,6 +672,7 @@ class ApiyiGptImage2Client:
             wall_sample_max_delta=max(0.0, float(os.getenv("APIYI_GPT_IMAGE_WALL_SAMPLE_MAX_DELTA", "18"))),
             wall_rgb_max_delta=max(0.0, float(os.getenv("APIYI_GPT_IMAGE_WALL_RGB_MAX_DELTA", "24"))),
             wall_rgb_correction_strength=max(0.0, float(os.getenv("APIYI_GPT_IMAGE_WALL_RGB_CORRECTION_STRENGTH", "1.0"))),
+            object_edge_guard_px=max(0, int(os.getenv("APIYI_GPT_IMAGE_OBJECT_EDGE_GUARD_PX", "2"))),
             allow_unmasked_fallback=_env_truthy("APIYI_GPT_IMAGE_ALLOW_UNMASKED_FALLBACK", "0"),
         )
 
@@ -811,6 +852,7 @@ class ApiyiGptImage2Client:
                         wall_sample_max_delta=self.wall_sample_max_delta,
                         wall_rgb_max_delta=self.wall_rgb_max_delta,
                         wall_rgb_correction_strength=self.wall_rgb_correction_strength,
+                        object_edge_guard_px=self.object_edge_guard_px,
                     )
                 else:
                     composite_trace = _composite_masked_crop(

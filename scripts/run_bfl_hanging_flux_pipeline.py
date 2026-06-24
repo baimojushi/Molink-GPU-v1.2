@@ -131,6 +131,17 @@ def _low_frequency_luma_delta_image(original: Image.Image, generated: Image.Imag
     return delta[..., None] * float(strength)
 
 
+def _darken_only_luma_transfer_full(original_arr: np.ndarray, generated_arr: np.ndarray, *, max_darkening: float) -> np.ndarray:
+    weights = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
+    orig_luma = np.tensordot(original_arr, weights, axes=([-1], [0]))
+    gen_luma = np.tensordot(generated_arr, weights, axes=([-1], [0]))
+    dark_delta = np.minimum(gen_luma - orig_luma, 0.0)
+    clamp = float(max(0.0, max_darkening))
+    if clamp > 0:
+        dark_delta = np.clip(dark_delta, -clamp, 0.0)
+    return np.clip(original_arr + dark_delta[..., None], 0, 255)
+
+
 def _alpha_bbox(alpha: np.ndarray, *, threshold: float = 0.2) -> tuple[int, int, int, int] | None:
     arr = np.asarray(alpha)
     if arr.ndim == 3:
@@ -289,6 +300,7 @@ def _apply_final_photometric_lock(
     wall_sample_max_delta: float,
     wall_rgb_max_delta: float,
     wall_rgb_correction_strength: float,
+    object_edge_guard_px: int,
 ) -> dict[str, Any]:
     with Image.open(hard_paste) as hard_img, Image.open(render) as render_img, Image.open(object_mask) as object_mask_img:
         hard_rgb = hard_img.convert("RGB")
@@ -347,12 +359,14 @@ def _apply_final_photometric_lock(
 
         # Preserve provider-rendered contact shadow / projection outside the
         # mounted artwork object, but never paste generated object pixels over
-        # the artwork itself. Relocation aligns the generated shadow to the
-        # locked artwork geometry; wall-RGB correction removes crop-paste color
-        # patches while retaining the relative shadow.
+        # the artwork itself.  A narrow object-edge guard prevents bright
+        # generated wall pixels from leaking into anti-aliased frame edges and
+        # creating a white seam; the guard allows only darken-only shadow.
+        object_guard_alpha = _dilate_alpha(object_alpha, int(object_edge_guard_px))
         object_alpha_3d = object_alpha[..., None]
         edit_alpha_3d = edit_alpha_2d[..., None]
-        shadow_alpha = np.clip(edit_alpha_3d * (1.0 - object_alpha_3d), 0.0, 1.0)
+        guard_alpha_3d = np.clip(edit_alpha_3d * np.clip(object_guard_alpha - object_alpha, 0.0, 1.0)[..., None], 0.0, 1.0)
+        shadow_alpha = np.clip(edit_alpha_3d * (1.0 - object_guard_alpha[..., None]), 0.0, 1.0)
 
         hard_arr = np.asarray(hard_rgb, dtype=np.float32)
         render_arr = np.asarray(render_rgb, dtype=np.float32)
@@ -364,9 +378,19 @@ def _apply_final_photometric_lock(
             strength=strength,
         )
         adjusted_object = np.clip(hard_arr + delta, 0, 255)
+        guard_shadow = _darken_only_luma_transfer_full(
+            hard_arr,
+            render_arr,
+            max_darkening=max_delta,
+        )
 
-        out = hard_arr * (1.0 - shadow_alpha) + render_arr * shadow_alpha
-        out = out * (1.0 - object_alpha_3d) + adjusted_object * object_alpha_3d
+        combined_alpha = np.clip(object_alpha_3d + guard_alpha_3d + shadow_alpha, 0.0, 1.0)
+        out = (
+            hard_arr * (1.0 - combined_alpha)
+            + adjusted_object * object_alpha_3d
+            + guard_shadow * guard_alpha_3d
+            + render_arr * shadow_alpha
+        )
 
         out_path.parent.mkdir(parents=True, exist_ok=True)
         Image.fromarray(np.clip(out, 0, 255).astype(np.uint8), mode="RGB").save(out_path)
@@ -381,7 +405,9 @@ def _apply_final_photometric_lock(
         "output_path": str(out_path),
         "outside_object_pixels_preserved_from_hardpaste": False,
         "rendered_shadow_preserved_outside_object": True,
-        "generated_pixels_pasted": "outside_object_within_edit_mask_only_after_relocation_and_wall_rgb_correction",
+        "generated_pixels_pasted": "outside_guarded_object_within_edit_mask_only_after_relocation_and_wall_rgb_correction",
+        "object_edge_guard_px": int(object_edge_guard_px),
+        "guard_treatment": "darken_only_luma_transfer_in_narrow_object_edge_ring",
         "intrinsic_color_policy": "artwork_object_achromatic_low_frequency_luma_delta_only",
         "anchor_relocation": relocation_trace,
         "wall_rgb_correction": wall_rgb_trace,
@@ -921,6 +947,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                         wall_sample_max_delta=max(0.0, _env_float("MOLINK_FINAL_WALL_SAMPLE_MAX_DELTA", 18.0)),
                         wall_rgb_max_delta=max(0.0, _env_float("MOLINK_FINAL_WALL_RGB_MAX_DELTA", 24.0)),
                         wall_rgb_correction_strength=max(0.0, _env_float("MOLINK_FINAL_WALL_RGB_CORRECTION_STRENGTH", 1.0)),
+                        object_edge_guard_px=max(0, int(os.getenv("MOLINK_FINAL_OBJECT_EDGE_GUARD_PX", "2"))),
                     )
                     render_result = ImageEditResult(
                         image=locked_path,
