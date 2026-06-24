@@ -53,6 +53,31 @@ def _extract_zip(zip_path: Path, work_dir: Path) -> Path:
     return work_dir
 
 
+def _resolve_render_seed(cli_seed: int | None) -> int | None:
+    if cli_seed is not None:
+        return int(cli_seed)
+    env_value = os.getenv("MOLINK_RENDER_FIXED_SEED")
+    if env_value is None or not env_value.strip():
+        return None
+    return int(env_value.strip())
+
+
+def _resolve_render_prompt_upsampling(cli_value: bool | None) -> bool:
+    if cli_value is not None:
+        return bool(cli_value)
+    return str(os.getenv("MOLINK_RENDER_PROMPT_UPSAMPLING", "0")).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _render_edit_runtime_metadata(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "seed": _resolve_render_seed(args.seed),
+        "safety_tolerance": args.safety_tolerance,
+        "prompt_upsampling": _resolve_render_prompt_upsampling(getattr(args, "render_prompt_upsampling", None)),
+        "render_creativity_profile": "low_variance_photometric_focus",
+        "interior_artwork_regeneration_discouraged": True,
+    }
+
+
 def _load_manifest(extracted: Path) -> dict[str, Any]:
     manifest = extracted / "flux_inputs" / "manifest.json"
     if not manifest.exists():
@@ -238,6 +263,58 @@ def _qa_quality_score(qa: dict[str, Any] | None) -> float:
     return score
 
 
+def _render_failure_diagnosis(
+    *,
+    qa: dict[str, Any] | None,
+    render_trace: dict[str, Any] | None,
+    using_apiyi_gpt_image2_vip: bool,
+    flux2_input_mode: str,
+) -> dict[str, Any]:
+    qa = qa if isinstance(qa, dict) else {}
+    trace = render_trace if isinstance(render_trace, dict) else {}
+    failures = list(qa.get("failures") or [])
+    provider = str(trace.get("provider") or "unknown")
+    diagnosis: dict[str, Any] = {
+        "provider": provider,
+        "using_apiyi_gpt_image2_vip": bool(using_apiyi_gpt_image2_vip),
+        "flux2_input_mode": flux2_input_mode,
+        "reference_count": trace.get("reference_count"),
+        "mask_sent_to_flux2": bool(trace.get("mask_sent_to_flux2")),
+        "mask_enforced_locally": bool(trace.get("mask_enforced_locally") or trace.get("mask_local_composite")),
+        "failures": failures,
+    }
+    try:
+        diagnosis["core_masked_ssim"] = float(qa.get("core_masked_ssim"))
+    except Exception:
+        pass
+    try:
+        diagnosis["core_color_delta"] = float(qa.get("core_color_delta"))
+    except Exception:
+        pass
+    try:
+        diagnosis["forbidden_outer_guard_changed_ratio"] = float(qa.get("forbidden_outer_guard_changed_ratio"))
+    except Exception:
+        pass
+
+    if (
+        provider == "bfl"
+        and not using_apiyi_gpt_image2_vip
+        and bool(trace.get("mask_sent_to_flux2"))
+        and ("core_masked_ssim_below_threshold" in failures or "core_color_delta_above_threshold" in failures)
+    ):
+        diagnosis["root_cause"] = (
+            "native FLUX/BFL final edit was allowed to repaint the masked artwork core; "
+            "the prompt/mask constrained outer geometry, but did not preserve the tiny painting identity inside the edit mask"
+        )
+        diagnosis["recommended_provider"] = "apiyi_gpt_image2_vip"
+        diagnosis["recommended_mode"] = "photometric_composite"
+    elif using_apiyi_gpt_image2_vip and bool(trace.get("mask_photometric_composite")):
+        diagnosis["root_cause"] = "post_photometric_composite_qa_failure"
+    else:
+        diagnosis["root_cause"] = "undetermined_render_qa_failure"
+    return diagnosis
+
+
 def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
     provider_name = str(args.provider or "apiyi_gpt_image2_vip").strip().lower()
     provider = build_image_edit_provider(provider_name)
@@ -271,7 +348,10 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             "flux2_mask_required": not using_apiyi_gpt_image2_vip,
             "flux2_mask_sent": not using_apiyi_gpt_image2_vip,
             "final_render_mask_required": not using_apiyi_gpt_image2_vip,
-            "final_render_contract": "gpt-image-2-vip /v1/images/edits prompt-constrained edit; API does not support mask inpainting" if using_apiyi_gpt_image2_vip else "masked FLUX.2 edit",
+            "final_render_contract": (
+                "gpt-image-2-vip /v1/images/edits with local bounded composite; "
+                "artwork core receives low-frequency photometric transfer only, not hard-paste pixel restore"
+            ) if using_apiyi_gpt_image2_vip else "masked FLUX.2 edit",
             "outputs": [],
             "errors": [],
             "warnings": ([{
@@ -457,14 +537,18 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                         "asset_id": asset_id,
                         "candidate_id": item.get("candidate_id"),
                         "wall_id": item.get("wall_id"),
-                        "seed": args.seed,
-                        "safety_tolerance": args.safety_tolerance,
+                        **_render_edit_runtime_metadata(args),
                         "sequence_mode": sequence_mode,
                         "flux2_input_mode": flux2_input_mode,
                         "render_input_semantics": render_input_semantics,
-                        "art_region_mask_usage": "front_region_mask_for_core_qa; flux2_edit_mask_sent_to_flux2",
+                        "art_region_mask_usage": "front_region_mask_for_core_qa; flux2_edit_mask_sent_to_provider",
+                        "qa_art_mask_path": str(qa_art_mask),
+                        "qa_art_mask_source": qa_art_mask_source,
+                        "art_region_mask_path": str(art_region_mask),
                         "flux2_edit_mask_path": str(flux2_edit_mask),
                         "flux2_edit_mask_source": flux2_edit_mask_source,
+                        "core_photometric_adjustment_allowed": True,
+                        "hardpaste_core_pixel_restore_allowed": False,
                     },
                 )
                 primary_render_size_qa = _run_mask_anchored_qa(
@@ -484,7 +568,8 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                     try:
                         baseline_prompt = (
                             f"{prompt} A/B comparison baseline: use this single input image as the authoritative target; "
-                            "do not use any original-room reference image for this baseline render."
+                            "do not use any original-room reference image for this baseline render. "
+                            "Keep the visible frame/border and painting core identity-locked; concentrate edits on local shadow, wall contact, and low-frequency lighting only."
                         )
                         baseline_result = render_hanging(
                             provider,
@@ -498,17 +583,21 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                                 "asset_id": asset_id,
                                 "candidate_id": item.get("candidate_id"),
                                 "wall_id": item.get("wall_id"),
-                                "seed": args.seed,
-                                "safety_tolerance": args.safety_tolerance,
+                                **_render_edit_runtime_metadata(args),
                                 "sequence_mode": sequence_mode,
                                 "flux2_input_mode": "single_after_erase_hardpaste_ab_baseline",
                                 "render_input_semantics": {
                                     "input_image": "cleaned_hard_paste_target_authoritative",
                                     "ab_compare_role": "single_input_baseline_for_dual_mode_validation",
                                 },
-                                "art_region_mask_usage": "front_region_mask_for_core_qa; flux2_edit_mask_sent_to_flux2",
+                                "art_region_mask_usage": "front_region_mask_for_core_qa; flux2_edit_mask_sent_to_provider",
+                                "qa_art_mask_path": str(qa_art_mask),
+                                "qa_art_mask_source": qa_art_mask_source,
+                                "art_region_mask_path": str(art_region_mask),
                                 "flux2_edit_mask_path": str(flux2_edit_mask),
                                 "flux2_edit_mask_source": flux2_edit_mask_source,
+                                "core_photometric_adjustment_allowed": True,
+                                "hardpaste_core_pixel_restore_allowed": False,
                                 "ab_compare": True,
                             },
                         )
@@ -545,7 +634,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                 if not bool(primary_render_size_qa.get("passed")) and flux2_input_mode == "dual_erased_room_plus_target":
                     fallback_prompt = (
                         f"{prompt} SAFE FALLBACK: use this single cleaned hard-paste input as the only authoritative canvas. "
-                        "Do not use any reference image. Preserve the exact painting-core pixel footprint."
+                        "Do not use any reference image. Preserve the exact painting-core pixel footprint, preserve the visible frame/border appearance, and limit edits to local shadow and low-frequency lighting only."
                     )
                     fallback_result = render_hanging(
                         provider,
@@ -559,13 +648,17 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                             "asset_id": asset_id,
                             "candidate_id": item.get("candidate_id"),
                             "wall_id": item.get("wall_id"),
-                            "seed": args.seed,
-                            "safety_tolerance": args.safety_tolerance,
+                            **_render_edit_runtime_metadata(args),
                             "sequence_mode": sequence_mode,
                             "flux2_input_mode": "single_after_erase_hardpaste_size_qa_fallback",
-                            "art_region_mask_usage": "front_region_mask_for_core_qa; flux2_edit_mask_sent_to_flux2",
+                            "art_region_mask_usage": "front_region_mask_for_core_qa; flux2_edit_mask_sent_to_provider",
+                            "qa_art_mask_path": str(qa_art_mask),
+                            "qa_art_mask_source": qa_art_mask_source,
+                            "art_region_mask_path": str(art_region_mask),
                             "flux2_edit_mask_path": str(flux2_edit_mask),
                             "flux2_edit_mask_source": flux2_edit_mask_source,
+                            "core_photometric_adjustment_allowed": True,
+                            "hardpaste_core_pixel_restore_allowed": False,
                             "size_qa_fallback": True,
                         },
                     )
@@ -606,7 +699,17 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                 selected_edit_scope = (
                     "mask_sent"
                     if selected_mask_sent
-                    else ("gpt_image2_vip_mask_local_composite" if selected_mask_enforced_locally else "unmasked_unknown")
+                    else (
+                        "gpt_image2_vip_mask_photometric_composite"
+                        if bool(selected_trace.get("mask_photometric_composite"))
+                        else ("gpt_image2_vip_mask_local_composite" if selected_mask_enforced_locally else "unmasked_unknown")
+                    )
+                )
+                render_failure_diagnosis = _render_failure_diagnosis(
+                    qa=selected_render_size_qa,
+                    render_trace=selected_trace,
+                    using_apiyi_gpt_image2_vip=selected_apiyi_gpt_image2_vip,
+                    flux2_input_mode=flux2_input_mode,
                 )
                 allow_qa_advisory_final = finalize_policy in {"qa_advisory", "lax", "always_final"}
                 should_finalize_flux = (
@@ -634,6 +737,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                     "selected_edit_scope_ok": selected_edit_scope_ok,
                     "never_silent_hardpaste_success": True,
                     "hardpaste_delivery_allowed": False,
+                    "render_failure_diagnosis": render_failure_diagnosis,
                 }
                 if should_finalize_flux:
                     if qa_passed:
@@ -667,6 +771,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                         "qa": selected_render_size_qa,
                         "qa_hard_block_reasons": qa_hard_block_reasons,
                         "selected_flux2_mask_sent": selected_mask_sent,
+                        "render_failure_diagnosis": render_failure_diagnosis,
                     })
                 finalization_trace.update({
                     "final_path": str(final_path) if final_path is not None else None,
@@ -692,7 +797,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                     "selected_apiyi_gpt_image2_vip": selected_apiyi_gpt_image2_vip,
                     "flux2_edit_mask_path": str(flux2_edit_mask),
                     "flux2_edit_mask_source": flux2_edit_mask_source,
-                    "art_region_mask_usage": "front_region_mask_for_core_qa; flux2_edit_mask sent_to_flux2",
+                    "art_region_mask_usage": "front_region_mask_for_core_qa; flux2_edit_mask sent_to_provider",
                     "qa_art_mask_path": str(qa_art_mask),
                     "qa_art_mask_source": qa_art_mask_source,
                     "art_region_mask_path": str(art_region_mask),
@@ -700,6 +805,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                     "primary_render_size_qa": primary_render_size_qa,
                     "selected_render_size_qa": selected_render_size_qa,
                     "post_flux_finalization": finalization_trace,
+                    "render_failure_diagnosis": render_failure_diagnosis,
                     "render_fallback": render_fallback_trace,
                     "exit_code": item_exit_code,
                     "production_usable": bool(production_usable),
@@ -745,6 +851,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--erase-dilate-pixels", type=int, default=10)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--safety-tolerance", type=int, default=None)
+    parser.add_argument("--render-prompt-upsampling", dest="render_prompt_upsampling", action="store_true", default=None, help="Enable provider-side prompt upsampling for final render; disabled by default to reduce creative drift.")
+    parser.add_argument("--no-render-prompt-upsampling", dest="render_prompt_upsampling", action="store_false", help="Disable provider-side prompt upsampling for final render.")
     parser.add_argument("--limit", type=int, default=None, help="Process only first N approved items after manifest selection")
     parser.add_argument("--dual-ab-compare", action="store_true", help="For safe dual_erased_room_plus_target items, also render a single-input baseline for validation.")
     parser.add_argument("--dual-ab-compare-limit", type=int, default=1, help="Maximum safe dual-mode items to render with the extra single-input A/B baseline.")

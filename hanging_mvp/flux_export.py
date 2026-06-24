@@ -218,21 +218,23 @@ def build_render_prompt(
     if mount_policy.get("precompose_frame_sides"):
         frame_rule = (
             "The artwork target already includes deterministic 3D frame side faces generated from the original artwork edge colors. "
-            "Do not add, redraw, thicken, replace, or reinterpret the frame; do not add mat board. "
-            "Do not change the front artwork, frame color, frame thickness, mounted geometry, or painting core size. Do not change the painting core size. "
+            "Treat the visible front border / frame / surround as identity-locked. "
+            "Do not add, redraw, restyle, recolor, thicken, shrink, replace, or reinterpret the frame; do not add mat board; do not create a black matte surround. "
+            "Do not change the front artwork, frame color, frame thickness, mounted geometry, or painting core size. "
             "Only render subtle contact shadow, local light consistency, and edge blending around the mounted object."
         )
     elif frame_known:
         frame_rule = (
-            "The artwork image contains a visible frame. Keep that frame exactly. "
-            "Do not replace the frame, do not add mat board, and Do not change the painting core size. "
+            "The artwork image contains a visible frame or border. Keep that frame exactly. "
+            "Do not replace, redraw, recolor, thicken, thin, sharpen into a graphic border, or add mat board. "
+            "Do not change the frame opening, inner crop, or painting core size. "
             "Only add subtle mounting shadow and local light consistency if needed."
         )
     else:
         frame_rule = (
             "No reliable physical frame was detected in the artwork image. "
-            "Do not invent a decorative frame or mat board. "
-            "You may render subtle natural object thickness, canvas edge, mounting depth, contact shadow, and lighting if visually appropriate. "
+            "Do not invent a decorative frame, heavy border, black matte surround, or mat board. "
+            "You may render only subtle natural object thickness, canvas edge, mounting depth, contact shadow, and lighting if visually appropriate. "
             "Keep the painting core size, crop, content, aspect ratio, and placement fixed."
         )
     mask_lock_rule = (
@@ -243,7 +245,16 @@ def build_render_prompt(
         "STRICT SIZE LOCK: preserve the painting core image dimensions inside the target polygon. "
         "Do not shrink, enlarge, recrop, extend, compress, stretch, zoom, or pad the painting core. "
         "The visible artwork core must keep the same pixel footprint, aspect ratio, and boundary alignment as the hard-paste target. "
+        "Inside the painting core, only low-frequency exposure / brightness / color-temperature adaptation is allowed; "
+        "do not change high-frequency artwork structure, brush strokes, figures, symbols, layout, subject identity, or small interior shapes. "
+        "The visible frame or border is also identity-locked: keep its color, thickness, opening, proportions, and geometry unchanged. "
         "Any frame treatment must stay outside the painting core and must not consume or expand the painted image area. "
+    )
+    conservative_edit_rule = (
+        "CONSERVATIVE EDIT PROFILE: perform the minimum possible edit. "
+        "Prioritize lighting integration over generation. "
+        "Most changes should occur in the narrow wall-contact halo and soft shadow region around the artwork, not inside the frame or painting core. "
+        "If unsure, leave the current pixels unchanged. "
     )
 
     base = (
@@ -254,7 +265,9 @@ def build_render_prompt(
         "Do not move, resize, recrop, rotate, restyle, replace, redraw, or reinterpret the artwork. "
         "Keep the artwork center, outer bounds, painting core size, scale, aspect ratio, crop, content, and perspective exactly the same as the hard-paste target. "
         f"{size_lock_rule}"
+        f"{conservative_edit_rule}"
         "Only blend local contact edges, subtle wall contact shadow, and lighting around the artwork. "
+        "Within the mounted object, any allowed change must be photometric-only and low-frequency. "
         "Keep the room geometry, wall texture, windows, doors, wall corners, floor, ceiling, architectural lines, lens perspective, and camera unchanged. "
         "Remove residual cleanup artifacts only outside the artwork region. "
         f"{frame_rule} "
