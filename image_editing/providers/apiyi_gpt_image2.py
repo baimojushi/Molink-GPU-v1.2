@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 import requests
+import cv2
 from PIL import Image, ImageFilter
 import numpy as np
 
@@ -260,6 +261,180 @@ def _low_frequency_luma_delta(original: Image.Image, generated: Image.Image, *, 
     return delta[..., None] * float(strength)
 
 
+def _alpha_bbox(alpha: np.ndarray, *, threshold: float = 0.2) -> tuple[int, int, int, int] | None:
+    arr = np.asarray(alpha)
+    if arr.ndim == 3:
+        arr = arr[:, :, 0]
+    ys, xs = np.where(arr > float(threshold))
+    if xs.size == 0 or ys.size == 0:
+        return None
+    return int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
+
+
+def _expand_bbox_xyxy(
+    bbox: tuple[int, int, int, int],
+    size_wh: tuple[int, int],
+    *,
+    pad_px: int,
+) -> tuple[int, int, int, int]:
+    x0, y0, x1, y1 = bbox
+    w, h = int(size_wh[0]), int(size_wh[1])
+    p = max(0, int(pad_px))
+    return max(0, x0 - p), max(0, y0 - p), min(w, x1 + p), min(h, y1 + p)
+
+
+def _dilate_alpha(alpha: np.ndarray, radius_px: int) -> np.ndarray:
+    if radius_px <= 0:
+        return np.asarray(alpha, dtype=np.float32)
+    arr = np.asarray(alpha, dtype=np.float32)
+    if arr.ndim == 3:
+        arr = arr[:, :, 0]
+    k = max(1, int(radius_px) * 2 + 1)
+    kernel = np.ones((k, k), np.uint8)
+    return cv2.dilate((np.clip(arr, 0.0, 1.0) * 255.0).astype(np.uint8), kernel, iterations=1).astype(np.float32) / 255.0
+
+
+def _to_gray_float(image: Image.Image) -> np.ndarray:
+    return np.asarray(image.convert("L"), dtype=np.float32)
+
+
+def _estimate_anchor_translation(
+    *,
+    original_crop: Image.Image,
+    generated_crop: Image.Image,
+    anchor_alpha: np.ndarray,
+    max_shift_px: int,
+    min_score: float,
+) -> dict[str, Any]:
+    """Estimate generated->original translation from the locked artwork anchor.
+
+    GPT Image may shift the pasted artwork inside the crop.  Before we use its
+    shadow/wall pixels, align the generated crop back to the hard-paste anchor
+    so the rendered projection follows the original artwork geometry.
+    """
+    max_shift = max(0, int(max_shift_px))
+    bbox = _alpha_bbox(anchor_alpha, threshold=0.2)
+    if bbox is None or max_shift <= 0:
+        return {"applied": False, "reason": "missing_anchor_or_search_disabled", "dx": 0, "dy": 0, "score": None}
+    w, h = original_crop.size
+    x0, y0, x1, y1 = _expand_bbox_xyxy(bbox, (w, h), pad_px=2)
+    if (x1 - x0) < 6 or (y1 - y0) < 6:
+        return {"applied": False, "reason": "anchor_too_small", "dx": 0, "dy": 0, "score": None, "anchor_bbox": [x0, y0, x1, y1]}
+
+    orig_gray = _to_gray_float(original_crop)
+    gen_gray = _to_gray_float(generated_crop)
+    template = orig_gray[y0:y1, x0:x1]
+    if float(np.std(template)) < 3.0:
+        return {"applied": False, "reason": "anchor_low_texture", "dx": 0, "dy": 0, "score": None, "anchor_bbox": [x0, y0, x1, y1]}
+
+    sx0 = max(0, x0 - max_shift)
+    sy0 = max(0, y0 - max_shift)
+    sx1 = min(w, x1 + max_shift)
+    sy1 = min(h, y1 + max_shift)
+    search = gen_gray[sy0:sy1, sx0:sx1]
+    if search.shape[0] < template.shape[0] or search.shape[1] < template.shape[1]:
+        return {"applied": False, "reason": "search_region_too_small", "dx": 0, "dy": 0, "score": None, "anchor_bbox": [x0, y0, x1, y1]}
+
+    result = cv2.matchTemplate(search, template, cv2.TM_CCOEFF_NORMED)
+    _min_val, max_val, _min_loc, max_loc = cv2.minMaxLoc(result)
+    gen_x0 = sx0 + int(max_loc[0])
+    gen_y0 = sy0 + int(max_loc[1])
+    dx = int(x0 - gen_x0)
+    dy = int(y0 - gen_y0)
+    applied = bool(max_val >= float(min_score) and (dx != 0 or dy != 0) and abs(dx) <= max_shift and abs(dy) <= max_shift)
+    return {
+        "applied": applied,
+        "reason": None if applied else "score_below_threshold_or_zero_shift",
+        "dx": dx if applied else 0,
+        "dy": dy if applied else 0,
+        "raw_dx": dx,
+        "raw_dy": dy,
+        "score": float(max_val),
+        "min_score": float(min_score),
+        "max_shift_px": int(max_shift),
+        "anchor_bbox": [int(x0), int(y0), int(x1), int(y1)],
+        "matched_bbox": [int(gen_x0), int(gen_y0), int(gen_x0 + (x1 - x0)), int(gen_y0 + (y1 - y0))],
+    }
+
+
+def _translate_rgb_array(image: Image.Image, *, dx: int, dy: int, fill_image: Image.Image) -> Image.Image:
+    if dx == 0 and dy == 0:
+        return image.convert("RGB")
+    arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    fill = np.asarray(fill_image.convert("RGB"), dtype=np.uint8)
+    h, w = arr.shape[:2]
+    matrix = np.array([[1.0, 0.0, float(dx)], [0.0, 1.0, float(dy)]], dtype=np.float32)
+    shifted = cv2.warpAffine(arr, matrix, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
+    valid = cv2.warpAffine(np.ones((h, w), dtype=np.uint8) * 255, matrix, (w, h), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    shifted[valid == 0] = fill[valid == 0]
+    return Image.fromarray(shifted, mode="RGB")
+
+
+def _correct_generated_wall_rgb(
+    *,
+    original_crop: Image.Image,
+    generated_crop: Image.Image,
+    edit_alpha: np.ndarray,
+    object_alpha: np.ndarray,
+    exclusion_px: int,
+    sample_max_delta: float,
+    max_rgb_delta: float,
+    strength: float,
+) -> tuple[Image.Image, dict[str, Any]]:
+    """Match generated wall RGB to the hard-paste wall while preserving shadows.
+
+    The RGB comparison deliberately excludes the artwork object, frame, and
+    likely projection/shadow pixels.  A constant robust median delta is then
+    applied to the generated crop, which removes crop-paste wall patches while
+    retaining local shadow contrast.
+    """
+    orig = np.asarray(original_crop.convert("RGB"), dtype=np.float32)
+    gen = np.asarray(generated_crop.convert("RGB"), dtype=np.float32)
+    edit = np.asarray(edit_alpha, dtype=np.float32)
+    obj_dilated = _dilate_alpha(object_alpha, int(exclusion_px))
+
+    weights = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
+    orig_luma = np.tensordot(orig, weights, axes=([-1], [0]))
+    gen_luma = np.tensordot(gen, weights, axes=([-1], [0]))
+    luma_delta = gen_luma - orig_luma
+    rgb_delta_abs = np.max(np.abs(gen - orig), axis=2)
+
+    sample_mask = (
+        (edit > 0.15)
+        & (obj_dilated < 0.05)
+        & (np.abs(luma_delta) <= float(sample_max_delta))
+        & (rgb_delta_abs <= float(sample_max_delta) * 2.0)
+    )
+    sample_count = int(np.count_nonzero(sample_mask))
+    if sample_count < 32:
+        return generated_crop.convert("RGB"), {
+            "applied": False,
+            "reason": "insufficient_clean_wall_samples",
+            "sample_count": sample_count,
+            "exclusion_px": int(exclusion_px),
+            "sample_max_delta": float(sample_max_delta),
+        }
+
+    orig_med = np.median(orig[sample_mask], axis=0)
+    gen_med = np.median(gen[sample_mask], axis=0)
+    delta = (orig_med - gen_med) * float(strength)
+    clamp = float(max(0.0, max_rgb_delta))
+    if clamp > 0:
+        delta = np.clip(delta, -clamp, clamp)
+    corrected = np.clip(gen + delta.reshape(1, 1, 3), 0, 255)
+    return Image.fromarray(corrected.astype(np.uint8), mode="RGB"), {
+        "applied": True,
+        "sample_count": sample_count,
+        "exclusion_px": int(exclusion_px),
+        "sample_max_delta": float(sample_max_delta),
+        "max_rgb_delta": float(max_rgb_delta),
+        "strength": float(strength),
+        "orig_wall_median_rgb": [float(v) for v in orig_med],
+        "generated_wall_median_rgb": [float(v) for v in gen_med],
+        "applied_delta_rgb": [float(v) for v in delta],
+    }
+
+
 def _composite_photometric_crop(
     *,
     original_path: Path,
@@ -275,6 +450,12 @@ def _composite_photometric_crop(
     photometric_blur_px: int,
     photometric_max_delta: float,
     photometric_strength: float,
+    relocation_search_px: int,
+    relocation_min_score: float,
+    wall_sample_exclusion_px: int,
+    wall_sample_max_delta: float,
+    wall_rgb_max_delta: float,
+    wall_rgb_correction_strength: float,
 ) -> dict[str, Any]:
     with Image.open(original_path) as original, Image.open(generated_crop_path) as generated, Image.open(edit_mask_crop_path) as edit_mask:
         base = original.convert("RGB")
@@ -301,7 +482,38 @@ def _composite_photometric_crop(
             core_alpha = np.clip(object_alpha * edit_alpha, 0.0, 1.0)
             core_mask_available = False
 
+        # Re-locate the generated crop back to the hard-paste artwork anchor.
+        # This fixes GPT Image's common small drift/squash before we reuse its
+        # shadow pixels.
+        anchor_alpha = core_alpha if core_mask_available else object_alpha
+        relocation_trace = _estimate_anchor_translation(
+            original_crop=original_crop,
+            generated_crop=generated_rgb,
+            anchor_alpha=anchor_alpha,
+            max_shift_px=relocation_search_px,
+            min_score=relocation_min_score,
+        )
+        if relocation_trace.get("applied"):
+            generated_rgb = _translate_rgb_array(
+                generated_rgb,
+                dx=int(relocation_trace.get("dx") or 0),
+                dy=int(relocation_trace.get("dy") or 0),
+                fill_image=original_crop,
+            )
+
+        generated_rgb, wall_rgb_trace = _correct_generated_wall_rgb(
+            original_crop=original_crop,
+            generated_crop=generated_rgb,
+            edit_alpha=edit_alpha,
+            object_alpha=object_alpha,
+            exclusion_px=wall_sample_exclusion_px,
+            sample_max_delta=wall_sample_max_delta,
+            max_rgb_delta=wall_rgb_max_delta,
+            strength=wall_rgb_correction_strength,
+        )
+
         orig_arr = np.asarray(original_crop, dtype=np.float32)
+        generated_arr = np.asarray(generated_rgb, dtype=np.float32)
         delta = _low_frequency_luma_delta(
             original_crop,
             generated_rgb,
@@ -317,14 +529,14 @@ def _composite_photometric_crop(
         object_w = np.clip(object_alpha * edit_alpha, 0.0, 1.0)[..., None]
 
         # Outside the artwork object but still inside the edit mask, keep the
-        # model-generated wall/contact-shadow pixels. This is where GPT Image
-        # usually produces the best cast shadow and wall integration, and it
-        # must not be pasted back to the hard-paste wall.
+        # model-generated wall/contact-shadow pixels after anchor relocation and
+        # wall-RGB correction. This preserves the good projection while removing
+        # crop paste patches.
         shadow_w = np.clip(edit_alpha - object_alpha, 0.0, 1.0)[..., None]
         out_arr = (
             orig_arr * (1.0 - np.clip(object_w + shadow_w, 0.0, 1.0))
             + photometric_arr * object_w
-            + np.asarray(generated_rgb, dtype=np.float32) * shadow_w
+            + generated_arr * shadow_w
         )
 
         out_crop = Image.fromarray(np.clip(out_arr, 0, 255).astype(np.uint8), mode="RGB")
@@ -342,7 +554,9 @@ def _composite_photometric_crop(
         "core_mask_available": core_mask_available,
         "hardpaste_core_pixel_restore": False,
         "core_treatment": "low_frequency_achromatic_luminance_transfer_only",
-        "edge_treatment": "generated_shadow_pixels_preserved_outside_artwork_object_within_edit_mask",
+        "edge_treatment": "generated_shadow_pixels_preserved_after_anchor_relocation_and_wall_rgb_correction",
+        "anchor_relocation": relocation_trace,
+        "wall_rgb_correction": wall_rgb_trace,
         "edge_feather_px": int(edge_feather_px),
         "core_feather_px": int(core_feather_px),
         "core_protection_px": int(core_protection_px),
@@ -373,6 +587,12 @@ class ApiyiGptImage2Client:
     photometric_strength: float = 1.0
     core_mask_feather_px: int = 1
     core_protection_px: int = 3
+    relocation_search_px: int = 24
+    relocation_min_score: float = 0.38
+    wall_sample_exclusion_px: int = 12
+    wall_sample_max_delta: float = 18.0
+    wall_rgb_max_delta: float = 24.0
+    wall_rgb_correction_strength: float = 1.0
     allow_unmasked_fallback: bool = False
 
     @classmethod
@@ -406,6 +626,12 @@ class ApiyiGptImage2Client:
             photometric_strength=max(0.0, float(os.getenv("APIYI_GPT_IMAGE_PHOTOMETRIC_STRENGTH", "1.0"))),
             core_mask_feather_px=max(0, int(os.getenv("APIYI_GPT_IMAGE_CORE_MASK_FEATHER_PX", "1"))),
             core_protection_px=max(0, int(os.getenv("APIYI_GPT_IMAGE_CORE_PROTECTION_PX", "3"))),
+            relocation_search_px=max(0, int(os.getenv("APIYI_GPT_IMAGE_RELOCATION_SEARCH_PX", "24"))),
+            relocation_min_score=max(0.0, float(os.getenv("APIYI_GPT_IMAGE_RELOCATION_MIN_SCORE", "0.38"))),
+            wall_sample_exclusion_px=max(0, int(os.getenv("APIYI_GPT_IMAGE_WALL_SAMPLE_EXCLUSION_PX", "12"))),
+            wall_sample_max_delta=max(0.0, float(os.getenv("APIYI_GPT_IMAGE_WALL_SAMPLE_MAX_DELTA", "18"))),
+            wall_rgb_max_delta=max(0.0, float(os.getenv("APIYI_GPT_IMAGE_WALL_RGB_MAX_DELTA", "24"))),
+            wall_rgb_correction_strength=max(0.0, float(os.getenv("APIYI_GPT_IMAGE_WALL_RGB_CORRECTION_STRENGTH", "1.0"))),
             allow_unmasked_fallback=_env_truthy("APIYI_GPT_IMAGE_ALLOW_UNMASKED_FALLBACK", "0"),
         )
 
@@ -579,6 +805,12 @@ class ApiyiGptImage2Client:
                         photometric_blur_px=self.photometric_blur_px,
                         photometric_max_delta=self.photometric_max_delta,
                         photometric_strength=self.photometric_strength,
+                        relocation_search_px=self.relocation_search_px,
+                        relocation_min_score=self.relocation_min_score,
+                        wall_sample_exclusion_px=self.wall_sample_exclusion_px,
+                        wall_sample_max_delta=self.wall_sample_max_delta,
+                        wall_rgb_max_delta=self.wall_rgb_max_delta,
+                        wall_rgb_correction_strength=self.wall_rgb_correction_strength,
                     )
                 else:
                     composite_trace = _composite_masked_crop(

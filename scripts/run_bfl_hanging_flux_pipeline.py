@@ -15,6 +15,8 @@ from typing import Any
 import numpy as np
 from PIL import Image, ImageFilter
 
+import cv2
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -129,6 +131,146 @@ def _low_frequency_luma_delta_image(original: Image.Image, generated: Image.Imag
     return delta[..., None] * float(strength)
 
 
+def _alpha_bbox(alpha: np.ndarray, *, threshold: float = 0.2) -> tuple[int, int, int, int] | None:
+    arr = np.asarray(alpha)
+    if arr.ndim == 3:
+        arr = arr[:, :, 0]
+    ys, xs = np.where(arr > float(threshold))
+    if xs.size == 0 or ys.size == 0:
+        return None
+    return int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
+
+
+def _dilate_alpha(alpha: np.ndarray, radius_px: int) -> np.ndarray:
+    if radius_px <= 0:
+        return np.asarray(alpha, dtype=np.float32)
+    arr = np.asarray(alpha, dtype=np.float32)
+    if arr.ndim == 3:
+        arr = arr[:, :, 0]
+    k = max(1, int(radius_px) * 2 + 1)
+    kernel = np.ones((k, k), np.uint8)
+    return cv2.dilate((np.clip(arr, 0.0, 1.0) * 255.0).astype(np.uint8), kernel, iterations=1).astype(np.float32) / 255.0
+
+
+def _estimate_anchor_translation_full(
+    *,
+    hard_rgb: Image.Image,
+    render_rgb: Image.Image,
+    anchor_alpha: np.ndarray,
+    max_shift_px: int,
+    min_score: float,
+) -> dict[str, Any]:
+    max_shift = max(0, int(max_shift_px))
+    bbox = _alpha_bbox(anchor_alpha, threshold=0.2)
+    if bbox is None or max_shift <= 0:
+        return {"applied": False, "reason": "missing_anchor_or_search_disabled", "dx": 0, "dy": 0, "score": None}
+    w, h = hard_rgb.size
+    x0, y0, x1, y1 = bbox
+    pad = 2
+    x0, y0, x1, y1 = max(0, x0 - pad), max(0, y0 - pad), min(w, x1 + pad), min(h, y1 + pad)
+    if (x1 - x0) < 6 or (y1 - y0) < 6:
+        return {"applied": False, "reason": "anchor_too_small", "dx": 0, "dy": 0, "score": None, "anchor_bbox": [x0, y0, x1, y1]}
+    hard_gray = np.asarray(hard_rgb.convert("L"), dtype=np.float32)
+    render_gray = np.asarray(render_rgb.convert("L"), dtype=np.float32)
+    template = hard_gray[y0:y1, x0:x1]
+    if float(np.std(template)) < 3.0:
+        return {"applied": False, "reason": "anchor_low_texture", "dx": 0, "dy": 0, "score": None, "anchor_bbox": [x0, y0, x1, y1]}
+    sx0 = max(0, x0 - max_shift)
+    sy0 = max(0, y0 - max_shift)
+    sx1 = min(w, x1 + max_shift)
+    sy1 = min(h, y1 + max_shift)
+    search = render_gray[sy0:sy1, sx0:sx1]
+    if search.shape[0] < template.shape[0] or search.shape[1] < template.shape[1]:
+        return {"applied": False, "reason": "search_region_too_small", "dx": 0, "dy": 0, "score": None, "anchor_bbox": [x0, y0, x1, y1]}
+    result = cv2.matchTemplate(search, template, cv2.TM_CCOEFF_NORMED)
+    _min_val, max_val, _min_loc, max_loc = cv2.minMaxLoc(result)
+    gen_x0 = sx0 + int(max_loc[0])
+    gen_y0 = sy0 + int(max_loc[1])
+    dx = int(x0 - gen_x0)
+    dy = int(y0 - gen_y0)
+    applied = bool(max_val >= float(min_score) and (dx != 0 or dy != 0) and abs(dx) <= max_shift and abs(dy) <= max_shift)
+    return {
+        "applied": applied,
+        "reason": None if applied else "score_below_threshold_or_zero_shift",
+        "dx": dx if applied else 0,
+        "dy": dy if applied else 0,
+        "raw_dx": dx,
+        "raw_dy": dy,
+        "score": float(max_val),
+        "min_score": float(min_score),
+        "max_shift_px": int(max_shift),
+        "anchor_bbox": [int(x0), int(y0), int(x1), int(y1)],
+        "matched_bbox": [int(gen_x0), int(gen_y0), int(gen_x0 + (x1 - x0)), int(gen_y0 + (y1 - y0))],
+    }
+
+
+def _translate_full_rgb(render_rgb: Image.Image, *, dx: int, dy: int, fill_rgb: Image.Image) -> Image.Image:
+    if dx == 0 and dy == 0:
+        return render_rgb.convert("RGB")
+    arr = np.asarray(render_rgb.convert("RGB"), dtype=np.uint8)
+    fill = np.asarray(fill_rgb.convert("RGB"), dtype=np.uint8)
+    h, w = arr.shape[:2]
+    matrix = np.array([[1.0, 0.0, float(dx)], [0.0, 1.0, float(dy)]], dtype=np.float32)
+    shifted = cv2.warpAffine(arr, matrix, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
+    valid = cv2.warpAffine(np.ones((h, w), dtype=np.uint8) * 255, matrix, (w, h), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    shifted[valid == 0] = fill[valid == 0]
+    return Image.fromarray(shifted, mode="RGB")
+
+
+def _correct_render_wall_rgb_full(
+    *,
+    hard_rgb: Image.Image,
+    render_rgb: Image.Image,
+    edit_alpha: np.ndarray,
+    object_alpha: np.ndarray,
+    exclusion_px: int,
+    sample_max_delta: float,
+    max_rgb_delta: float,
+    strength: float,
+) -> tuple[Image.Image, dict[str, Any]]:
+    hard = np.asarray(hard_rgb.convert("RGB"), dtype=np.float32)
+    render = np.asarray(render_rgb.convert("RGB"), dtype=np.float32)
+    obj_dilated = _dilate_alpha(object_alpha, int(exclusion_px))
+    weights = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
+    hard_luma = np.tensordot(hard, weights, axes=([-1], [0]))
+    render_luma = np.tensordot(render, weights, axes=([-1], [0]))
+    luma_delta = render_luma - hard_luma
+    rgb_delta_abs = np.max(np.abs(render - hard), axis=2)
+    sample_mask = (
+        (np.asarray(edit_alpha, dtype=np.float32) > 0.15)
+        & (obj_dilated < 0.05)
+        & (np.abs(luma_delta) <= float(sample_max_delta))
+        & (rgb_delta_abs <= float(sample_max_delta) * 2.0)
+    )
+    sample_count = int(np.count_nonzero(sample_mask))
+    if sample_count < 32:
+        return render_rgb.convert("RGB"), {
+            "applied": False,
+            "reason": "insufficient_clean_wall_samples",
+            "sample_count": sample_count,
+            "exclusion_px": int(exclusion_px),
+            "sample_max_delta": float(sample_max_delta),
+        }
+    hard_med = np.median(hard[sample_mask], axis=0)
+    render_med = np.median(render[sample_mask], axis=0)
+    delta = (hard_med - render_med) * float(strength)
+    clamp = float(max(0.0, max_rgb_delta))
+    if clamp > 0:
+        delta = np.clip(delta, -clamp, clamp)
+    corrected = np.clip(render + delta.reshape(1, 1, 3), 0, 255)
+    return Image.fromarray(corrected.astype(np.uint8), mode="RGB"), {
+        "applied": True,
+        "sample_count": sample_count,
+        "exclusion_px": int(exclusion_px),
+        "sample_max_delta": float(sample_max_delta),
+        "max_rgb_delta": float(max_rgb_delta),
+        "strength": float(strength),
+        "hard_wall_median_rgb": [float(v) for v in hard_med],
+        "render_wall_median_rgb": [float(v) for v in render_med],
+        "applied_delta_rgb": [float(v) for v in delta],
+    }
+
+
 def _apply_final_photometric_lock(
     *,
     hard_paste: Path,
@@ -141,6 +283,12 @@ def _apply_final_photometric_lock(
     strength: float,
     feather_px: int,
     shadow_feather_px: int,
+    relocation_search_px: int,
+    relocation_min_score: float,
+    wall_sample_exclusion_px: int,
+    wall_sample_max_delta: float,
+    wall_rgb_max_delta: float,
+    wall_rgb_correction_strength: float,
 ) -> dict[str, Any]:
     with Image.open(hard_paste) as hard_img, Image.open(render) as render_img, Image.open(object_mask) as object_mask_img:
         hard_rgb = hard_img.convert("RGB")
@@ -154,7 +302,7 @@ def _apply_final_photometric_lock(
         object_mask_for_light = object_mask_l
         if feather_px > 0:
             object_mask_for_light = object_mask_for_light.filter(ImageFilter.GaussianBlur(radius=float(feather_px)))
-        object_alpha = np.asarray(object_mask_for_light, dtype=np.float32)[..., None] / 255.0
+        object_alpha = np.asarray(object_mask_for_light, dtype=np.float32) / 255.0
 
         if edit_mask is not None and edit_mask.exists():
             with Image.open(edit_mask) as edit_mask_img:
@@ -169,12 +317,42 @@ def _apply_final_photometric_lock(
             edit_mask_for_shadow = edit_mask_l.filter(ImageFilter.GaussianBlur(radius=float(shadow_feather_px)))
         else:
             edit_mask_for_shadow = edit_mask_l
-        edit_alpha = np.asarray(edit_mask_for_shadow, dtype=np.float32)[..., None] / 255.0
+        edit_alpha_2d = np.asarray(edit_mask_for_shadow, dtype=np.float32) / 255.0
+
+        relocation_trace = _estimate_anchor_translation_full(
+            hard_rgb=hard_rgb,
+            render_rgb=render_rgb,
+            anchor_alpha=object_alpha,
+            max_shift_px=relocation_search_px,
+            min_score=relocation_min_score,
+        )
+        if relocation_trace.get("applied"):
+            render_rgb = _translate_full_rgb(
+                render_rgb,
+                dx=int(relocation_trace.get("dx") or 0),
+                dy=int(relocation_trace.get("dy") or 0),
+                fill_rgb=hard_rgb,
+            )
+
+        render_rgb, wall_rgb_trace = _correct_render_wall_rgb_full(
+            hard_rgb=hard_rgb,
+            render_rgb=render_rgb,
+            edit_alpha=edit_alpha_2d,
+            object_alpha=object_alpha,
+            exclusion_px=wall_sample_exclusion_px,
+            sample_max_delta=wall_sample_max_delta,
+            max_rgb_delta=wall_rgb_max_delta,
+            strength=wall_rgb_correction_strength,
+        )
 
         # Preserve provider-rendered contact shadow / projection outside the
         # mounted artwork object, but never paste generated object pixels over
-        # the artwork itself. This fixes squash/drift while keeping shadows.
-        shadow_alpha = np.clip(edit_alpha * (1.0 - object_alpha), 0.0, 1.0)
+        # the artwork itself. Relocation aligns the generated shadow to the
+        # locked artwork geometry; wall-RGB correction removes crop-paste color
+        # patches while retaining the relative shadow.
+        object_alpha_3d = object_alpha[..., None]
+        edit_alpha_3d = edit_alpha_2d[..., None]
+        shadow_alpha = np.clip(edit_alpha_3d * (1.0 - object_alpha_3d), 0.0, 1.0)
 
         hard_arr = np.asarray(hard_rgb, dtype=np.float32)
         render_arr = np.asarray(render_rgb, dtype=np.float32)
@@ -188,13 +366,13 @@ def _apply_final_photometric_lock(
         adjusted_object = np.clip(hard_arr + delta, 0, 255)
 
         out = hard_arr * (1.0 - shadow_alpha) + render_arr * shadow_alpha
-        out = out * (1.0 - object_alpha) + adjusted_object * object_alpha
+        out = out * (1.0 - object_alpha_3d) + adjusted_object * object_alpha_3d
 
         out_path.parent.mkdir(parents=True, exist_ok=True)
         Image.fromarray(np.clip(out, 0, 255).astype(np.uint8), mode="RGB").save(out_path)
     return {
         "enabled": True,
-        "mode": "post_provider_shadow_preserving_photometric_object_lock",
+        "mode": "post_provider_shadow_preserving_photometric_object_lock_relocated_wall_corrected",
         "input_render_path": str(render),
         "hard_paste_path": str(hard_paste),
         "object_mask_path": str(object_mask),
@@ -203,8 +381,10 @@ def _apply_final_photometric_lock(
         "output_path": str(out_path),
         "outside_object_pixels_preserved_from_hardpaste": False,
         "rendered_shadow_preserved_outside_object": True,
-        "generated_pixels_pasted": "outside_object_within_edit_mask_only",
+        "generated_pixels_pasted": "outside_object_within_edit_mask_only_after_relocation_and_wall_rgb_correction",
         "intrinsic_color_policy": "artwork_object_achromatic_low_frequency_luma_delta_only",
+        "anchor_relocation": relocation_trace,
+        "wall_rgb_correction": wall_rgb_trace,
         "blur_px": int(blur_px),
         "max_delta": float(max_delta),
         "strength": float(strength),
@@ -735,6 +915,12 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                         strength=max(0.0, _env_float("MOLINK_FINAL_PHOTOMETRIC_LOCK_STRENGTH", 1.0)),
                         feather_px=max(0, int(os.getenv("MOLINK_FINAL_PHOTOMETRIC_LOCK_FEATHER_PX", "1"))),
                         shadow_feather_px=max(0, int(os.getenv("MOLINK_FINAL_SHADOW_FEATHER_PX", "2"))),
+                        relocation_search_px=max(0, int(os.getenv("MOLINK_FINAL_RELOCATION_SEARCH_PX", "24"))),
+                        relocation_min_score=max(0.0, _env_float("MOLINK_FINAL_RELOCATION_MIN_SCORE", 0.38)),
+                        wall_sample_exclusion_px=max(0, int(os.getenv("MOLINK_FINAL_WALL_SAMPLE_EXCLUSION_PX", "12"))),
+                        wall_sample_max_delta=max(0.0, _env_float("MOLINK_FINAL_WALL_SAMPLE_MAX_DELTA", 18.0)),
+                        wall_rgb_max_delta=max(0.0, _env_float("MOLINK_FINAL_WALL_RGB_MAX_DELTA", 24.0)),
+                        wall_rgb_correction_strength=max(0.0, _env_float("MOLINK_FINAL_WALL_RGB_CORRECTION_STRENGTH", 1.0)),
                     )
                     render_result = ImageEditResult(
                         image=locked_path,
