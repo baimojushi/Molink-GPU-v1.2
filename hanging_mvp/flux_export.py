@@ -239,22 +239,25 @@ def build_render_prompt(
         )
     mask_lock_rule = (
         "HARD EDIT MASK: the provided mask is mandatory. Do not edit pixels outside that mask. "
+        "Do not edit any non-artwork room region, wall, window, floor, door, or architecture. "
         "Never add duplicate paintings, extra frames, people, labels, hooks, or wall decorations outside the mask. "
     )
     size_lock_rule = (
         "STRICT SIZE LOCK: preserve the painting core image dimensions inside the target polygon. "
         "Do not shrink, enlarge, recrop, extend, compress, stretch, zoom, or pad the painting core. "
         "The visible artwork core must keep the same pixel footprint, aspect ratio, and boundary alignment as the hard-paste target. "
-        "Inside the painting core, only low-frequency exposure / brightness / color-temperature adaptation is allowed; "
+        "Inside the painting core, only low-frequency exposure / brightness / lightness adaptation is allowed; "
         "do not change high-frequency artwork structure, brush strokes, figures, symbols, layout, subject identity, or small interior shapes. "
+        "INTRINSIC COLOR LOCK: do not recolor the painting, frame, border, mat, liner, or surround. Preserve the intrinsic base color of all artwork components. "
         "The visible frame or border is also identity-locked: keep its color, thickness, opening, proportions, and geometry unchanged. "
         "Any frame treatment must stay outside the painting core and must not consume or expand the painted image area. "
     )
     conservative_edit_rule = (
         "CONSERVATIVE EDIT PROFILE: perform the minimum possible edit. "
         "Prioritize lighting integration over generation. "
-        "Most changes should occur in the narrow wall-contact halo and soft shadow region around the artwork, not inside the frame or painting core. "
-        "If unsure, leave the current pixels unchanged. "
+        "Treat the task as photometric compositing, not repainting. "
+        "Only apply low-frequency achromatic light / shadow / brightness modulation derived from the environment. "
+        "Do not directly change intrinsic colors. If unsure, leave the current pixels unchanged. "
     )
 
     base = (
@@ -266,10 +269,10 @@ def build_render_prompt(
         "Keep the artwork center, outer bounds, painting core size, scale, aspect ratio, crop, content, and perspective exactly the same as the hard-paste target. "
         f"{size_lock_rule}"
         f"{conservative_edit_rule}"
-        "Only blend local contact edges, subtle wall contact shadow, and lighting around the artwork. "
-        "Within the mounted object, any allowed change must be photometric-only and low-frequency. "
-        "Keep the room geometry, wall texture, windows, doors, wall corners, floor, ceiling, architectural lines, lens perspective, and camera unchanged. "
-        "Remove residual cleanup artifacts only outside the artwork region. "
+        "Only blend local lighting over the visible artwork object itself. "
+        "Within the mounted object, any allowed change must be photometric-only, low-frequency, and achromatic with respect to intrinsic color. "
+        "Do not edit non-artwork pixels, wall texture, windows, doors, wall corners, floor, ceiling, architectural lines, lens perspective, or camera. "
+        "Do not remove or alter anything outside the artwork region. "
         f"{frame_rule} "
         "FINAL SIZE LOCK AFTER FRAME RULE: keep the painting core pixel footprint exactly unchanged; do not expand the artwork or any frame-like surround into the editable wall area."
     )

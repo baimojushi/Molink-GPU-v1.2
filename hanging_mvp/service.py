@@ -427,6 +427,7 @@ def _compute_artwork_mount_policy_for_candidate(
     min_area = float(rule_value(rules, ["artwork_mount", "min_side_face_area_px"], 3))
     min_width = float(rule_value(rules, ["artwork_mount", "min_side_face_width_px"], 1.5))
     edge_sample_px = int(rule_value(rules, ["artwork_mount", "edge_sample_px"], 8))
+    edge_average_depth_px = int(rule_value(rules, ["artwork_mount", "edge_average_depth_px"], max(1, min(2, edge_sample_px))))
     side_shading_strength = float(rule_value(rules, ["artwork_mount", "side_shading_strength"], 0.18))
 
     origin = np.array(basis.origin, np.float32)
@@ -506,9 +507,10 @@ def _compute_artwork_mount_policy_for_candidate(
         "front_anchor_mode": "candidate_projection_visual_front_locked",
         "visible_side_faces_original": visible,
         "edge_sample_px": int(edge_sample_px),
+        "edge_average_depth_px": int(max(1, edge_average_depth_px)),
         "side_shading_strength": float(side_shading_strength),
         "max_visible_side_faces": int(max_faces),
-        "edge_color_source": "artwork_outer_edge_pixels",
+        "edge_color_source": "original_artwork_outer_edge_average_color",
         "artwork_analysis": artwork_analysis or {},
     }
 

@@ -258,7 +258,7 @@ def _warp_rgba_to_quad(
     return out
 
 
-def _edge_side_texture(artwork_rgba: np.ndarray, source_edge: str, sample_px: int, *, side_shading_strength: float = 0.18) -> np.ndarray:
+def _edge_side_texture(artwork_rgba: np.ndarray, source_edge: str, sample_px: int, *, side_shading_strength: float = 0.18, average_depth_px: int | None = None) -> np.ndarray:
     ah, aw = artwork_rgba.shape[:2]
     sample = max(1, min(int(sample_px or 1), max(1, min(aw, ah) // 2)))
     edge = str(source_edge or "right").lower()
@@ -272,7 +272,40 @@ def _edge_side_texture(artwork_rgba: np.ndarray, source_edge: str, sample_px: in
         tex = artwork_rgba[max(0, ah - sample):, :, :].copy()
     else:
         tex = artwork_rgba[:, max(0, aw - sample):, :].copy()
-    tex = tex.astype(np.float32)
+
+    # Side-face color must come from the original artwork outer edge itself,
+    # not from a warped hard-paste strip and not from a deep strip that can
+    # accidentally include inner mat / liner pixels after small downscales.
+    # We therefore estimate a single intrinsic edge color from only the
+    # outermost edge band of the original artwork, then build a solid side-face
+    # texture from that mean color and apply deterministic shading on top.
+    avg_depth = max(1, min(int(average_depth_px or max(1, min(2, sample))), sample))
+    if edge == "left":
+        avg_band = artwork_rgba[:, :avg_depth, :].copy()
+    elif edge == "right":
+        avg_band = artwork_rgba[:, max(0, aw - avg_depth):, :].copy()
+    elif edge == "top":
+        avg_band = artwork_rgba[:avg_depth, :, :].copy()
+    elif edge == "bottom":
+        avg_band = artwork_rgba[max(0, ah - avg_depth):, :, :].copy()
+    else:
+        avg_band = artwork_rgba[:, max(0, aw - avg_depth):, :].copy()
+
+    band = avg_band.astype(np.float32)
+    alpha = band[:, :, 3:4] / 255.0
+    weight = np.maximum(alpha, 1e-6)
+    denom = np.sum(weight)
+    if denom <= 1e-6:
+        mean_rgb = np.mean(band[:, :, :3].reshape(-1, 3), axis=0)
+        mean_alpha = 255.0
+    else:
+        mean_rgb = np.sum(band[:, :, :3] * weight, axis=(0, 1)) / denom
+        mean_alpha = float(np.sum(band[:, :, 3:4]) / np.maximum(band.shape[0] * band.shape[1], 1))
+
+    solid = np.zeros_like(tex, dtype=np.float32)
+    solid[:, :, :3] = mean_rgb.reshape(1, 1, 3)
+    solid[:, :, 3] = mean_alpha
+    tex = solid
     shade_strength = max(0.0, min(0.65, float(side_shading_strength or 0.0)))
     # Product lighting convention for deterministic side precompose:
     # keep side faces overall darker than the artwork front, but make the
@@ -326,6 +359,7 @@ def warp_artwork_mount_to_geometry(
     side_faces_original: list[dict],
     *,
     edge_sample_px: int = 8,
+    edge_average_depth_px: int | None = None,
     side_shading_strength: float = 0.18,
     supersample_scale: int = 4,
     clip_side_faces_to_front_span: bool = True,
@@ -356,7 +390,13 @@ def warp_artwork_mount_to_geometry(
             clip_polygon = _side_face_front_span_clip_polygon(quad, pad_px=side_face_span_pad_px)
             if clip_polygon is None or len(clip_polygon) < 3:
                 continue
-        tex = _edge_side_texture(artwork_rgba, edge, int(edge_sample_px), side_shading_strength=side_shading_strength)
+        tex = _edge_side_texture(
+            artwork_rgba,
+            edge,
+            int(edge_sample_px),
+            side_shading_strength=side_shading_strength,
+            average_depth_px=edge_average_depth_px,
+        )
         canvas = _warp_rgba_to_quad(canvas, tex, quad, supersample_scale=supersample_scale, clip_polygon=clip_polygon)
         fm = _mask_from_polygon((h, w), clip_polygon) if clip_polygon else _mask_from_quad((h, w), quad)
         side_mask = cv2.bitwise_or(side_mask, fm)
@@ -390,6 +430,8 @@ def warp_artwork_mount_to_geometry(
             "side_mask_area_px": int(np.count_nonzero(side_mask)),
             "mount_mask_area_px": int(np.count_nonzero(mount_mask)),
             "edge_sample_px": int(edge_sample_px),
+            "edge_average_depth_px": int(edge_average_depth_px if edge_average_depth_px is not None else max(1, min(2, int(edge_sample_px) if int(edge_sample_px) > 0 else 1))),
+            "side_texture_policy": "solid_texture_from_original_artwork_outer_edge_average_color",
             "side_shading_strength": float(side_shading_strength),
             "side_shading_policy": "side overall darker; artwork-front-adjacent edge brighter than outer/wall-contact edge",
             "clip_side_faces_to_front_span": bool(clip_side_faces_to_front_span),

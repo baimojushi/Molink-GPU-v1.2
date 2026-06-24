@@ -240,20 +240,24 @@ def _as_alpha(mask: Image.Image, size: tuple[int, int], *, feather_px: int = 0) 
     return np.asarray(alpha, dtype=np.float32) / 255.0
 
 
-def _low_frequency_delta(original: Image.Image, generated: Image.Image, *, blur_px: int, max_delta: float, strength: float) -> np.ndarray:
-    """Return a clamped low-frequency RGB delta field.
+def _low_frequency_luma_delta(original: Image.Image, generated: Image.Image, *, blur_px: int, max_delta: float, strength: float) -> np.ndarray:
+    """Return a clamped low-frequency achromatic luminance delta field.
 
-    This extracts exposure / color-temperature adaptation from the model output
-    while discarding high-frequency hallucinated artwork content.
+    The field is derived from generated-vs-original lighting but applied as a
+    neutral lightness change only, so intrinsic artwork/frame colors are
+    preserved and the model cannot recolor the object.
     """
     radius = max(1, int(blur_px))
-    orig_blur = original.convert("RGB").filter(ImageFilter.GaussianBlur(radius=float(radius)))
-    gen_blur = generated.convert("RGB").filter(ImageFilter.GaussianBlur(radius=float(radius)))
-    delta = np.asarray(gen_blur, dtype=np.float32) - np.asarray(orig_blur, dtype=np.float32)
+    orig_blur = np.asarray(original.convert("RGB").filter(ImageFilter.GaussianBlur(radius=float(radius))), dtype=np.float32)
+    gen_blur = np.asarray(generated.convert("RGB").filter(ImageFilter.GaussianBlur(radius=float(radius))), dtype=np.float32)
+    weights = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
+    orig_luma = np.tensordot(orig_blur, weights, axes=([-1], [0]))
+    gen_luma = np.tensordot(gen_blur, weights, axes=([-1], [0]))
+    delta = gen_luma - orig_luma
     clamp = float(max(0.0, max_delta))
     if clamp > 0:
         delta = np.clip(delta, -clamp, clamp)
-    return delta * float(strength)
+    return delta[..., None] * float(strength)
 
 
 def _composite_photometric_crop(
@@ -261,6 +265,7 @@ def _composite_photometric_crop(
     original_path: Path,
     generated_crop_path: Path,
     edit_mask_crop_path: Path,
+    object_mask_crop_path: Path | None,
     core_mask_crop_path: Path | None,
     bbox: tuple[int, int, int, int],
     output_path: Path,
@@ -281,22 +286,23 @@ def _composite_photometric_crop(
             generated_rgb = generated_rgb.resize(crop_size, Image.Resampling.LANCZOS)
 
         edit_alpha = _as_alpha(edit_mask, crop_size, feather_px=edge_feather_px)
+        if object_mask_crop_path is not None and object_mask_crop_path.exists():
+            with Image.open(object_mask_crop_path) as object_mask:
+                object_alpha = _as_alpha(object_mask, crop_size, feather_px=0)
+            object_mask_available = True
+        else:
+            object_alpha = edit_alpha.copy()
+            object_mask_available = False
         if core_mask_crop_path is not None and core_mask_crop_path.exists():
             with Image.open(core_mask_crop_path) as core_mask:
                 core_alpha = _as_alpha(core_mask, crop_size, feather_px=core_feather_px)
-                protected_core_alpha = _as_alpha(core_mask, crop_size, feather_px=max(0, int(core_protection_px)))
             core_mask_available = True
         else:
-            # Safe fallback: when no front/core mask is exported, treat the
-            # whole edit mask as identity-sensitive and apply photometric-only
-            # transfer rather than direct generated pixels.
-            core_alpha = edit_alpha.copy()
-            protected_core_alpha = edit_alpha.copy()
+            core_alpha = np.clip(object_alpha * edit_alpha, 0.0, 1.0)
             core_mask_available = False
 
         orig_arr = np.asarray(original_crop, dtype=np.float32)
-        gen_arr = np.asarray(generated_rgb, dtype=np.float32)
-        delta = _low_frequency_delta(
+        delta = _low_frequency_luma_delta(
             original_crop,
             generated_rgb,
             blur_px=photometric_blur_px,
@@ -305,18 +311,11 @@ def _composite_photometric_crop(
         )
         photometric_arr = np.clip(orig_arr + delta, 0, 255)
 
-        # 1) The artwork front/core receives only a low-frequency exposure/color
-        # transfer.  High-frequency generated pixels are never pasted into the
-        # core, so a hallucinated painting cannot replace the user's artwork.
-        core_w = np.clip(core_alpha * edit_alpha, 0.0, 1.0)[..., None]
-        out_arr = orig_arr * (1.0 - core_w) + photometric_arr * core_w
-
-        # 2) Outside the protected front/core, the model may contribute edge
-        # contact shadows and wall blending.  The protected-core subtraction is
-        # what replaces the previous hard-paste core restore: the core is not
-        # restored; it is photometrically adapted from the generated lighting.
-        edge_alpha = np.clip(edit_alpha - protected_core_alpha, 0.0, 1.0)[..., None]
-        out_arr = out_arr * (1.0 - edge_alpha) + gen_arr * edge_alpha
+        # Only the visible artwork object may change, and only by low-frequency
+        # achromatic lightness transfer. No generated pixels are pasted over the
+        # artwork, and nothing outside the artwork object is modified.
+        object_w = np.clip(object_alpha * edit_alpha, 0.0, 1.0)[..., None]
+        out_arr = orig_arr * (1.0 - object_w) + photometric_arr * object_w
 
         out_crop = Image.fromarray(np.clip(out_arr, 0, 255).astype(np.uint8), mode="RGB")
         base.paste(out_crop, (bbox[0], bbox[1]))
@@ -325,14 +324,15 @@ def _composite_photometric_crop(
 
     return {
         "composited": True,
-        "mode": "photometric_core_edge_composite",
+        "mode": "photometric_intrinsic_color_preserving_composite",
         "bbox": list(bbox),
         "crop_size": list(crop_size),
         "generated_size": list(generated_size),
+        "object_mask_available": object_mask_available,
         "core_mask_available": core_mask_available,
         "hardpaste_core_pixel_restore": False,
-        "core_treatment": "low_frequency_photometric_transfer_from_generated_crop_to_hardpaste_core",
-        "edge_treatment": "direct_generated_pixels_outside_protected_core_only",
+        "core_treatment": "low_frequency_achromatic_luminance_transfer_only",
+        "edge_treatment": "no_generated_pixels_pasted_outside_artwork_object",
         "edge_feather_px": int(edge_feather_px),
         "core_feather_px": int(core_feather_px),
         "core_protection_px": int(core_protection_px),
@@ -428,6 +428,13 @@ class ApiyiGptImage2Client:
         target_for_api = image
         output_scope = "whole_image"
         composite_trace: dict[str, Any] = {"composited": False}
+        object_mask_source = (
+            request.metadata.get("art_region_mask_path")
+            or request.metadata.get("mount_mask_path")
+            or request.metadata.get("qa_art_mask_path")
+            or request.metadata.get("front_region_mask_path")
+        )
+        object_mask_path = _coerce_optional_path(object_mask_source)
         core_mask_source = (
             request.metadata.get("qa_art_mask_path")
             or request.metadata.get("front_region_mask_path")
@@ -456,6 +463,15 @@ class ApiyiGptImage2Client:
                 "structure_preserving_composite",
             }
             output_scope = "mask_photometric_composite" if photometric_mode else "mask_local_composite"
+            object_mask_crop_path = None
+            if photometric_mode and object_mask_path is not None:
+                object_mask_crop_path = _crop_mask_to_bbox(
+                    object_mask_path,
+                    image_size=tuple(local["full_size"]),
+                    bbox=tuple(int(v) for v in local["bbox"]),
+                    tmp_dir=upload_tmp,
+                    stem=f"{image.stem}_object",
+                )
             core_mask_crop_path = None
             if photometric_mode and core_mask_path is not None:
                 core_mask_crop_path = _crop_mask_to_bbox(
@@ -466,10 +482,13 @@ class ApiyiGptImage2Client:
                     stem=image.stem,
                 )
             mask_trace.update({
-                "mask_enforcement": "local_crop_then_photometric_core_edge_composite" if photometric_mode else "local_crop_then_mask_composite",
+                "mask_enforcement": "local_crop_then_photometric_artwork_only_composite" if photometric_mode else "local_crop_then_mask_composite",
                 "mask_enforced_locally": True,
                 "edit_crop_path": str(local["crop_path"]),
                 "mask_crop_path": str(local["mask_crop_path"]),
+                "object_mask_path": str(object_mask_path) if object_mask_path is not None else None,
+                "object_mask_crop_path": str(object_mask_crop_path) if object_mask_crop_path is not None else None,
+                "object_mask_source": str(object_mask_source) if object_mask_source else None,
                 "core_mask_path": str(core_mask_path) if core_mask_path is not None else None,
                 "core_mask_crop_path": str(core_mask_crop_path) if core_mask_crop_path is not None else None,
                 "core_mask_source": str(core_mask_source) if core_mask_source else None,
@@ -533,11 +552,13 @@ class ApiyiGptImage2Client:
                 if self.resize_to_input_size:
                     resize_trace = _resize_to_match(target_for_api, raw_out_path)
                 if output_scope == "mask_photometric_composite":
+                    object_crop_value = mask_trace.get("object_mask_crop_path")
                     core_crop_value = mask_trace.get("core_mask_crop_path")
                     composite_trace = _composite_photometric_crop(
                         original_path=image,
                         generated_crop_path=raw_out_path,
                         edit_mask_crop_path=crop_mask,
+                        object_mask_crop_path=Path(str(object_crop_value)) if object_crop_value else None,
                         core_mask_crop_path=Path(str(core_crop_value)) if core_crop_value else None,
                         bbox=bbox,  # type: ignore[arg-type]
                         output_path=out_path,
@@ -643,26 +664,26 @@ class ApiyiGptImage2Client:
         if output_scope in {"mask_local_composite", "mask_photometric_composite"}:
             if output_scope == "mask_photometric_composite":
                 prefix = (
-                    "修改图1。图1是完整房间画面中挂画区域及边缘阴影带的局部裁剪。"
-                    "保持图1内部挂画位置、挂画尺寸、透视、裁切、边框/画框外观、边框厚度、边框颜色、画芯内容、人物/图案结构稳定。"
-                    "画芯和可见边框都只允许整体明度、曝光、色温、低频光照一致性调整；不要改变任何笔触、纹理、图案、人物、构图、边界、边框样式或内开口。"
-                    "主要修改重点应集中在挂画外沿、墙面接触带、轻微阴影和融合真实感；如果不确定，请尽量保持现有像素不变。"
+                    "修改图1。图1是完整房间画面中挂画区域的局部裁剪。"
+                    "图1中的挂画位置、挂画尺寸、透视、裁切、边框/画框外观、边框厚度、边框颜色、白衬/卡纸、画芯内容、人物/图案结构都必须保持不变。"
+                    "只允许根据环境做低频、非着色性的光影和明度叠加；不得改变固有色，不得改变任何边框、白衬、画芯或图案的本色。"
+                    "不要修改挂画以外的区域，不要改动墙面、窗户、地面或房间结构。"
                     "不要新增、移动、缩放、复制、替换、重绘或重新设计画作，不要把画芯重新生成成另一幅画，也不要把边框改成新的黑边、白边或装饰框。"
-                    "输出保持图1的构图比例，便于回贴到原图。"
+                    "如果不确定，请尽量保持现有像素不变。输出保持图1的构图比例，便于回贴到原图。"
                 )
             else:
                 prefix = (
-                    "修改图1。图1是完整房间画面中挂画区域及边缘阴影带的局部裁剪。"
-                    "保持图1内部挂画位置、挂画尺寸、透视、画芯内容、边框/画框外观和裁切稳定。"
-                    "只优化挂画边缘融合、自然阴影、墙面接触感、光照一致性和真实感，尽量把改动集中在外沿和阴影带。"
+                    "修改图1。图1是完整房间画面中挂画区域的局部裁剪。"
+                    "保持图1内部挂画位置、挂画尺寸、透视、画芯内容、边框/画框外观、边框固有色和裁切稳定。"
+                    "只允许最小化的光照一致性调整，不要改变画作和边框的固有颜色，不要改动挂画以外的区域。"
                     "不要新增、移动、缩放、复制、替换画作，不要改变画芯图案，不要改边框颜色、厚度、样式或开口。"
                     "输出保持图1的构图比例，便于回贴到原图。"
                 )
         else:
             prefix = (
                 "修改图1。以图1作为唯一权威画布和最终构图。"
-                "保持房间结构、墙面、挂画位置、挂画尺寸、透视、边框/画框外观、画芯内容和画面裁切稳定。"
-                "只优化挂画边缘融合、自然阴影、墙面接触感、光照一致性和整体真实感，尽量减少内部重绘。"
+                "保持房间结构、墙面、挂画位置、挂画尺寸、透视、边框/画框外观、边框固有色、画芯内容和画面裁切稳定。"
+                "只允许对挂画对象本身进行最小化的低频光影/明度调整，不要改动固有色，也不要改动挂画以外的区域。"
                 "不要新增、移动、缩放、复制、替换画作，不要改变边框样式或画芯图案，不要重绘非挂画区域。"
             )
         if reference_count:

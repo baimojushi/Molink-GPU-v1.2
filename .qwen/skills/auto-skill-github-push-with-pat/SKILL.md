@@ -39,3 +39,33 @@ curl -s -H "Authorization: token <PAT>" https://api.github.com/repos/<user>/<rep
 ```bash
 curl -s -H "Authorization: token <PAT>" https://api.github.com/repos/<user>/<repo>/git/refs/heads/main | python3 -c "import sys,json; print(json.load(sys.stdin)['object']['sha'][:7])"
 ```
+
+## Network connectivity diagnosis
+
+On AutoDL machines in China, direct GitHub access often fails with:
+- `GnuTLS recv error (-110): The TLS connection was non-properly terminated`
+- `Failed to connect to github.com port 443 after 129934 ms: Connection timed out`
+
+**Pre-push connectivity check:**
+```bash
+curl -vI --connect-timeout 10 https://github.com 2>&1 | grep -E "Trying|connect to|Closing"
+```
+
+If the above shows connection timeout to `20.205.243.166:443`, GitHub is blocked.
+
+**Workarounds:**
+
+1. **If a local proxy is available** (e.g. clash, v2ray on the machine):
+```bash
+export https_proxy=http://127.0.0.1:<proxy_port>
+git -c credential.helper='!f() { echo "username=<user>"; echo "password=<PAT>"; }; f' push origin main
+```
+
+2. **SSH via proxy command** (if SSH key is configured and proxy supports it):
+```bash
+git config core.sshCommand "ssh -o ProxyCommand='nc -X connect -x <proxy_host>:<proxy_port> %h %p'"
+git remote set-url origin git@github.com:<user>/<repo>.git
+git push origin main
+```
+
+3. **Defer push** — commit locally and push when network allows. The local commit is safe; push can be retried later.

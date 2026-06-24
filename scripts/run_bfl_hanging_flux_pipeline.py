@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFilter
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -23,6 +23,7 @@ from hanging_mvp.hardpaste import load_rgba, save_rgb, warp_artwork_mount_to_geo
 from hanging_mvp.render_qa import evaluate_mask_anchored_render_qa
 from image_editing.pipeline import cleanup_objects, render_hanging
 from image_editing.provider_registry import build_image_edit_provider
+from image_editing.providers import ImageEditResult
 
 
 MOCK_PROVIDER_WARNING = (
@@ -68,6 +69,133 @@ def _resolve_render_prompt_upsampling(cli_value: bool | None) -> bool:
     return str(os.getenv("MOLINK_RENDER_PROMPT_UPSAMPLING", "0")).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _resolve_render_mask_scope(cli_value: str | None) -> str:
+    raw = str(cli_value or os.getenv("MOLINK_RENDER_MASK_SCOPE", "edit_region")).strip().lower()
+    if raw in {"front_only", "front"}:
+        return "front_only"
+    if raw in {"edit_region", "edit", "legacy"}:
+        return "edit_region"
+    return "art_only"
+
+
+def _select_render_mask_path(
+    *,
+    qa_art_mask: Path,
+    art_region_mask: Path,
+    flux2_edit_mask: Path,
+    scope: str,
+) -> tuple[Path, str]:
+    scope = _resolve_render_mask_scope(scope)
+    if scope == "front_only":
+        return qa_art_mask, "qa_art_mask_front_only"
+    if scope == "edit_region":
+        return flux2_edit_mask, "flux2_edit_mask_edit_region"
+    return art_region_mask, "art_region_mask_art_only"
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except Exception:
+        return float(default)
+
+
+def _low_frequency_luma_delta_image(original: Image.Image, generated: Image.Image, *, blur_px: int, max_delta: float, strength: float) -> np.ndarray:
+    radius = max(1, int(blur_px))
+    orig_blur = np.asarray(original.convert("RGB").filter(ImageFilter.GaussianBlur(radius=float(radius))), dtype=np.float32)
+    gen_blur = np.asarray(generated.convert("RGB").filter(ImageFilter.GaussianBlur(radius=float(radius))), dtype=np.float32)
+    weights = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
+    delta = np.tensordot(gen_blur, weights, axes=([-1], [0])) - np.tensordot(orig_blur, weights, axes=([-1], [0]))
+    clamp = float(max(0.0, max_delta))
+    if clamp > 0:
+        delta = np.clip(delta, -clamp, clamp)
+    return delta[..., None] * float(strength)
+
+
+def _apply_final_photometric_lock(
+    *,
+    hard_paste: Path,
+    render: Path,
+    object_mask: Path,
+    edit_mask: Path | None,
+    out_path: Path,
+    blur_px: int,
+    max_delta: float,
+    strength: float,
+    feather_px: int,
+    shadow_feather_px: int,
+) -> dict[str, Any]:
+    with Image.open(hard_paste) as hard_img, Image.open(render) as render_img, Image.open(object_mask) as object_mask_img:
+        hard_rgb = hard_img.convert("RGB")
+        render_rgb = render_img.convert("RGB")
+        if render_rgb.size != hard_rgb.size:
+            render_rgb = render_rgb.resize(hard_rgb.size, Image.Resampling.LANCZOS)
+
+        object_mask_l = object_mask_img.convert("L")
+        if object_mask_l.size != hard_rgb.size:
+            object_mask_l = object_mask_l.resize(hard_rgb.size, Image.Resampling.NEAREST)
+        object_mask_for_light = object_mask_l
+        if feather_px > 0:
+            object_mask_for_light = object_mask_for_light.filter(ImageFilter.GaussianBlur(radius=float(feather_px)))
+        object_alpha = np.asarray(object_mask_for_light, dtype=np.float32)[..., None] / 255.0
+
+        if edit_mask is not None and edit_mask.exists():
+            with Image.open(edit_mask) as edit_mask_img:
+                edit_mask_l = edit_mask_img.convert("L")
+                if edit_mask_l.size != hard_rgb.size:
+                    edit_mask_l = edit_mask_l.resize(hard_rgb.size, Image.Resampling.NEAREST)
+            edit_mask_available = True
+        else:
+            edit_mask_l = object_mask_l
+            edit_mask_available = False
+        if shadow_feather_px > 0:
+            edit_mask_for_shadow = edit_mask_l.filter(ImageFilter.GaussianBlur(radius=float(shadow_feather_px)))
+        else:
+            edit_mask_for_shadow = edit_mask_l
+        edit_alpha = np.asarray(edit_mask_for_shadow, dtype=np.float32)[..., None] / 255.0
+
+        # Preserve provider-rendered contact shadow / projection outside the
+        # mounted artwork object, but never paste generated object pixels over
+        # the artwork itself. This fixes squash/drift while keeping shadows.
+        shadow_alpha = np.clip(edit_alpha * (1.0 - object_alpha), 0.0, 1.0)
+
+        hard_arr = np.asarray(hard_rgb, dtype=np.float32)
+        render_arr = np.asarray(render_rgb, dtype=np.float32)
+        delta = _low_frequency_luma_delta_image(
+            hard_rgb,
+            render_rgb,
+            blur_px=blur_px,
+            max_delta=max_delta,
+            strength=strength,
+        )
+        adjusted_object = np.clip(hard_arr + delta, 0, 255)
+
+        out = hard_arr * (1.0 - shadow_alpha) + render_arr * shadow_alpha
+        out = out * (1.0 - object_alpha) + adjusted_object * object_alpha
+
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        Image.fromarray(np.clip(out, 0, 255).astype(np.uint8), mode="RGB").save(out_path)
+    return {
+        "enabled": True,
+        "mode": "post_provider_shadow_preserving_photometric_object_lock",
+        "input_render_path": str(render),
+        "hard_paste_path": str(hard_paste),
+        "object_mask_path": str(object_mask),
+        "edit_mask_path": str(edit_mask) if edit_mask is not None else None,
+        "edit_mask_available": bool(edit_mask_available),
+        "output_path": str(out_path),
+        "outside_object_pixels_preserved_from_hardpaste": False,
+        "rendered_shadow_preserved_outside_object": True,
+        "generated_pixels_pasted": "outside_object_within_edit_mask_only",
+        "intrinsic_color_policy": "artwork_object_achromatic_low_frequency_luma_delta_only",
+        "blur_px": int(blur_px),
+        "max_delta": float(max_delta),
+        "strength": float(strength),
+        "feather_px": int(feather_px),
+        "shadow_feather_px": int(shadow_feather_px),
+    }
+
+
 def _render_edit_runtime_metadata(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "seed": _resolve_render_seed(args.seed),
@@ -75,6 +203,7 @@ def _render_edit_runtime_metadata(args: argparse.Namespace) -> dict[str, Any]:
         "prompt_upsampling": _resolve_render_prompt_upsampling(getattr(args, "render_prompt_upsampling", None)),
         "render_creativity_profile": "low_variance_photometric_focus",
         "interior_artwork_regeneration_discouraged": True,
+        "render_mask_scope": _resolve_render_mask_scope(getattr(args, "render_mask_scope", None)),
     }
 
 
@@ -178,6 +307,7 @@ def _hardpaste_after_erase(
             front_quad_original=policy.get("front_quad_original") or quad,
             side_faces_original=policy.get("visible_side_faces_original") or [],
             edge_sample_px=int(policy.get("edge_sample_px", 8)),
+            edge_average_depth_px=int(policy.get("edge_average_depth_px", max(1, min(2, int(policy.get("edge_sample_px", 8)))))),
             side_shading_strength=float(policy.get("side_shading_strength", 0.18)),
             supersample_scale=int(supersample_scale),
         )
@@ -405,6 +535,20 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                         "mode": "missing_flux2_edit_mask_path",
                         "message": "Manifest did not include flux2_edit_mask_path; falling back to QA art mask so FLUX.2 is still masked.",
                     })
+                render_mask_scope = _resolve_render_mask_scope(getattr(args, "render_mask_scope", None))
+                render_mask, render_mask_source = _select_render_mask_path(
+                    qa_art_mask=qa_art_mask,
+                    art_region_mask=art_region_mask,
+                    flux2_edit_mask=flux2_edit_mask,
+                    scope=render_mask_scope,
+                )
+                mount_mask_candidate = _resolve_path(extracted, item.get("mount_mask_path"))
+                if mount_mask_candidate is not None and mount_mask_candidate.exists():
+                    render_object_mask = mount_mask_candidate
+                    render_object_mask_source = "mount_mask_path"
+                else:
+                    render_object_mask = art_region_mask
+                    render_object_mask_source = "art_region_mask_path"
                 prompt = item.get("render_prompt")
                 if not prompt and item.get("render_prompt_path"):
                     prompt = _require_existing(_resolve_path(extracted, item["render_prompt_path"]), label="render_prompt_path", asset_id=asset_id).read_text(encoding="utf-8")
@@ -529,7 +673,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                     provider,
                     render_primary,
                     prompt,
-                    art_mask=flux2_edit_mask,
+                    art_mask=render_mask,
                     references=render_refs,
                     output_dir=item_dir,
                     output_name="03_flux2_render.png" if sequence_mode.startswith("v7") else "02_flux2_render.png",
@@ -541,16 +685,47 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                         "sequence_mode": sequence_mode,
                         "flux2_input_mode": flux2_input_mode,
                         "render_input_semantics": render_input_semantics,
-                        "art_region_mask_usage": "front_region_mask_for_core_qa; flux2_edit_mask_sent_to_provider",
+                        "art_region_mask_usage": "front_region_mask_for_core_qa; selected_render_mask_sent_to_provider",
+                        "render_mask_path": str(render_mask),
+                        "render_mask_source": render_mask_source,
                         "qa_art_mask_path": str(qa_art_mask),
                         "qa_art_mask_source": qa_art_mask_source,
                         "art_region_mask_path": str(art_region_mask),
+                        "mount_mask_path": str(render_object_mask),
+                        "mount_mask_source": render_object_mask_source,
+                        "render_object_mask_path": str(render_object_mask),
+                        "render_object_mask_source": render_object_mask_source,
                         "flux2_edit_mask_path": str(flux2_edit_mask),
                         "flux2_edit_mask_source": flux2_edit_mask_source,
                         "core_photometric_adjustment_allowed": True,
                         "hardpaste_core_pixel_restore_allowed": False,
                     },
                 )
+                post_render_photometric_lock_trace: dict[str, Any] | None = None
+                if _env_truthy("MOLINK_FINAL_PHOTOMETRIC_LOCK", "1"):
+                    locked_path = item_dir / ("03_flux2_render_photometric_locked.png" if sequence_mode.startswith("v7") else "02_flux2_render_photometric_locked.png")
+                    post_render_photometric_lock_trace = _apply_final_photometric_lock(
+                        hard_paste=hard_paste_after_erase,
+                        render=render_result.image,
+                        object_mask=render_object_mask,
+                        edit_mask=render_mask,
+                        out_path=locked_path,
+                        blur_px=max(1, int(os.getenv("MOLINK_FINAL_PHOTOMETRIC_LOCK_BLUR_PX", "18"))),
+                        max_delta=max(0.0, _env_float("MOLINK_FINAL_PHOTOMETRIC_LOCK_MAX_DELTA", 32.0)),
+                        strength=max(0.0, _env_float("MOLINK_FINAL_PHOTOMETRIC_LOCK_STRENGTH", 1.0)),
+                        feather_px=max(0, int(os.getenv("MOLINK_FINAL_PHOTOMETRIC_LOCK_FEATHER_PX", "1"))),
+                        shadow_feather_px=max(0, int(os.getenv("MOLINK_FINAL_SHADOW_FEATHER_PX", "2"))),
+                    )
+                    render_result = ImageEditResult(
+                        image=locked_path,
+                        trace={
+                            **dict(render_result.trace),
+                            "post_render_photometric_lock": post_render_photometric_lock_trace,
+                            "output_path_before_photometric_lock": dict(render_result.trace).get("output_path"),
+                            "output_path": str(locked_path),
+                        },
+                    )
+
                 primary_render_size_qa = _run_mask_anchored_qa(
                     args,
                     hard_paste=hard_paste_after_erase,
@@ -569,13 +744,13 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                         baseline_prompt = (
                             f"{prompt} A/B comparison baseline: use this single input image as the authoritative target; "
                             "do not use any original-room reference image for this baseline render. "
-                            "Keep the visible frame/border and painting core identity-locked; concentrate edits on local shadow, wall contact, and low-frequency lighting only."
+                            "Keep the visible frame/border and painting core identity-locked; only apply low-frequency achromatic light/shadow and brightness adaptation. Do not change intrinsic colors and do not edit any non-artwork region."
                         )
                         baseline_result = render_hanging(
                             provider,
                             hard_paste_after_erase,
                             baseline_prompt,
-                            art_mask=flux2_edit_mask,
+                            art_mask=render_mask,
                             references=[],
                             output_dir=item_dir,
                             output_name="03b_flux2_render_single_baseline.png",
@@ -590,7 +765,9 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                                     "input_image": "cleaned_hard_paste_target_authoritative",
                                     "ab_compare_role": "single_input_baseline_for_dual_mode_validation",
                                 },
-                                "art_region_mask_usage": "front_region_mask_for_core_qa; flux2_edit_mask_sent_to_provider",
+                                "art_region_mask_usage": "front_region_mask_for_core_qa; selected_render_mask_sent_to_provider",
+                        "render_mask_path": str(render_mask),
+                        "render_mask_source": render_mask_source,
                                 "qa_art_mask_path": str(qa_art_mask),
                                 "qa_art_mask_source": qa_art_mask_source,
                                 "art_region_mask_path": str(art_region_mask),
@@ -634,13 +811,13 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                 if not bool(primary_render_size_qa.get("passed")) and flux2_input_mode == "dual_erased_room_plus_target":
                     fallback_prompt = (
                         f"{prompt} SAFE FALLBACK: use this single cleaned hard-paste input as the only authoritative canvas. "
-                        "Do not use any reference image. Preserve the exact painting-core pixel footprint, preserve the visible frame/border appearance, and limit edits to local shadow and low-frequency lighting only."
+                        "Do not use any reference image. Preserve the exact painting-core pixel footprint, preserve the visible frame/border appearance, and allow only low-frequency achromatic light/shadow and brightness adaptation. Do not change intrinsic colors and do not edit any non-artwork region."
                     )
                     fallback_result = render_hanging(
                         provider,
                         hard_paste_after_erase,
                         fallback_prompt,
-                        art_mask=flux2_edit_mask,
+                        art_mask=render_mask,
                         references=[],
                         output_dir=item_dir,
                         output_name="03c_flux2_render_single_fallback.png",
@@ -651,7 +828,9 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                             **_render_edit_runtime_metadata(args),
                             "sequence_mode": sequence_mode,
                             "flux2_input_mode": "single_after_erase_hardpaste_size_qa_fallback",
-                            "art_region_mask_usage": "front_region_mask_for_core_qa; flux2_edit_mask_sent_to_provider",
+                            "art_region_mask_usage": "front_region_mask_for_core_qa; selected_render_mask_sent_to_provider",
+                        "render_mask_path": str(render_mask),
+                        "render_mask_source": render_mask_source,
                             "qa_art_mask_path": str(qa_art_mask),
                             "qa_art_mask_source": qa_art_mask_source,
                             "art_region_mask_path": str(art_region_mask),
@@ -797,14 +976,21 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                     "selected_apiyi_gpt_image2_vip": selected_apiyi_gpt_image2_vip,
                     "flux2_edit_mask_path": str(flux2_edit_mask),
                     "flux2_edit_mask_source": flux2_edit_mask_source,
-                    "art_region_mask_usage": "front_region_mask_for_core_qa; flux2_edit_mask sent_to_provider",
+                    "art_region_mask_usage": "front_region_mask_for_core_qa; selected_render_mask_sent_to_provider",
+                    "render_mask_path": str(render_mask),
+                    "render_mask_source": render_mask_source,
                     "qa_art_mask_path": str(qa_art_mask),
                     "qa_art_mask_source": qa_art_mask_source,
                     "art_region_mask_path": str(art_region_mask),
+                    "mount_mask_path": str(render_object_mask),
+                    "mount_mask_source": render_object_mask_source,
+                    "render_object_mask_path": str(render_object_mask),
+                    "render_object_mask_source": render_object_mask_source,
                     "render_size_qa_status": selected_render_size_qa.get("status"),
                     "primary_render_size_qa": primary_render_size_qa,
                     "selected_render_size_qa": selected_render_size_qa,
                     "post_flux_finalization": finalization_trace,
+                    "post_render_photometric_lock": post_render_photometric_lock_trace,
                     "render_failure_diagnosis": render_failure_diagnosis,
                     "render_fallback": render_fallback_trace,
                     "exit_code": item_exit_code,
@@ -853,6 +1039,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--safety-tolerance", type=int, default=None)
     parser.add_argument("--render-prompt-upsampling", dest="render_prompt_upsampling", action="store_true", default=None, help="Enable provider-side prompt upsampling for final render; disabled by default to reduce creative drift.")
     parser.add_argument("--no-render-prompt-upsampling", dest="render_prompt_upsampling", action="store_false", help="Disable provider-side prompt upsampling for final render.")
+    parser.add_argument("--render-mask-scope", default=os.getenv("MOLINK_RENDER_MASK_SCOPE", "edit_region"), choices=["art_only", "front_only", "edit_region"], help="Final render mask scope: art_only forbids edits outside the mounted artwork object; front_only restricts to the visible front face; edit_region keeps the legacy wider halo.")
     parser.add_argument("--limit", type=int, default=None, help="Process only first N approved items after manifest selection")
     parser.add_argument("--dual-ab-compare", action="store_true", help="For safe dual_erased_room_plus_target items, also render a single-input baseline for validation.")
     parser.add_argument("--dual-ab-compare-limit", type=int, default=1, help="Maximum safe dual-mode items to render with the extra single-input A/B baseline.")
