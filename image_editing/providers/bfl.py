@@ -127,10 +127,20 @@ class BflClient:
         sample_url = (((result.get("result") or {}) if isinstance(result.get("result"), dict) else {}).get("sample"))
         if not sample_url:
             raise RuntimeError(f"BFL result has no result.sample URL: {json.dumps(result, ensure_ascii=False)}")
-        resp = requests.get(str(sample_url), timeout=self.timeout_s)
-        resp.raise_for_status()
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_bytes(resp.content)
+        last_error: Exception | None = None
+        for attempt in range(self.max_retries):
+            try:
+                resp = requests.get(str(sample_url), timeout=self.timeout_s)
+                resp.raise_for_status()
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_bytes(resp.content)
+                return
+            except requests.RequestException as exc:
+                last_error = exc
+                if attempt >= self.max_retries - 1:
+                    break
+                time.sleep(2**attempt)
+        raise RuntimeError(f"BFL sample download failed after {self.max_retries} attempts: {last_error}")
 
 
 class BflImageEditProvider:
