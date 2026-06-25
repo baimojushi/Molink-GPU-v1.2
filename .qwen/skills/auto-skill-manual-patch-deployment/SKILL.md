@@ -149,7 +149,23 @@ if missing:
 print(f'[OK] All {len(checks)} marker verification checks passed')
 ```
 
-## Step 10 — Restart affected services
+## Step 10 — Add environment variables (if patch introduces new env vars)
+
+Patches that introduce new tunable parameters often expect corresponding environment variables in `/etc/molink/gpu.env` (worker config) rather than project `.env` files. Worker processes load env vars via `set -a; source /etc/molink/gpu.env; set +a` in `start_worker.sh`.
+
+Check the patch `.example` files (e.g. `.env.bfl.example`, `worker/.env.worker.example`) for new env var names and default values. Add them to `/etc/molink/gpu.env` in the appropriate section:
+
+```bash
+# Edit /etc/molink/gpu.env — add new vars under the matching comment section
+# Example:
+# APIYI_GPT_IMAGE_RELOCATION_SCALE_MIN=0.92
+# APIYI_GPT_IMAGE_RELOCATION_SCALE_MAX=1.08
+# MOLINK_FINAL_POSTPROCESS_MODE=wall_rgb_only
+```
+
+After updating `/etc/molink/gpu.env`, restart the worker for the new vars to take effect (Step 11).
+
+## Step 11 — Restart affected services
 
 For general service restart:
 ```bash

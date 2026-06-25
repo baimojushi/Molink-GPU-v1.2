@@ -30,3 +30,6 @@ if r.status_code >= 400:
 ## When to apply
 - Any `httpx.post()` / `httpx.get()` / `requests.post()` / `requests.get()` call to internal microservices or third-party APIs where the response body carries diagnostic information.
 - Especially critical for GPU services (CUDA errors, OOM kills, weight loading failures) and file-processing endpoints (image format/size validation errors).
+
+## Applied fixes
+- `image_editing/providers/bfl.py`: `BflClient._request_json()` — replaced `raise_for_status()` with explicit status+body capture for 4xx/5xx responses.
