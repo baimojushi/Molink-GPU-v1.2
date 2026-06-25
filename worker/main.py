@@ -136,6 +136,11 @@ class Worker:
         self._shutdown_task: asyncio.Task | None = None
         self._current_job_id: str | None = None
 
+    async def _create_ws(self):
+        """Create a fresh WebSocket connection to the business server."""
+        url = f"{MOLINK_WS_URL}?token={WORKER_SECRET}"
+        return await websockets.connect(url, ping_interval=30, ping_timeout=10, max_size=None)
+
     async def register(self, ws) -> None:
         await ws.send(json.dumps({
             "type": "register",
@@ -146,6 +151,52 @@ class Worker:
             "services": ["metric3d", "semantic", "hanging", "bfl"],
         }))
         print(f"[worker] 已注册 {INSTANCE_ID} ({GPU_MODEL})")
+
+    async def send_result(self, ws, job, payload) -> None:
+        print(
+            f"[worker-debug] send_result job_id={job.get('job_id')} order_id={job.get('order_id')} "
+            f"status={payload.get('status')} exit_code={payload.get('exit_code')} "
+            f"candidates={len(payload.get('candidates') or [])} "
+            f"final_urls={sum(1 for c in (payload.get('candidates') or []) if c.get('final_image_url'))} "
+            f"partial_images={len(payload.get('partial_review_images') or [])} "
+            f"error={payload.get('error')}",
+            flush=True,
+        )
+        try:
+            await ws.send(json.dumps({
+                "type": "result", "job_id": job["job_id"],
+                "status": payload.get("status"), "order_id": job.get("order_id"),
+                "payload": payload,
+            }))
+            if payload.get("status") in {"succeeded", "succeeded_partial"}:
+                await self.progress(ws, job, "done", "done", 100, "完成")
+            else:
+                await self.progress(ws, job, "failed", "failed", 92, "本次自动生成遇到异常，团队会继续为您处理…")
+        except Exception as exc:
+            # Connection died — reconnect and resend via a fresh connection.
+            print(f"[worker] send_result failed ({exc}), reconnecting to resend result…", flush=True)
+            fresh_ws = None
+            try:
+                fresh_ws = await self._create_ws()
+                await self.register(fresh_ws)
+                await fresh_ws.send(json.dumps({
+                    "type": "result", "job_id": job["job_id"],
+                    "status": payload.get("status"), "order_id": job.get("order_id"),
+                    "payload": payload,
+                }))
+                if payload.get("status") in {"succeeded", "succeeded_partial"}:
+                    await self.progress(fresh_ws, job, "done", "done", 100, "完成")
+                else:
+                    await self.progress(fresh_ws, job, "failed", "failed", 92, "本次自动生成遇到异常，团队会继续为您处理…")
+                print(f"[worker-debug] send_result retransmitted via fresh connection job_id={job.get('job_id')}", flush=True)
+            except Exception as retry_exc:
+                print(f"[worker] send_result retransmit also failed ({retry_exc}), result saved locally only", flush=True)
+            finally:
+                if fresh_ws:
+                    try:
+                        await fresh_ws.close()
+                    except Exception:
+                        pass
 
     async def heartbeat(self, ws) -> None:
         while True:
@@ -329,26 +380,6 @@ class Worker:
                 await flush_diag_tasks()
                 await asyncio.to_thread(diag.finalize_zip, payload_for_diag, exc)
                 await self.on_job_complete(ws)
-
-    async def send_result(self, ws, job, payload) -> None:
-        print(
-            f"[worker-debug] send_result job_id={job.get('job_id')} order_id={job.get('order_id')} "
-            f"status={payload.get('status')} exit_code={payload.get('exit_code')} "
-            f"candidates={len(payload.get('candidates') or [])} "
-            f"final_urls={sum(1 for c in (payload.get('candidates') or []) if c.get('final_image_url'))} "
-            f"partial_images={len(payload.get('partial_review_images') or [])} "
-            f"error={payload.get('error')}",
-            flush=True,
-        )
-        await ws.send(json.dumps({
-            "type": "result", "job_id": job["job_id"],
-            "status": payload.get("status"), "order_id": job.get("order_id"),
-            "payload": payload,
-        }))
-        if payload.get("status") in {"succeeded", "succeeded_partial"}:
-            await self.progress(ws, job, "done", "done", 100, "完成")
-        else:
-            await self.progress(ws, job, "failed", "failed", 92, "本次自动生成遇到异常，团队会继续为您处理…")
 
     async def listen(self, ws) -> None:
         async for raw in ws:
