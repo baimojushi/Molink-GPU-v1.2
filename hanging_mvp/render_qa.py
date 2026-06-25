@@ -24,6 +24,21 @@ def _kernel(radius_px: int) -> np.ndarray:
     return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
 
 
+def _rgb_luma(arr: np.ndarray) -> np.ndarray:
+    weights = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
+    return np.tensordot(arr.astype(np.float32), weights, axes=([-1], [0]))
+
+
+def _chroma_delta(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    # Compare color residual after removing neutral luma.  Neutral shadow should
+    # have small chroma delta even when it is visibly darker.
+    la = _rgb_luma(a)[..., None]
+    lb = _rgb_luma(b)[..., None]
+    ca = a.astype(np.float32) - la
+    cb = b.astype(np.float32) - lb
+    return np.mean(np.abs(cb - ca), axis=2)
+
+
 def _masked_global_ssim(a: np.ndarray, b: np.ndarray, mask: np.ndarray) -> float:
     """Small dependency-free masked SSIM-style score over RGB pixels."""
     idx = mask > 0
@@ -60,6 +75,10 @@ def evaluate_mask_anchored_render_qa(
     min_core_masked_ssim: float = 0.96,
     max_core_color_delta: float = 10.0,
     max_forbidden_outer_guard_changed_ratio: float = 0.12,
+    ignore_shadow_in_forbidden_guard: bool = True,
+    shadow_min_darkening_delta: float = 4.0,
+    shadow_max_brighten_delta: float = 3.0,
+    shadow_max_chroma_delta: float = 6.0,
 ) -> dict[str, Any]:
     """QA FLUX output using the deterministic art mask as the only geometry anchor.
 
@@ -90,7 +109,29 @@ def evaluate_mask_anchored_render_qa(
     delta = np.mean(np.abs(render - target), axis=2)
     core_ssim = _masked_global_ssim(target, render, core)
     core_delta = float(np.mean(delta[core])) if np.any(core) else 0.0
-    guard_ratio = float(np.mean(delta[forbidden_guard] > float(changed_pixel_delta))) if np.any(forbidden_guard) else 0.0
+
+    changed_forbidden = (delta > float(changed_pixel_delta)) & forbidden_guard
+    raw_guard_ratio = float(np.mean(delta[forbidden_guard] > float(changed_pixel_delta))) if np.any(forbidden_guard) else 0.0
+    ignored_shadow_count = 0
+    shadow_like_ratio = 0.0
+    if bool(ignore_shadow_in_forbidden_guard) and np.any(forbidden_guard):
+        target_luma = _rgb_luma(target)
+        render_luma = _rgb_luma(render)
+        luma_diff = render_luma - target_luma
+        max_channel_brighten = np.max(render - target, axis=2)
+        chroma_diff = _chroma_delta(target, render)
+        shadow_like = (
+            forbidden_guard
+            & changed_forbidden
+            & (luma_diff <= -float(shadow_min_darkening_delta))
+            & (max_channel_brighten <= float(shadow_max_brighten_delta))
+            & (chroma_diff <= float(shadow_max_chroma_delta))
+        )
+        ignored_shadow_count = int(np.count_nonzero(shadow_like))
+        shadow_like_ratio = float(np.mean(shadow_like[forbidden_guard])) if np.any(forbidden_guard) else 0.0
+        changed_forbidden = changed_forbidden & (~shadow_like)
+
+    guard_ratio = float(np.mean(changed_forbidden[forbidden_guard])) if np.any(forbidden_guard) else 0.0
 
     failures: list[str] = []
     if core_ssim < float(min_core_masked_ssim):
@@ -109,11 +150,21 @@ def evaluate_mask_anchored_render_qa(
         "core_masked_ssim": core_ssim,
         "core_color_delta": core_delta,
         "forbidden_outer_guard_changed_ratio": guard_ratio,
+        "raw_forbidden_outer_guard_changed_ratio": raw_guard_ratio,
+        "ignored_shadow_like_guard_ratio": shadow_like_ratio,
+        "ignored_shadow_like_guard_pixel_count": ignored_shadow_count,
         "changed_pixel_delta": float(changed_pixel_delta),
         "thresholds": {
             "min_core_masked_ssim": float(min_core_masked_ssim),
             "max_core_color_delta": float(max_core_color_delta),
             "max_forbidden_outer_guard_changed_ratio": float(max_forbidden_outer_guard_changed_ratio),
+        },
+        "shadow_aware_guard": {
+            "enabled": bool(ignore_shadow_in_forbidden_guard),
+            "shadow_min_darkening_delta": float(shadow_min_darkening_delta),
+            "shadow_max_brighten_delta": float(shadow_max_brighten_delta),
+            "shadow_max_chroma_delta": float(shadow_max_chroma_delta),
+            "policy": "neutral_darken_only_projection_pixels_do_not_fail_outer_guard",
         },
         "bands_px": {
             "core_erode_px": int(core_erode_px),

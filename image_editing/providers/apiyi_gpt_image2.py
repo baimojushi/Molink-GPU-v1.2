@@ -517,6 +517,7 @@ def _correct_generated_wall_rgb(
     sample_max_delta: float,
     max_rgb_delta: float,
     strength: float,
+    apply_to_wall_only: bool = False,
 ) -> tuple[Image.Image, dict[str, Any]]:
     """Match generated wall RGB to the hard-paste wall while preserving shadows.
 
@@ -558,7 +559,18 @@ def _correct_generated_wall_rgb(
     clamp = float(max(0.0, max_rgb_delta))
     if clamp > 0:
         delta = np.clip(delta, -clamp, clamp)
-    corrected = np.clip(gen + delta.reshape(1, 1, 3), 0, 255)
+    corrected_full = np.clip(gen + delta.reshape(1, 1, 3), 0, 255)
+    if apply_to_wall_only:
+        # Apply the median wall color offset only to wall pixels inside the
+        # editable crop.  The artwork, frame, mat, and model-rendered object
+        # pixels remain exactly as returned by GPT Image, avoiding a second
+        # locked-texture paste or any frame/core repaint in post.
+        wall_apply_alpha = np.clip(edit * (1.0 - np.clip(object_alpha, 0.0, 1.0)), 0.0, 1.0)[..., None]
+        corrected = gen * (1.0 - wall_apply_alpha) + corrected_full * wall_apply_alpha
+        apply_scope = "wall_pixels_only_inside_edit_mask_object_unchanged"
+    else:
+        corrected = corrected_full
+        apply_scope = "entire_generated_crop"
     return Image.fromarray(corrected.astype(np.uint8), mode="RGB"), {
         "applied": True,
         "sample_count": sample_count,
@@ -569,6 +581,79 @@ def _correct_generated_wall_rgb(
         "orig_wall_median_rgb": [float(v) for v in orig_med],
         "generated_wall_median_rgb": [float(v) for v in gen_med],
         "applied_delta_rgb": [float(v) for v in delta],
+        "apply_scope": apply_scope,
+    }
+
+
+def _composite_wall_rgb_only_crop(
+    *,
+    original_path: Path,
+    generated_crop_path: Path,
+    edit_mask_crop_path: Path,
+    object_mask_crop_path: Path | None,
+    bbox: tuple[int, int, int, int],
+    output_path: Path,
+    edge_feather_px: int,
+    wall_sample_exclusion_px: int,
+    wall_sample_max_delta: float,
+    wall_rgb_max_delta: float,
+    wall_rgb_correction_strength: float,
+) -> dict[str, Any]:
+    """Paste the GPT Image crop back after wall-only RGB correction.
+
+    This mode intentionally does *not* estimate relocation, warp a hard-paste
+    locked texture, rebuild the frame/core, or run an object edge guard.  The
+    provider-rendered crop is treated as the visual source of truth; post only
+    removes clean-wall RGB mismatch by applying a robust median delta to wall
+    pixels outside the object mask.
+    """
+    with Image.open(original_path) as original, Image.open(generated_crop_path) as generated, Image.open(edit_mask_crop_path) as edit_mask:
+        base = original.convert("RGB")
+        crop_size = (bbox[2] - bbox[0], bbox[3] - bbox[1])
+        original_crop = base.crop(bbox).convert("RGB")
+        generated_rgb = generated.convert("RGB")
+        generated_size = tuple(generated_rgb.size)
+        if generated_size != crop_size:
+            generated_rgb = generated_rgb.resize(crop_size, Image.Resampling.LANCZOS)
+
+        edit_alpha = _as_alpha(edit_mask, crop_size, feather_px=edge_feather_px)
+        if object_mask_crop_path is not None and object_mask_crop_path.exists():
+            with Image.open(object_mask_crop_path) as object_mask:
+                object_alpha = _as_alpha(object_mask, crop_size, feather_px=0)
+            object_mask_available = True
+        else:
+            object_alpha = np.zeros((crop_size[1], crop_size[0]), dtype=np.float32)
+            object_mask_available = False
+
+        generated_rgb, wall_rgb_trace = _correct_generated_wall_rgb(
+            original_crop=original_crop,
+            generated_crop=generated_rgb,
+            edit_alpha=edit_alpha,
+            object_alpha=object_alpha,
+            exclusion_px=wall_sample_exclusion_px,
+            sample_max_delta=wall_sample_max_delta,
+            max_rgb_delta=wall_rgb_max_delta,
+            strength=wall_rgb_correction_strength,
+            apply_to_wall_only=True,
+        )
+
+        alpha = Image.fromarray(np.clip(edit_alpha * 255.0, 0, 255).astype(np.uint8), mode="L")
+        base.paste(generated_rgb, (bbox[0], bbox[1]), alpha)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        base.save(output_path)
+
+    return {
+        "composited": True,
+        "mode": "gpt_render_preserved_wall_rgb_only_composite",
+        "bbox": list(bbox),
+        "crop_size": list(crop_size),
+        "generated_size": list(generated_size),
+        "object_mask_available": object_mask_available,
+        "locked_texture_pasted": False,
+        "hardpaste_frame_core_repaste": False,
+        "anchor_relocation_applied": False,
+        "wall_rgb_correction": wall_rgb_trace,
+        "edge_feather_px": int(edge_feather_px),
     }
 
 
@@ -778,6 +863,7 @@ class ApiyiGptImage2Client:
             compress_inputs=_env_truthy("APIYI_GPT_IMAGE_COMPRESS_INPUTS", "1"),
             max_input_bytes=max(128_000, int(os.getenv("APIYI_GPT_IMAGE_MAX_INPUT_BYTES", "10000000"))),
             resize_to_input_size=_env_truthy("APIYI_GPT_IMAGE_RESIZE_TO_INPUT", "1"),
+            include_references=_env_truthy("APIYI_GPT_IMAGE_INCLUDE_REFERENCES", "1"),
             mask_edit_mode=os.getenv("APIYI_GPT_IMAGE_MASK_EDIT_MODE", "photometric_composite").strip().lower() or "photometric_composite",
             mask_crop_padding_px=max(0, int(os.getenv("APIYI_GPT_IMAGE_MASK_CROP_PADDING_PX", "48"))),
             mask_composite_feather_px=max(0, int(os.getenv("APIYI_GPT_IMAGE_MASK_COMPOSITE_FEATHER_PX", "2"))),
@@ -823,6 +909,9 @@ class ApiyiGptImage2Client:
             "mask_path": str(request.mask) if request.mask else None,
             "mask_parameter_supported_by_endpoint": False,
             "mask_sent_as_multipart_field": False,
+            "pixel_coordinate_matrix_supported_by_endpoint": False,
+            "pixel_coordinate_matrix_sent": False,
+            "remote_edit_region_control": "none_api_has_no_mask_or_coordinate_matrix_field",
             "mask_enforcement": "none",
         }
         target_for_api = image
@@ -843,10 +932,14 @@ class ApiyiGptImage2Client:
         )
         core_mask_path = _coerce_optional_path(core_mask_source)
 
-        if request.mask and self.mask_edit_mode in {
+        normalized_mask_edit_mode = self.mask_edit_mode.replace("-", "_")
+        if request.mask and normalized_mask_edit_mode in {
             "photometric_composite",
             "photometric_core_edge_composite",
             "structure_preserving_composite",
+            "wall_rgb_only",
+            "wall_rgb_correction_only",
+            "render_wall_rgb_only",
             "local_composite",
             "crop_composite",
             "masked_crop",
@@ -858,14 +951,22 @@ class ApiyiGptImage2Client:
                 padding_px=self.mask_crop_padding_px,
             )
             target_for_api = Path(local["crop_path"])
-            photometric_mode = self.mask_edit_mode in {
+            photometric_mode = normalized_mask_edit_mode in {
                 "photometric_composite",
                 "photometric_core_edge_composite",
                 "structure_preserving_composite",
             }
-            output_scope = "mask_photometric_composite" if photometric_mode else "mask_local_composite"
+            wall_rgb_only_mode = normalized_mask_edit_mode in {
+                "wall_rgb_only",
+                "wall_rgb_correction_only",
+                "render_wall_rgb_only",
+            }
+            if wall_rgb_only_mode:
+                output_scope = "mask_wall_rgb_only_composite"
+            else:
+                output_scope = "mask_photometric_composite" if photometric_mode else "mask_local_composite"
             object_mask_crop_path = None
-            if photometric_mode and object_mask_path is not None:
+            if (photometric_mode or wall_rgb_only_mode) and object_mask_path is not None:
                 object_mask_crop_path = _crop_mask_to_bbox(
                     object_mask_path,
                     image_size=tuple(local["full_size"]),
@@ -883,8 +984,14 @@ class ApiyiGptImage2Client:
                     stem=image.stem,
                 )
             mask_trace.update({
-                "mask_enforcement": "local_crop_then_photometric_artwork_lock_and_shadow_composite" if photometric_mode else "local_crop_then_mask_composite",
+                "mask_enforcement": (
+                    "local_crop_then_wall_rgb_only_composite_no_locked_texture"
+                    if wall_rgb_only_mode
+                    else ("local_crop_then_photometric_artwork_lock_and_shadow_composite" if photometric_mode else "local_crop_then_mask_composite")
+                ),
                 "mask_enforced_locally": True,
+                "local_coordinate_bbox_xyxy": local["bbox"],
+                "remote_coordinate_matrix_sent": False,
                 "edit_crop_path": str(local["crop_path"]),
                 "mask_crop_path": str(local["mask_crop_path"]),
                 "object_mask_path": str(object_mask_path) if object_mask_path is not None else None,
@@ -947,7 +1054,7 @@ class ApiyiGptImage2Client:
             response_json = self._post_images_edit(data=data, files=files)
             response_source = _write_apiyi_image(response_json, raw_out_path, timeout_s=self.timeout_s)
 
-            if output_scope in {"mask_local_composite", "mask_photometric_composite"}:
+            if output_scope in {"mask_local_composite", "mask_photometric_composite", "mask_wall_rgb_only_composite"}:
                 crop_mask = Path(mask_trace["mask_crop_path"])
                 bbox = tuple(int(v) for v in mask_trace["mask_bbox"])
                 if self.resize_to_input_size:
@@ -979,6 +1086,21 @@ class ApiyiGptImage2Client:
                         wall_rgb_max_delta=self.wall_rgb_max_delta,
                         wall_rgb_correction_strength=self.wall_rgb_correction_strength,
                         object_edge_guard_px=self.object_edge_guard_px,
+                    )
+                elif output_scope == "mask_wall_rgb_only_composite":
+                    object_crop_value = mask_trace.get("object_mask_crop_path")
+                    composite_trace = _composite_wall_rgb_only_crop(
+                        original_path=image,
+                        generated_crop_path=raw_out_path,
+                        edit_mask_crop_path=crop_mask,
+                        object_mask_crop_path=Path(str(object_crop_value)) if object_crop_value else None,
+                        bbox=bbox,  # type: ignore[arg-type]
+                        output_path=out_path,
+                        edge_feather_px=self.mask_composite_feather_px,
+                        wall_sample_exclusion_px=self.wall_sample_exclusion_px,
+                        wall_sample_max_delta=self.wall_sample_max_delta,
+                        wall_rgb_max_delta=self.wall_rgb_max_delta,
+                        wall_rgb_correction_strength=self.wall_rgb_correction_strength,
                     )
                 else:
                     composite_trace = _composite_masked_crop(
@@ -1028,15 +1150,18 @@ class ApiyiGptImage2Client:
             "output_scope": output_scope,
             "mask_sent_to_flux2": False,
             "flux2_mask_sent": False,
-            "mask_local_composite": output_scope in {"mask_local_composite", "mask_photometric_composite"},
+            "mask_local_composite": output_scope in {"mask_local_composite", "mask_photometric_composite", "mask_wall_rgb_only_composite"},
             "mask_photometric_composite": output_scope == "mask_photometric_composite",
-            "mask_enforced_locally": output_scope in {"mask_local_composite", "mask_photometric_composite"},
+            "mask_wall_rgb_only_composite": output_scope == "mask_wall_rgb_only_composite",
+            "mask_enforced_locally": output_scope in {"mask_local_composite", "mask_photometric_composite", "mask_wall_rgb_only_composite"},
             "mask_contract": (
-                "API易 gpt-image-2-vip image-edit endpoint has no multipart mask field; "
-                "the adapter enforces bounded repaint by cropping the mask bbox and compositing locally. "
+                "API易 gpt-image-2-vip image-edit endpoint has no multipart mask field and no pixel-coordinate matrix field; "
+                "the adapter enforces bounded repaint locally by cropping the mask bbox and compositing/QA outside the remote request. "
                 "In photometric mode, artwork core pixels are not hard-restored from hard-paste; "
-                "they receive only low-frequency exposure/color transfer from the generated crop, while direct generated pixels are limited to the edge/shadow region."
+                "they receive only low-frequency exposure/color transfer from the generated crop, while direct generated pixels are limited to the edge/shadow region. "
+                "In wall_rgb_only mode, the GPT Image crop is preserved and only wall RGB outside the object mask is corrected."
             ),
+            "remote_coordinate_matrix_sent": False,
             "mask_adapter": mask_trace,
             "local_composite": composite_trace,
             "apiyi_images_edit_request": True,
@@ -1072,7 +1197,7 @@ class ApiyiGptImage2Client:
 
     @staticmethod
     def _build_prompt(prompt: str, *, reference_count: int, output_scope: str) -> str:
-        if output_scope in {"mask_local_composite", "mask_photometric_composite"}:
+        if output_scope in {"mask_local_composite", "mask_photometric_composite", "mask_wall_rgb_only_composite"}:
             if output_scope == "mask_photometric_composite":
                 prefix = (
                     "修改图1。图1是完整房间画面中挂画区域的局部裁剪。"
@@ -1081,6 +1206,14 @@ class ApiyiGptImage2Client:
                     "不要修改挂画以外的区域，不要改动墙面、窗户、地面或房间结构。"
                     "不要新增、移动、缩放、复制、替换、重绘或重新设计画作，不要把画芯重新生成成另一幅画，也不要把边框改成新的黑边、白边或装饰框。"
                     "如果不确定，请尽量保持现有像素不变。输出保持图1的构图比例，便于回贴到原图。"
+                )
+            elif output_scope == "mask_wall_rgb_only_composite":
+                prefix = (
+                    "修改图1。图1是完整房间画面中挂画区域的局部裁剪。"
+                    "以图1中已经硬贴好的挂画为准，只做环境光、接触阴影、投影和墙面融合渲染。"
+                    "不要重绘、替换、移动、压扁、缩放或重新设计挂画、画框、白衬/卡纸或画芯内容。"
+                    "允许墙面上的自然投影和明暗过渡，但不要改变房间结构。"
+                    "输出保持图1的构图比例，便于回贴到原图。"
                 )
             else:
                 prefix = (
@@ -1098,7 +1231,11 @@ class ApiyiGptImage2Client:
                 "不要新增、移动、缩放、复制、替换画作，不要改变边框样式或画芯图案，不要重绘非挂画区域。"
             )
         if reference_count:
-            prefix += "图2及后续图片仅作为光照、材质、背景纹理或艺术品身份参考，不得覆盖图1构图。"
+            prefix += (
+                "图2及后续图片仅作为环境光方向、整体明暗、墙面材质和背景纹理参考；"
+                "如果参考图中没有挂画或挂画位置为空，这是正常的 erase 后空间参考，不代表要删除、移动或替换图1中的挂画。"
+                "不得让参考图覆盖图1的构图、画作位置、边框形状或画芯内容。"
+            )
         return f"{prefix}\n\n原始渲染指令：{prompt}"
 
 

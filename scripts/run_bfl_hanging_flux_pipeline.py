@@ -112,6 +112,99 @@ def _select_render_mask_path(
     return art_region_mask, "art_region_mask_art_only"
 
 
+def _resolve_light_context_reference_mode(provider_name: str) -> str:
+    default = "erased_room" if _normalize_render_provider_name(provider_name) == "apiyi_gpt_image2_vip" else "none"
+    raw = str(os.getenv("MOLINK_RENDER_LIGHT_CONTEXT_REFERENCE", default)).strip().lower()
+    if raw in {"0", "false", "off", "none", "no"}:
+        return "none"
+    if raw in {"erase", "erased", "erased_room", "clean_room", "cleaned_room"}:
+        return "erased_room"
+    return "none"
+
+
+def _ambient_light_hint(
+    *,
+    image_path: Path,
+    edit_mask_path: Path | None,
+    object_mask_path: Path | None,
+    band_px: int = 64,
+    exclude_px: int = 8,
+) -> tuple[str, dict[str, Any]]:
+    """Build a tiny numeric light hint for GPT Image from deterministic pixels.
+
+    This is intentionally advisory text only.  The hard-paste target remains the
+    authoritative canvas; the hint gives GPT Image information it loses when we
+    send only a local crop.
+    """
+    try:
+        rgb = np.asarray(Image.open(image_path).convert("RGB"), dtype=np.float32)
+        h, w = rgb.shape[:2]
+        mask_source = object_mask_path if object_mask_path is not None and object_mask_path.exists() else edit_mask_path
+        if mask_source is None or not mask_source.exists():
+            return "", {"enabled": False, "reason": "missing_mask"}
+        raw = np.asarray(Image.open(mask_source).convert("L"), dtype=np.uint8)
+        if raw.shape[:2] != (h, w):
+            raw = cv2.resize(raw, (w, h), interpolation=cv2.INTER_NEAREST)
+        alpha = raw > 0
+        bbox = _alpha_bbox(alpha.astype(np.float32), threshold=0.2)
+        if bbox is None:
+            return "", {"enabled": False, "reason": "empty_mask"}
+        band = max(8, int(band_px))
+        exclude = max(0, int(exclude_px))
+        dil_band = _dilate_alpha(alpha.astype(np.float32), band) > 0.05
+        dil_exclude = _dilate_alpha(alpha.astype(np.float32), exclude) > 0.05
+        sample = dil_band & (~dil_exclude)
+        if edit_mask_path is not None and edit_mask_path.exists():
+            edit_raw = np.asarray(Image.open(edit_mask_path).convert("L"), dtype=np.uint8)
+            if edit_raw.shape[:2] != (h, w):
+                edit_raw = cv2.resize(edit_raw, (w, h), interpolation=cv2.INTER_NEAREST)
+            # Prefer pixels around the target, but do not require only editable pixels;
+            # nearby non-object wall often carries the cleanest ambient evidence.
+            sample = sample & (edit_raw <= 250) | (sample & (edit_raw > 0))
+        count = int(np.count_nonzero(sample))
+        if count < 32:
+            return "", {"enabled": False, "reason": "insufficient_samples", "sample_count": count}
+        weights = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
+        luma = np.tensordot(rgb, weights, axes=([-1], [0]))
+        med_rgb = np.median(rgb[sample], axis=0)
+        med_luma = float(np.median(luma[sample]))
+        x0, y0, x1, y1 = bbox
+        yy, xx = np.indices((h, w))
+        sides: dict[str, float] = {}
+        side_masks = {
+            "left": sample & (xx < x0),
+            "right": sample & (xx >= x1),
+            "top": sample & (yy < y0),
+            "bottom": sample & (yy >= y1),
+        }
+        for name, m in side_masks.items():
+            if int(np.count_nonzero(m)) >= 16:
+                sides[name] = float(np.median(luma[m]))
+        brightest = max(sides, key=sides.get) if sides else None
+        darkest = min(sides, key=sides.get) if sides else None
+        hint = (
+            "环境光采样提示：挂画附近干净墙面中位 RGB≈"
+            f"({int(round(float(med_rgb[0])))},{int(round(float(med_rgb[1])))},{int(round(float(med_rgb[2])))})，"
+            f"中位亮度≈{med_luma:.1f}/255。"
+        )
+        if brightest and darkest and brightest != darkest:
+            hint += f"周围墙面相对亮度：{brightest} 侧更亮，{darkest} 侧更暗；投影和画芯明度应与这个环境光关系一致。"
+        hint += "只把这些数值作为光影/明度参考，不要因此移动、缩放、重绘或替换挂画。"
+        return hint, {
+            "enabled": True,
+            "sample_count": count,
+            "median_wall_rgb": [float(v) for v in med_rgb],
+            "median_wall_luma": med_luma,
+            "side_luma": sides,
+            "brightest_side": brightest,
+            "darkest_side": darkest,
+            "band_px": int(band),
+            "exclude_px": int(exclude),
+        }
+    except Exception as exc:
+        return "", {"enabled": False, "reason": "exception", "error": str(exc)}
+
+
 def _env_float(name: str, default: float) -> float:
     try:
         return float(os.getenv(name, str(default)))
@@ -338,6 +431,7 @@ def _correct_render_wall_rgb_full(
     sample_max_delta: float,
     max_rgb_delta: float,
     strength: float,
+    apply_to_wall_only: bool = False,
 ) -> tuple[Image.Image, dict[str, Any]]:
     hard = np.asarray(hard_rgb.convert("RGB"), dtype=np.float32)
     render = np.asarray(render_rgb.convert("RGB"), dtype=np.float32)
@@ -368,7 +462,18 @@ def _correct_render_wall_rgb_full(
     clamp = float(max(0.0, max_rgb_delta))
     if clamp > 0:
         delta = np.clip(delta, -clamp, clamp)
-    corrected = np.clip(render + delta.reshape(1, 1, 3), 0, 255)
+    corrected_full = np.clip(render + delta.reshape(1, 1, 3), 0, 255)
+    if apply_to_wall_only:
+        # Only normalize wall pixels.  Keep GPT Image's rendered artwork, frame,
+        # mat/core and object pixels exactly as the provider returned them; this
+        # avoids a second hard-paste/locked-texture pass that can create bottom
+        # frame stacking when render geometry shifts or scales.
+        wall_apply_alpha = np.clip(np.asarray(edit_alpha, dtype=np.float32) * (1.0 - np.clip(object_alpha, 0.0, 1.0)), 0.0, 1.0)[..., None]
+        corrected = render * (1.0 - wall_apply_alpha) + corrected_full * wall_apply_alpha
+        apply_scope = "wall_pixels_only_inside_edit_mask_object_unchanged"
+    else:
+        corrected = corrected_full
+        apply_scope = "entire_render_image"
     return Image.fromarray(corrected.astype(np.uint8), mode="RGB"), {
         "applied": True,
         "sample_count": sample_count,
@@ -379,6 +484,7 @@ def _correct_render_wall_rgb_full(
         "hard_wall_median_rgb": [float(v) for v in hard_med],
         "render_wall_median_rgb": [float(v) for v in render_med],
         "applied_delta_rgb": [float(v) for v in delta],
+        "apply_scope": apply_scope,
     }
 
 
@@ -404,6 +510,7 @@ def _apply_final_photometric_lock(
     wall_rgb_max_delta: float,
     wall_rgb_correction_strength: float,
     object_edge_guard_px: int,
+    postprocess_mode: str = "photometric_lock",
 ) -> dict[str, Any]:
     with Image.open(hard_paste) as hard_img, Image.open(render) as render_img, Image.open(object_mask) as object_mask_img:
         hard_rgb = hard_img.convert("RGB")
@@ -433,6 +540,40 @@ def _apply_final_photometric_lock(
         else:
             edit_mask_for_shadow = edit_mask_l
         edit_alpha_2d = np.asarray(edit_mask_for_shadow, dtype=np.float32) / 255.0
+
+        normalized_postprocess_mode = str(postprocess_mode or "photometric_lock").strip().lower().replace("-", "_")
+        if normalized_postprocess_mode in {"wall_rgb_only", "wall_rgb_correction_only", "render_wall_rgb_only"}:
+            corrected_render_rgb, wall_rgb_trace = _correct_render_wall_rgb_full(
+                hard_rgb=hard_rgb,
+                render_rgb=render_rgb,
+                edit_alpha=edit_alpha_2d,
+                object_alpha=object_alpha,
+                exclusion_px=wall_sample_exclusion_px,
+                sample_max_delta=wall_sample_max_delta,
+                max_rgb_delta=wall_rgb_max_delta,
+                strength=wall_rgb_correction_strength,
+                apply_to_wall_only=True,
+            )
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            corrected_render_rgb.save(out_path)
+            return {
+                "enabled": True,
+                "mode": "post_provider_wall_rgb_only_no_locked_texture",
+                "postprocess_mode": normalized_postprocess_mode,
+                "input_render_path": str(render),
+                "hard_paste_path": str(hard_paste),
+                "object_mask_path": str(object_mask),
+                "edit_mask_path": str(edit_mask) if edit_mask is not None else None,
+                "edit_mask_available": bool(edit_mask_available),
+                "output_path": str(out_path),
+                "locked_texture_pasted": False,
+                "hardpaste_frame_core_repasted": False,
+                "anchor_relocation_applied": False,
+                "render_pixels_preserved": True,
+                "wall_rgb_correction": wall_rgb_trace,
+                "feather_px": int(feather_px),
+                "shadow_feather_px": int(shadow_feather_px),
+            }
 
         relocation_trace = _estimate_anchor_similarity_full(
             hard_rgb=hard_rgb,
@@ -501,6 +642,7 @@ def _apply_final_photometric_lock(
     return {
         "enabled": True,
         "mode": "post_provider_shadow_preserving_photometric_object_lock_relocated_wall_corrected",
+        "postprocess_mode": str(postprocess_mode or "photometric_lock").strip().lower().replace("-", "_"),
         "input_render_path": str(render),
         "hard_paste_path": str(hard_paste),
         "object_mask_path": str(object_mask),
@@ -661,6 +803,10 @@ def _run_mask_anchored_qa(args: argparse.Namespace, *, hard_paste: Path, render:
         min_core_masked_ssim=float(args.qa_min_core_masked_ssim),
         max_core_color_delta=float(args.qa_max_core_color_delta),
         max_forbidden_outer_guard_changed_ratio=float(args.qa_max_forbidden_outer_guard_changed_ratio),
+        ignore_shadow_in_forbidden_guard=bool(args.qa_ignore_shadow_in_forbidden_guard),
+        shadow_min_darkening_delta=float(args.qa_shadow_min_darkening_delta),
+        shadow_max_brighten_delta=float(args.qa_shadow_max_brighten_delta),
+        shadow_max_chroma_delta=float(args.qa_shadow_max_chroma_delta),
     )
 
 
@@ -812,7 +958,8 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             "final_render_mask_required": not using_apiyi_gpt_image2_vip,
             "final_render_contract": (
                 "gpt-image-2-vip /v1/images/edits with local bounded composite; "
-                "artwork core receives low-frequency photometric transfer only, not hard-paste pixel restore"
+                "remote API receives images only, no mask or pixel-coordinate matrix; "
+                "local crop/composite/QA enforce edit scope"
             ) if using_apiyi_gpt_image2_vip else "masked FLUX.2 edit",
             "outputs": [],
             "errors": [],
@@ -1001,10 +1148,33 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                         "raw_original_reference_prohibited": True,
                     }
 
+                light_context_reference_mode = _resolve_light_context_reference_mode(provider_name)
+                if (
+                    using_apiyi_gpt_image2_vip
+                    and light_context_reference_mode == "erased_room"
+                    and sequence_mode.startswith("v7")
+                    and erase_result.image not in render_refs
+                ):
+                    render_refs.append(erase_result.image)
+                    render_input_semantics["input_image_2"] = "erased_room_full_space_environment_light_reference"
+                    render_input_semantics["light_context_reference_policy"] = (
+                        "use erased full-space image only for environment light direction, wall brightness, and material context; "
+                        "do not remove or override the authoritative hard-paste artwork in input_image"
+                    )
+
+                render_light_hint, render_light_hint_trace = _ambient_light_hint(
+                    image_path=hard_paste_after_erase,
+                    edit_mask_path=render_mask,
+                    object_mask_path=render_object_mask,
+                    band_px=max(8, int(os.getenv("MOLINK_RENDER_LIGHT_HINT_BAND_PX", "64"))),
+                    exclude_px=max(0, int(os.getenv("MOLINK_RENDER_LIGHT_HINT_EXCLUDE_PX", "8"))),
+                ) if _env_truthy("MOLINK_RENDER_LIGHT_HINT_PROMPT", "1") else ("", {"enabled": False, "reason": "disabled_by_env"})
+                prompt_for_render = f"{prompt}\n\n{render_light_hint}" if render_light_hint else prompt
+
                 render_result = render_hanging(
                     provider,
                     render_primary,
-                    prompt,
+                    prompt_for_render,
                     art_mask=render_mask,
                     references=render_refs,
                     output_dir=item_dir,
@@ -1017,6 +1187,11 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                         "sequence_mode": sequence_mode,
                         "flux2_input_mode": flux2_input_mode,
                         "render_input_semantics": render_input_semantics,
+                        "render_reference_count": len(render_refs),
+                        "light_context_reference_mode": light_context_reference_mode,
+                        "render_light_hint": render_light_hint_trace,
+                        "remote_pixel_coordinate_matrix_supported": False,
+                        "remote_pixel_coordinate_matrix_sent": False,
                         "art_region_mask_usage": "front_region_mask_for_core_qa; selected_render_mask_sent_to_provider",
                         "render_mask_path": str(render_mask),
                         "render_mask_source": render_mask_source,
@@ -1035,7 +1210,15 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                 )
                 post_render_photometric_lock_trace: dict[str, Any] | None = None
                 if _env_truthy("MOLINK_FINAL_PHOTOMETRIC_LOCK", "1"):
-                    locked_path = item_dir / ("03_flux2_render_photometric_locked.png" if sequence_mode.startswith("v7") else "02_flux2_render_photometric_locked.png")
+                    final_postprocess_mode = (
+                        os.getenv("MOLINK_FINAL_POSTPROCESS_MODE")
+                        or os.getenv("MOLINK_FINAL_PHOTOMETRIC_LOCK_MODE")
+                        or "photometric_lock"
+                    ).strip().lower().replace("-", "_")
+                    if final_postprocess_mode in {"wall_rgb_only", "wall_rgb_correction_only", "render_wall_rgb_only"}:
+                        locked_path = item_dir / ("03_flux2_render_wall_rgb_corrected.png" if sequence_mode.startswith("v7") else "02_flux2_render_wall_rgb_corrected.png")
+                    else:
+                        locked_path = item_dir / ("03_flux2_render_photometric_locked.png" if sequence_mode.startswith("v7") else "02_flux2_render_photometric_locked.png")
                     post_render_photometric_lock_trace = _apply_final_photometric_lock(
                         hard_paste=hard_paste_after_erase,
                         render=render_result.image,
@@ -1057,6 +1240,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                         wall_rgb_max_delta=max(0.0, _env_float("MOLINK_FINAL_WALL_RGB_MAX_DELTA", 24.0)),
                         wall_rgb_correction_strength=max(0.0, _env_float("MOLINK_FINAL_WALL_RGB_CORRECTION_STRENGTH", 1.0)),
                         object_edge_guard_px=max(0, int(os.getenv("MOLINK_FINAL_OBJECT_EDGE_GUARD_PX", "2"))),
+                        postprocess_mode=final_postprocess_mode,
                     )
                     render_result = ImageEditResult(
                         image=locked_path,
@@ -1313,6 +1497,11 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                     "requested_flux2_input_mode": requested_flux2_input_mode,
                     "flux2_input_mode": flux2_input_mode,
                     "render_input_semantics": render_input_semantics,
+                    "render_reference_count": len(render_refs),
+                    "light_context_reference_mode": locals().get("light_context_reference_mode"),
+                    "render_light_hint": locals().get("render_light_hint_trace"),
+                    "remote_pixel_coordinate_matrix_supported": False,
+                    "remote_pixel_coordinate_matrix_sent": False,
                     "flux2_mask_sent": selected_mask_sent,
                     "final_render_edit_scope": selected_edit_scope,
                     "selected_apiyi_gpt_image2_vip": selected_apiyi_gpt_image2_vip,
@@ -1392,6 +1581,11 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--qa-min-core-masked-ssim", type=float, default=float(os.getenv("MOLINK_FLUX_QA_MIN_CORE_MASKED_SSIM", "0.78")))
     parser.add_argument("--qa-max-core-color-delta", type=float, default=float(os.getenv("MOLINK_FLUX_QA_MAX_CORE_COLOR_DELTA", "45")))
     parser.add_argument("--qa-max-forbidden-outer-guard-changed-ratio", type=float, default=float(os.getenv("MOLINK_FLUX_QA_MAX_FORBIDDEN_OUTER_GUARD_CHANGED_RATIO", "0.65")))
+    parser.add_argument("--qa-ignore-shadow-in-forbidden-guard", dest="qa_ignore_shadow_in_forbidden_guard", action="store_true", default=_env_truthy("MOLINK_FLUX_QA_IGNORE_GENERATED_SHADOW", "1"), help="Do not fail QA for neutral darken-only projection/shadow pixels in the outer guard band.")
+    parser.add_argument("--qa-no-ignore-shadow-in-forbidden-guard", dest="qa_ignore_shadow_in_forbidden_guard", action="store_false")
+    parser.add_argument("--qa-shadow-min-darkening-delta", type=float, default=float(os.getenv("MOLINK_FLUX_QA_SHADOW_MIN_DARKENING_DELTA", "4")))
+    parser.add_argument("--qa-shadow-max-brighten-delta", type=float, default=float(os.getenv("MOLINK_FLUX_QA_SHADOW_MAX_BRIGHTEN_DELTA", "3")))
+    parser.add_argument("--qa-shadow-max-chroma-delta", type=float, default=float(os.getenv("MOLINK_FLUX_QA_SHADOW_MAX_CHROMA_DELTA", "6")))
     parser.add_argument("--qa-hard-min-core-masked-ssim", type=float, default=float(os.getenv("MOLINK_FLUX_QA_HARD_MIN_CORE_MASKED_SSIM", "0.45")), help="Hard delivery gate: below this artwork-core SSIM, a Flux render cannot enter final_hd even under qa_advisory.")
     parser.add_argument("--qa-hard-max-core-color-delta", type=float, default=float(os.getenv("MOLINK_FLUX_QA_HARD_MAX_CORE_COLOR_DELTA", "90")), help="Hard delivery gate: above this artwork-core color delta, a Flux render cannot enter final_hd even under qa_advisory.")
     parser.add_argument("--qa-hard-max-forbidden-outer-guard-changed-ratio", type=float, default=float(os.getenv("MOLINK_FLUX_QA_HARD_MAX_FORBIDDEN_OUTER_GUARD_CHANGED_RATIO", "0.85")), help="Hard delivery gate for severe outer-region change around the target artwork.")
