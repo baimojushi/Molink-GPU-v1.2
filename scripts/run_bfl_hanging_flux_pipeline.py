@@ -1078,6 +1078,13 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                             "erase_input_semantics": "original_room",
                         },
                     )
+                    # Defensive guard: refuse to hardpaste if erase output size differs from original room.
+                    with Image.open(erase_result.image) as erased_img, Image.open(original_room) as orig_img:
+                        if erased_img.size != orig_img.size:
+                            raise RuntimeError(
+                                f"cleanup output size {erased_img.size} differs from original_room size {orig_img.size}; "
+                                "refusing to hardpaste original-space quad onto resized erase canvas"
+                            )
                     hard_paste_after_erase, mount_trace = _hardpaste_after_erase(
                         erase_result.image,
                         artwork_path,
@@ -1119,6 +1126,13 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                         },
                     )
                     hard_paste_after_erase = erase_result.image
+                    # Defensive guard: refuse to hardpaste if erase output size differs from erase input.
+                    with Image.open(erase_result.image) as erased_img, Image.open(erase_input) as inp_img:
+                        if erased_img.size != inp_img.size:
+                            raise RuntimeError(
+                                f"cleanup output size {erased_img.size} differs from erase_input size {inp_img.size}; "
+                                "refusing to hardpaste onto resized erase canvas"
+                            )
                     mount_trace = {"mode": "legacy_hardpaste_erase_flux2", "policy": mount_policy}
 
                 requested_flux2_input_mode = str(item.get("flux2_input_mode") or "single_after_erase_hardpaste")

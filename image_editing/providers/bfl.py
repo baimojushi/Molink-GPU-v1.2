@@ -184,6 +184,9 @@ class BflImageEditProvider:
         out_path = _default_output_path(request, "erase")
         dilate_pixels = int(request.metadata.get("dilate_pixels", os.getenv("BFL_ERASE_DILATE_PIXELS", "10")))
 
+        with Image.open(image) as src_img:
+            original_size = src_img.size
+
         # Downscale oversized images before base64 encoding to avoid BFL 422.
         max_long_edge = int(os.getenv("BFL_ERASE_MAX_LONG_EDGE", "2048"))
         payload_image = image
@@ -213,6 +216,21 @@ class BflImageEditProvider:
         submit_meta = self.client.submit(self.erase_endpoint, payload)
         result = self.client.poll(submit_meta)
         self.client.download_sample(result, out_path)
+
+        resize_back_trace: dict[str, Any] = {"applied": False}
+        with Image.open(out_path) as erased_img:
+            if erased_img.size != original_size:
+                raw_out_path = out_path.with_name(f"{out_path.stem}.provider_raw{out_path.suffix}")
+                shutil.move(str(out_path), str(raw_out_path))
+                erased_img.convert("RGB").resize(original_size, Image.Resampling.LANCZOS).save(out_path)
+                resize_back_trace = {
+                    "applied": True,
+                    "provider_output_path": str(raw_out_path),
+                    "provider_output_size": list(erased_img.size),
+                    "restored_output_size": list(original_size),
+                    "reason": "keep_cleanup_output_in_original_coordinate_space",
+                }
+
         trace = {
             "provider": "bfl",
             "capability": "erase",
@@ -223,6 +241,7 @@ class BflImageEditProvider:
             "elapsed_s": round(time.time() - started, 3),
             "output_path": str(out_path),
             "metadata": dict(request.metadata),
+            "resize_back_to_input_size": resize_back_trace,
         }
         return ImageEditResult(image=out_path, trace=trace)
 
