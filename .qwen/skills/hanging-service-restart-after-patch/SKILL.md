@@ -82,6 +82,19 @@ Or restart all services:
 bash /opt/metric3d_api/scripts/manage_all_mvp_apis.sh restart
 ```
 
+## Worker restart after patch
+
+If the patch modifies `image_editing/providers/*.py`, `scripts/run_bfl_hanging_flux_pipeline.py`, or any code executed by the GPU worker process, the worker must also be restarted:
+
+```bash
+pkill -f 'worker.main|worker/start_worker.sh' || true
+: > /opt/molink/hanging/logs/worker.log
+cd /opt/molink/hanging
+bash /opt/molink/hanging/worker/start_worker.sh
+```
+
+The worker runs as a persistent background process and never reloads code automatically. Deploying a patch without restarting the worker means the next job still executes the old bytecode.
+
 ## Prevention Rule
 
 After deploying any patch that modifies `hanging_mvp/*.py`, `semantic_mvp/*.py`, or `scripts/*.py`:
