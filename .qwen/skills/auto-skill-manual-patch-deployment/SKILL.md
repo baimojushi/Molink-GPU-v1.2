@@ -43,13 +43,26 @@ diff -rq --exclude='.git' --exclude='__pycache__' --exclude='data_disk_*' . /tmp
 
 If the patch is a `.patch` file, read it directly to identify affected files and line ranges.
 
-## Step 2 — Stash uncommitted changes (if in git repo)
+## Step 2 — Find correct -p strip level
+
+Patches generated from absolute or nested paths often need a non-standard strip level. Discover it by incrementally testing:
 
 ```bash
-cd <project_root> && git stash && git apply --stat --check -p<N> <patch> 2>&1
+cd <project_root>
+# Try -p 1 through -p 6 until git apply --check returns exit code 0
+for p in 1 2 3 4 5 6; do
+  git apply --check -p $p <patch> 2>&1 && echo "SUCCESS with -p $p" && break
+  echo "FAILED with -p $p"
+done
 ```
 
-Try `--strip=1`, `--strip=2`, etc. until the path prefix resolves. If `git apply --check` still fails with hunk errors, fall back to manual deployment. After the dry-run attempt, restore changes with `git stash pop`.
+If `git apply --check` fails with "No such file or directory" at a given `-p`, the path prefix still has extra directories — try a higher number. Once `git apply --check` returns exit code 0 (no output), apply the patch with the same `-p` value:
+
+```bash
+git apply -p <successful_p> <patch>
+```
+
+If `git apply --check` fails with hunk errors (content mismatch) even at the correct strip level, fall back to manual deployment (Step 3+).
 
 ## Step 3 — Backup affected files
 
@@ -138,11 +151,25 @@ print(f'[OK] All {len(checks)} marker verification checks passed')
 
 ## Step 10 — Restart affected services
 
+For general service restart:
 ```bash
 bash manage_all_mvp_apis.sh restart
 # Or targeted restart if only one service changed:
 pkill -f 'specific.service' && bash start_specific.sh
 ```
+
+**If the patch modifies worker-executed code** (`image_editing/providers/*.py`, `scripts/run_bfl_hanging_flux_pipeline.py`, `worker/main.py`), restart the GPU worker:
+
+```bash
+pkill -f 'worker.main|worker/start_worker.sh' || true
+: > /opt/molink/hanging/logs/worker.log
+cd /opt/molink/hanging
+bash /opt/molink/hanging/worker/start_worker.sh &
+# Wait ~3s, then verify:
+ps aux | grep -E 'worker.main|start_worker' | grep -v grep
+```
+
+The worker runs as a persistent background process and never reloads code automatically. Deploying without restarting means the next job still executes old bytecode.
 
 Verify health endpoints:
 
