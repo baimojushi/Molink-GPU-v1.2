@@ -92,6 +92,8 @@ class BflClient:
                 if resp.status_code == 429 and attempt < self.max_retries - 1:
                     time.sleep(2**attempt)
                     continue
+                if resp.status_code >= 400:
+                    raise RuntimeError(f"BFL {method} {url} -> {resp.status_code}: {resp.text[:1000]}")
                 resp.raise_for_status()
                 return resp.json()
             except requests.RequestException as exc:
@@ -181,10 +183,30 @@ class BflImageEditProvider:
         _ensure_same_image_size(image, mask)
         out_path = _default_output_path(request, "erase")
         dilate_pixels = int(request.metadata.get("dilate_pixels", os.getenv("BFL_ERASE_DILATE_PIXELS", "10")))
+
+        # Downscale oversized images before base64 encoding to avoid BFL 422.
+        max_long_edge = int(os.getenv("BFL_ERASE_MAX_LONG_EDGE", "2048"))
+        payload_image = image
+        payload_mask = mask
+        dilate_scale = 1.0
+        if max_long_edge > 0:
+            with Image.open(image) as img:
+                longest = max(img.size)
+                if longest > max_long_edge:
+                    dilate_scale = max_long_edge / longest
+                    new_size = (max(1, int(img.size[0] * dilate_scale)), max(1, int(img.size[1] * dilate_scale)))
+                    tmp_dir = out_path.parent / ".bfl_tmp"
+                    tmp_dir.mkdir(parents=True, exist_ok=True)
+                    payload_image = tmp_dir / f"{out_path.stem}_downscaled_input.png"
+                    payload_mask = tmp_dir / f"{out_path.stem}_downscaled_mask.png"
+                    img.resize(new_size, Image.Resampling.LANCZOS).save(payload_image)
+                    with Image.open(mask) as m:
+                        m.resize(new_size, Image.Resampling.NEAREST).save(payload_mask)
+
         payload = {
-            "image": _read_base64(image),
-            "mask": _read_base64(mask),
-            "dilate_pixels": max(0, min(25, dilate_pixels)),
+            "image": _read_base64(payload_image),
+            "mask": _read_base64(payload_mask),
+            "dilate_pixels": max(0, min(25, int(dilate_pixels * dilate_scale))),
             "output_format": str(request.metadata.get("output_format", "png")),
         }
         started = time.time()
