@@ -310,6 +310,172 @@ def _suppress_projected_duplicate_candidates(
     return kept, dropped, summary
 
 
+def _largest_rect_in_binary_mask(mask_u8: np.ndarray) -> dict[str, Any] | None:
+    """Largest axis-aligned all-foreground rectangle in a binary mask crop."""
+    arr = (np.asarray(mask_u8) > 0).astype(np.uint8)
+    if arr.ndim != 2 or arr.size == 0:
+        return None
+    h, w = arr.shape
+    heights = np.zeros(w, dtype=np.int32)
+    best_area = 0
+    best: tuple[int, int, int, int] | None = None
+
+    for y in range(h):
+        heights = (heights + 1) * arr[y]
+        stack: list[tuple[int, int]] = []
+        for x in range(w + 1):
+            cur_h = int(heights[x]) if x < w else 0
+            start = x
+            while stack and stack[-1][1] > cur_h:
+                idx, prev_h = stack.pop()
+                area = int(prev_h * (x - idx))
+                if area > best_area:
+                    best_area = area
+                    best = (idx, y - prev_h + 1, x - 1, y)
+                start = idx
+            if not stack or stack[-1][1] < cur_h:
+                stack.append((start, cur_h))
+
+    if best is None or best_area <= 0:
+        return None
+    x1, y1, x2, y2 = best
+    return {
+        "bbox_xyxy": [int(x1), int(y1), int(x2), int(y2)],
+        "area_px": int(best_area),
+        "width_px": int(x2 - x1 + 1),
+        "height_px": int(y2 - y1 + 1),
+    }
+
+
+def _semantic_solid_max_empty_rect_axes(
+    *,
+    semantic_clear_wall_mask: np.ndarray,
+    solid_wall_mask: np.ndarray,
+    xyz: np.ndarray,
+    basis: Any,
+    artwork_w_m: float,
+    artwork_h_m: float,
+    min_edge_margin_m: float,
+    max_axes: int = 3,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Generate fallback candidates from semantic_clear_wall_mask ∩ solid_wall_mask.
+
+    This path is only for low safe-coverage walls: a wall can have poor full-mask
+    coverage while still containing a contiguous solid rectangle large enough for
+    the artwork.  It adds candidate positions only; final filtering and scoring
+    remain unchanged.
+    """
+    safe_clear = ((semantic_clear_wall_mask > 0) & (solid_wall_mask > 0)).astype(np.uint8)
+    safe_clear = cv2.morphologyEx(safe_clear, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    safe_clear = cv2.morphologyEx(safe_clear, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(safe_clear, connectivity=8)
+    min_component_area_px = max(900, int(np.count_nonzero(semantic_clear_wall_mask > 0) * 0.005))
+    required_w_m = float(artwork_w_m + 2.0 * min_edge_margin_m)
+    required_h_m = float(artwork_h_m + 2.0 * min_edge_margin_m)
+    debug: dict[str, Any] = {
+        "enabled": True,
+        "source": "semantic_clear_wall_mask_intersect_solid_wall_mask_max_empty_rect",
+        "safe_clear_area_px": int(np.count_nonzero(safe_clear)),
+        "component_count": int(max(0, num_labels - 1)),
+        "min_component_area_px": int(min_component_area_px),
+        "required_width_m": float(required_w_m),
+        "required_height_m": float(required_h_m),
+        "added_count": 0,
+        "components": [],
+    }
+    axes: list[dict[str, Any]] = []
+    origin = np.array(basis.origin, np.float32).reshape(1, 3)
+    u = np.array(basis.u, np.float32).reshape(3)
+    v = np.array(basis.v, np.float32).reshape(3)
+
+    component_items: list[tuple[int, int]] = []
+    for comp_id in range(1, num_labels):
+        area_px = int(stats[comp_id, cv2.CC_STAT_AREA])
+        if area_px >= min_component_area_px:
+            component_items.append((area_px, comp_id))
+    component_items.sort(reverse=True)
+
+    for area_px, comp_id in component_items:
+        x = int(stats[comp_id, cv2.CC_STAT_LEFT])
+        y = int(stats[comp_id, cv2.CC_STAT_TOP])
+        ww = int(stats[comp_id, cv2.CC_STAT_WIDTH])
+        hh = int(stats[comp_id, cv2.CC_STAT_HEIGHT])
+        comp_crop = (labels[y:y + hh, x:x + ww] == comp_id).astype(np.uint8)
+        rect = _largest_rect_in_binary_mask(comp_crop)
+        comp_debug: dict[str, Any] = {
+            "component_id": int(comp_id),
+            "component_area_px": int(area_px),
+            "component_bbox_xywh": [int(x), int(y), int(ww), int(hh)],
+            "largest_rect": rect,
+        }
+        debug["components"].append(comp_debug)
+        if rect is None:
+            comp_debug["skip_reason"] = "no_nonempty_rect"
+            continue
+
+        rx1, ry1, rx2, ry2 = rect["bbox_xyxy"]
+        gx1, gy1, gx2, gy2 = x + rx1, y + ry1, x + rx2, y + ry2
+        rect_mask = np.zeros_like(safe_clear, dtype=np.uint8)
+        rect_mask[gy1:gy2 + 1, gx1:gx2 + 1] = 255
+        rect_mask[(safe_clear == 0)] = 0
+        rect_pts = points_from_mask(xyz, rect_mask, max_points=30000)
+        rect_pts = rect_pts[np.isfinite(rect_pts).all(axis=1)] if rect_pts.size else rect_pts
+        comp_debug["largest_rect_global_bbox_xyxy"] = [int(gx1), int(gy1), int(gx2), int(gy2)]
+        comp_debug["largest_rect_point_count"] = int(len(rect_pts))
+        if len(rect_pts) < 80:
+            comp_debug["skip_reason"] = "largest_rect_has_too_few_metric_points"
+            continue
+
+        rel = rect_pts - origin
+        rect_s = rel @ u
+        rect_t = rel @ v
+        rect_s = rect_s[np.isfinite(rect_s)]
+        rect_t = rect_t[np.isfinite(rect_t)]
+        if rect_s.size < 40 or rect_t.size < 40:
+            comp_debug["skip_reason"] = "largest_rect_metric_projection_invalid"
+            continue
+        s_min = float(np.percentile(rect_s, 5))
+        s_max = float(np.percentile(rect_s, 95))
+        t_min = float(np.percentile(rect_t, 5))
+        t_max = float(np.percentile(rect_t, 95))
+        width_m = float(s_max - s_min)
+        height_m = float(t_max - t_min)
+        comp_debug.update({
+            "s_range_m": [float(s_min), float(s_max)],
+            "t_range_m": [float(t_min), float(t_max)],
+            "width_m": float(width_m),
+            "height_m": float(height_m),
+        })
+        if width_m < required_w_m:
+            comp_debug["skip_reason"] = "largest_rect_too_narrow_for_artwork_with_edge_margin"
+            continue
+        if height_m < required_h_m:
+            comp_debug["skip_reason"] = "largest_rect_too_short_for_artwork_with_edge_margin"
+            continue
+
+        axis_s = float(0.5 * (s_min + s_max))
+        center_t = float(0.5 * (t_min + t_max))
+        axes.append({
+            "axis_s_m": axis_s,
+            "center_t_m_override": center_t,
+            "component_id": int(comp_id),
+            "component_area_px": int(area_px),
+            "component_s_range_m": [float(s_min), float(s_max)],
+            "component_t_range_m": [float(t_min), float(t_max)],
+            "component_width_m": float(width_m),
+            "component_height_m": float(height_m),
+            "source": "semantic_clear_subregion_max_empty_rect_center",
+            "candidate_generation_policy": "low_safe_coverage_semantic_clear_wall_intersect_solid_wall_max_empty_rect",
+            "max_empty_rect_bbox_processed": [int(gx1), int(gy1), int(gx2), int(gy2)],
+        })
+        debug["added_count"] += 1
+        if len(axes) >= max_axes:
+            break
+
+    debug["status"] = "available" if axes else "no_rect_large_enough"
+    return axes, debug
+
+
 def _cleanup_semantic_types_from_remove_mask(
     *,
     remove_mask: np.ndarray,
@@ -1220,7 +1386,31 @@ async def analyze_hanging_mvp(
             else:
                 semantic_axis_debug["skip_reason"] = "semantic_wall_section_too_narrow_for_artwork_with_edge_margin"
         elif fine_grained_front_policy_enabled:
-            semantic_axis_debug["skip_reason"] = "semantic_axis_set_dropped_low_safe_mask_coverage"
+            max_rect_axes, max_rect_debug = _semantic_solid_max_empty_rect_axes(
+                semantic_clear_wall_mask=semantic_clear_wall_mask,
+                solid_wall_mask=solid_wall_mask_u8,
+                xyz=xyz,
+                basis=basis,
+                artwork_w_m=artwork_w_m,
+                artwork_h_m=artwork_h_m,
+                min_edge_margin_m=min_edge_margin_m,
+                max_axes=max(1, min(3, max_axis)),
+            )
+            semantic_axis_debug["max_empty_rect_fallback"] = max_rect_debug
+            if max_rect_axes:
+                existing_axis_s = [float(a.get("axis_s_m", 0.0)) for a in axes]
+                min_axis_separation_m = max(0.04, artwork_w_m * 0.10)
+                for max_rect_axis in max_rect_axes:
+                    axis_s_rect = float(max_rect_axis.get("axis_s_m", 0.0))
+                    if any(abs(axis_s_rect - ex) < min_axis_separation_m for ex in existing_axis_s):
+                        continue
+                    axes.append(max_rect_axis)
+                    existing_axis_s.append(axis_s_rect)
+                    semantic_axis_debug["added_count"] += 1
+                semantic_axis_debug["skip_reason"] = None
+                semantic_axis_debug["status"] = "low_safe_coverage_overridden_by_max_empty_rect"
+            else:
+                semantic_axis_debug["skip_reason"] = "semantic_axis_set_dropped_low_safe_mask_coverage"
 
         solid_component_debug["semantic_axis_debug"] = semantic_axis_debug
 
@@ -1417,7 +1607,18 @@ async def analyze_hanging_mvp(
                 support_context.setdefault("height_band_base", "estimated_full_wall_or_trusted_floor")
             center_height_abs_m = float(support_context["center_height_abs_m"])
             center_height_above_floor_m = float(support_context["center_height_above_floor_m"])
-            center_t = float((center_height_abs_m - float(np.dot(wall_origin_np, g_hat_np))) / dot_v_g)
+            center_t_override = axis_item.get("center_t_m_override")
+            if center_t_override is not None and np.isfinite(float(center_t_override)):
+                center_t = float(center_t_override)
+                center_point = wall_origin_np + wall_v_np * center_t
+                center_height_abs_m = float(np.dot(center_point, g_hat_np))
+                center_height_above_floor_m = float(center_height_abs_m - floor_height_abs_m)
+                support_context["center_height_abs_m"] = center_height_abs_m
+                support_context["center_height_above_floor_m"] = center_height_above_floor_m
+                support_context["center_t_override_m"] = center_t
+                support_context["center_t_override_source"] = axis_item.get("source")
+            else:
+                center_t = float((center_height_abs_m - float(np.dot(wall_origin_np, g_hat_np))) / dot_v_g)
             visible_t_min = float(np.percentile(t_vals, 5))
             visible_t_max = float(np.percentile(t_vals, 95))
             center_t_normalized = float((center_t - visible_t_min) / max(1e-6, visible_t_max - visible_t_min))

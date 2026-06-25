@@ -217,15 +217,14 @@ def _valid_vlm_bbox_values(bbox):
         return None
     return vals
 
-def _infer_vlm_bbox_coordinate_space(objects, original_w, original_h):
-    """Infer whether VLM boxes are original pixels or normalized coordinates.
+def _infer_vlm_bbox_coordinate_space(objects, original_w, original_h, vlm_image_meta: Optional[Dict[str, Any]] = None):
+    """Infer whether VLM boxes are original pixels, sent-image pixels, or normalized coordinates.
 
-    Some vision APIs return 0..1000 visual coordinates even when the prompt asks
-    for original image pixels. If those boxes are used directly on a 1664x768
-    image, the right side is compressed into the middle and large regions become
-    a semantic vacuum. This guard is intentionally conservative and only switches
-    to normalized modes when the raw coordinate distribution is clearly not in
-    the original pixel space.
+    The OpenAI-compatible client may resize large images before sending them to
+    the VLM. Prompting and normalization must use that sent-image size; otherwise
+    boxes from high-resolution photos are projected into the upper-left region of
+    the original image. Some providers still return 0..1000 visual coordinates,
+    so keep the normalized-grid guard as a second path.
     """
     boxes = []
     for obj in objects or []:
@@ -251,12 +250,24 @@ def _infer_vlm_bbox_coordinate_space(objects, original_w, original_h):
     min_x = float(min(xs))
     min_y = float(min(ys))
     max_coord = max(max_x, max_y)
+    vlm_image_meta = vlm_image_meta or {}
+    sent_size = vlm_image_meta.get("sent_size") if isinstance(vlm_image_meta, dict) else None
+    try:
+        sent_w = int(sent_size[0]) if isinstance(sent_size, (list, tuple)) and len(sent_size) >= 2 else int(original_w)
+        sent_h = int(sent_size[1]) if isinstance(sent_size, (list, tuple)) and len(sent_size) >= 2 else int(original_h)
+    except Exception:
+        sent_w, sent_h = int(original_w), int(original_h)
+    sent_w = max(1, sent_w)
+    sent_h = max(1, sent_h)
+
     debug.update({
         'raw_min_x': min_x,
         'raw_max_x': max_x,
         'raw_min_y': min_y,
         'raw_max_y': max_y,
         'original_size': [int(original_w), int(original_h)],
+        'vlm_image_meta': vlm_image_meta,
+        'sent_size': [int(sent_w), int(sent_h)],
     })
 
     if max_coord <= 1.5 and min_x >= -0.05 and min_y >= -0.05:
@@ -271,15 +282,36 @@ def _infer_vlm_bbox_coordinate_space(objects, original_w, original_h):
     normalized_1000_like = (min_x >= -20.0 and min_y >= -20.0 and max_x <= 1024.0 and max_y <= 1024.0 and max_coord >= 10.0)
     y_exceeds_original = max_y > float(original_h) * 1.03 and original_h < 980
     looks_1000_tall = original_h < 900 and max_y >= 900.0
+    high_res_image_1000_grid = (float(original_w) > 1400.0 or float(original_h) > 1400.0) and (sent_w > 1100 or sent_h > 1100)
+    compact_1000_grid_on_original = (
+        normalized_1000_like
+        and max_coord < max(1.0, min(float(original_w), float(original_h)) * 0.5)
+    )
 
-    if normalized_1000_like and (y_exceeds_original or looks_1000_tall):
+    if normalized_1000_like and (
+        y_exceeds_original
+        or looks_1000_tall
+        or high_res_image_1000_grid
+        or compact_1000_grid_on_original
+    ):
         debug.update({
             'source_coordinate_space': 'normalized_0_1000',
-            'reason': 'vlm_boxes_match_0_1000_coordinate_grid_not_original_pixels',
+            'reason': 'vlm_boxes_match_0_1000_coordinate_grid_not_original_or_sent_pixels',
             'scale_x_to_original': float(original_w) / 1000.0,
             'scale_y_to_original': float(original_h) / 1000.0,
         })
         return 'normalized_0_1000', debug
+
+    sent_differs_from_original = (abs(float(sent_w) - float(original_w)) > 1.0 or abs(float(sent_h) - float(original_h)) > 1.0)
+    boxes_fit_sent_image = (min_x >= -20.0 and min_y >= -20.0 and max_x <= float(sent_w) * 1.03 and max_y <= float(sent_h) * 1.03)
+    if sent_differs_from_original and boxes_fit_sent_image:
+        debug.update({
+            'source_coordinate_space': 'sent_image_pixels',
+            'reason': 'vlm_boxes_match_resized_request_image_pixels',
+            'scale_x_to_original': float(original_w) / float(sent_w),
+            'scale_y_to_original': float(original_h) / float(sent_h),
+        })
+        return 'sent_image_pixels', debug
 
     debug.update({
         'scale_x_to_original': 1.0,
@@ -287,7 +319,7 @@ def _infer_vlm_bbox_coordinate_space(objects, original_w, original_h):
     })
     return 'original_pixels', debug
 
-def _normalize_vlm_bbox_to_original_pixels(bbox, original_w, original_h, coordinate_space):
+def _normalize_vlm_bbox_to_original_pixels(bbox, original_w, original_h, coordinate_space, vlm_image_meta: Optional[Dict[str, Any]] = None):
     vals = _valid_vlm_bbox_values(bbox)
     if vals is None:
         return []
@@ -296,6 +328,20 @@ def _normalize_vlm_bbox_to_original_pixels(bbox, original_w, original_h, coordin
         box = [x1 * float(original_w), y1 * float(original_h), x2 * float(original_w), y2 * float(original_h)]
     elif coordinate_space == 'normalized_0_1000':
         box = [x1 / 1000.0 * float(original_w), y1 / 1000.0 * float(original_h), x2 / 1000.0 * float(original_w), y2 / 1000.0 * float(original_h)]
+    elif coordinate_space == 'sent_image_pixels':
+        vlm_image_meta = vlm_image_meta or {}
+        sent_size = vlm_image_meta.get("sent_size") if isinstance(vlm_image_meta, dict) else None
+        try:
+            sent_w = float(sent_size[0]) if isinstance(sent_size, (list, tuple)) and len(sent_size) >= 2 else float(original_w)
+            sent_h = float(sent_size[1]) if isinstance(sent_size, (list, tuple)) and len(sent_size) >= 2 else float(original_h)
+        except Exception:
+            sent_w, sent_h = float(original_w), float(original_h)
+        box = [
+            x1 / max(1.0, sent_w) * float(original_w),
+            y1 / max(1.0, sent_h) * float(original_h),
+            x2 / max(1.0, sent_w) * float(original_w),
+            y2 / max(1.0, sent_h) * float(original_h),
+        ]
     else:
         box = [x1, y1, x2, y2]
     return _clip_box_xyxy(box, original_w, original_h)
@@ -943,7 +989,7 @@ def _remap_objects_to_processed_space(objects, processed_w, processed_h, sx, sy)
     return remapped
 
 
-def _build_vlm_objects_in_original_space(raw, original_w, original_h, bbox_coordinate_space):
+def _build_vlm_objects_in_original_space(raw, original_w, original_h, bbox_coordinate_space, vlm_image_meta: Optional[Dict[str, Any]] = None):
     """Convert VLM boxes to canonical object records in original image space.
 
     This keeps VLM/SAM independent from Metric3D. A later alignment step maps
@@ -958,7 +1004,7 @@ def _build_vlm_objects_in_original_space(raw, original_w, original_h, bbox_coord
         if len(bbox) != 4:
             continue
         bbox_raw = [float(x) for x in bbox]
-        bbox_orig = _normalize_vlm_bbox_to_original_pixels(bbox_raw, original_w, original_h, bbox_coordinate_space)
+        bbox_orig = _normalize_vlm_bbox_to_original_pixels(bbox_raw, original_w, original_h, bbox_coordinate_space, vlm_image_meta)
         if len(bbox_orig) != 4:
             continue
         poly_orig = bbox_to_polygon(bbox_orig, original_w, original_h)
@@ -1082,8 +1128,9 @@ async def parse_semantics_mvp(
         # visual coordinates, so normalize before any SAM or Metric3D alignment.
         raw = parse_with_vlm(image_bytes, scene_profile, vlm_mode, original_w, original_h)
         objs = raw.get("objects", [])
-        bbox_coordinate_space, bbox_coordinate_debug = _infer_vlm_bbox_coordinate_space(objs, original_w, original_h)
-        original_space_objects = _build_vlm_objects_in_original_space(raw, original_w, original_h, bbox_coordinate_space)
+        vlm_image_meta = raw.get("_vlm_image_meta") if isinstance(raw, dict) else None
+        bbox_coordinate_space, bbox_coordinate_debug = _infer_vlm_bbox_coordinate_space(objs, original_w, original_h, vlm_image_meta)
+        original_space_objects = _build_vlm_objects_in_original_space(raw, original_w, original_h, bbox_coordinate_space, vlm_image_meta)
 
         # Optional SAM now runs only in original-image space. This lets callers
         # start /parse_semantics_mvp without metric3d_zip while Metric3D is still

@@ -24,18 +24,32 @@ def _detect_mime(image_bytes: bytes) -> str:
         fmt = ""
     return _MIME_MAP.get(fmt or "", "image/jpeg")
 
-def _resize_image(image_bytes: bytes, max_side: int) -> bytes:
+def _resize_image_with_meta(image_bytes: bytes, max_side: int) -> tuple[bytes, Dict[str, Any]]:
     img = ImageOps.exif_transpose(Image.open(io.BytesIO(image_bytes))).convert("RGB")
-    w, h = img.size
-    if w > max_side or h > max_side:
-        if w > h:
-            nw, nh = max_side, int(h * max_side / w)
+    original_w, original_h = img.size
+    sent_w, sent_h = original_w, original_h
+    resized_for_vlm = False
+    if original_w > max_side or original_h > max_side:
+        resized_for_vlm = True
+        if original_w > original_h:
+            sent_w, sent_h = max_side, int(original_h * max_side / original_w)
         else:
-            nw, nh = int(w * max_side / h), max_side
-        img = img.resize((nw, nh), Image.LANCZOS)
+            sent_w, sent_h = int(original_w * max_side / original_h), max_side
+        img = img.resize((sent_w, sent_h), Image.LANCZOS)
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=85)
-    return buf.getvalue()
+    return buf.getvalue(), {
+        "original_size": [int(original_w), int(original_h)],
+        "sent_size": [int(sent_w), int(sent_h)],
+        "max_side": int(max_side),
+        "resized_for_vlm": bool(resized_for_vlm),
+        "scale_x_sent_to_original": float(original_w) / float(max(1, sent_w)),
+        "scale_y_sent_to_original": float(original_h) / float(max(1, sent_h)),
+    }
+
+
+def _resize_image(image_bytes: bytes, max_side: int) -> bytes:
+    return _resize_image_with_meta(image_bytes, max_side)[0]
 
 def image_to_data_url(image_bytes: bytes, mime: str = "") -> str:
     mime = mime if mime else _detect_mime(image_bytes)
@@ -89,7 +103,7 @@ def call_openai_compatible_with_prompts(
     if not api_url or not api_key or not model:
         raise RuntimeError("VLM_API_URL, VLM_API_KEY and VLM_MODEL are required for openai_compatible mode")
 
-    resized = _resize_image(image_bytes, _VLM_MAX_IMAGE_SIDE)
+    resized, vlm_image_meta = _resize_image_with_meta(image_bytes, _VLM_MAX_IMAGE_SIDE)
     data_url = image_to_data_url(resized)
     payload = {
         "model": model,
@@ -110,14 +124,21 @@ def call_openai_compatible_with_prompts(
     resp.raise_for_status()
     data = resp.json()
     text = data["choices"][0]["message"]["content"]
-    return extract_json(text)
+    result = extract_json(text)
+    if isinstance(result, dict):
+        result["_vlm_image_meta"] = vlm_image_meta
+    return result
 
 
 def call_openai_compatible(image_bytes: bytes, scene_profile: str, width: int, height: int) -> Dict[str, Any]:
+    # The provider sees the resized request image, so ask for coordinates in that
+    # image space and map them back to original pixels in semantic_mvp.service.
+    _, vlm_image_meta = _resize_image_with_meta(image_bytes, _VLM_MAX_IMAGE_SIDE)
+    sent_w, sent_h = vlm_image_meta.get("sent_size", [width, height])
     return call_openai_compatible_with_prompts(
         image_bytes,
         system_prompt(scene_profile),
-        user_prompt(scene_profile, width, height),
+        user_prompt(scene_profile, int(sent_w), int(sent_h)),
     )
 
 

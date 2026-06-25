@@ -27,7 +27,7 @@ Return an object:
   ]
 }
 
-Coordinate system: original input image pixels.
+Coordinate system: pixels of the image attached in this request.
 Prioritize high-recall boxes. Coarse bbox is acceptable for MVP.
 Required labels when visible:
 wall, floor, sofa, table, cabinet, window, door, tv, mirror, lamp,
