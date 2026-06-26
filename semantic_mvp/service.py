@@ -393,6 +393,36 @@ def _infer_vlm_bbox_coordinate_space(objects, original_w, original_h, vlm_image_
         })
         return 'sent_image_pixels', debug
 
+    # Dynamic VLM internal size inference: VLM may internally resize images
+    # (e.g. qwen3-vl resizes 2048×1536 → 1536×1152). Infer the actual pixel
+    # space from bbox coordinate ranges.
+    inferred_vlm_w = max(1, int(round(max_x)))
+    inferred_vlm_h = max(1, int(round(max_y)))
+    # Check if coords roughly match a 4:3 or 3:4 aspect ratio and are
+    # substantially smaller than original but larger than 1000-grid
+    aspect_orig = float(original_w) / max(1, float(original_h))
+    aspect_inferred = float(inferred_vlm_w) / max(1, float(inferred_vlm_h))
+    aspect_sent = float(sent_w) / max(1, float(sent_h))
+    # If inferred aspect ratio matches original within 10%, treat max_coords
+    # as the VLM's actual pixel space
+    aspect_match = abs(aspect_inferred - aspect_orig) < 0.10
+    coords_between_1000_and_original = (
+        max_coord > 1024.0 and
+        max_coord < min(float(original_w), float(original_h)) * 0.95
+    )
+    if aspect_match and coords_between_1000_and_original:
+        # VLM used an internal pixel space — compute actual scale
+        scale_x = float(original_w) / float(max(1, inferred_vlm_w))
+        scale_y = float(original_h) / float(max(1, inferred_vlm_h))
+        debug.update({
+            'source_coordinate_space': 'sent_image_pixels',
+            'reason': f'dynamic_inferred_vlm_internal_pixel_space_{inferred_vlm_w}x{inferred_vlm_h}',
+            'scale_x_to_original': scale_x,
+            'scale_y_to_original': scale_y,
+            'inferred_vlm_internal_size': [inferred_vlm_w, inferred_vlm_h],
+        })
+        return 'sent_image_pixels', debug
+
     debug.update({
         'scale_x_to_original': 1.0,
         'scale_y_to_original': 1.0,

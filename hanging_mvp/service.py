@@ -868,6 +868,16 @@ def _compute_artwork_mount_policy_for_candidate(
     ]
     ow, oh = original_size_wh
     _, front_mask = _mask_area_for_quad((oh, ow), front_orig)
+
+    # When wall faces camera directly, back-front perspective shift may be
+    # sub-pixel (< 2px). But sides are still visible when artwork center
+    # is offset from image center — the side facing away from the image
+    # center is always visible in perspective.
+    front_center = np.mean(front_orig, axis=0)
+    image_center = np.array([ow / 2.0, oh / 2.0])
+    center_offset = front_center - image_center
+    offset_dist = np.linalg.norm(center_offset)
+
     visible = []
     for face in raw_faces:
         area_total, side_mask = _mask_area_for_quad((oh, ow), face["quad"])
@@ -876,6 +886,36 @@ def _compute_artwork_mount_policy_for_candidate(
         visible_area = int(np.count_nonzero(side_visible))
         edge_len = max(1.0, _quad_edge_length(face["quad"], face["source_edge"]))
         est_width = float(visible_area) / edge_len
+
+        # Fallback: when perspective shift is sub-pixel, compute side
+        # visibility from artwork-center-to-image-center offset.
+        # The side whose edge faces away from image center is visible.
+        if visible_area < min_area and est_width < min_width and offset_dist > 10.0:
+            face_quad = np.array(face["quad"], dtype=np.float32)
+            face_edge = face["source_edge"]
+            # Determine which edge of the face is the "outer" edge
+            # (farthest from image center)
+            if face_edge == "right":
+                outer_edge_pts = face_quad[[1, 2]]  # right edge
+            elif face_edge == "left":
+                outer_edge_pts = face_quad[[0, 3]]  # left edge
+            elif face_edge == "top":
+                outer_edge_pts = face_quad[[0, 1]]  # top edge
+            else:  # bottom
+                outer_edge_pts = face_quad[[2, 3]]  # bottom edge
+
+            outer_edge_center = np.mean(outer_edge_pts, axis=0)
+            # Check if this edge is farther from image center than front center
+            dist_outer = np.linalg.norm(outer_edge_center - image_center)
+            dist_front = np.linalg.norm(front_center - image_center)
+            if dist_outer > dist_front + 5.0:
+                # This side faces away from image center → visible
+                # Estimate visible width proportional to offset distance
+                est_visible_width = min(frame_depth_m * 40.0 * (offset_dist / max(100.0, dist_front)), edge_len * 0.15)
+                est_visible_width = max(est_visible_width, min_width)
+                visible_area = max(visible_area, int(est_visible_width * edge_len * 0.3))
+                est_width = max(est_width, est_visible_width)
+
         rec = {
             "source_edge": face["source_edge"],
             "quad": _jsonable_quad(face["quad"]),
