@@ -121,6 +121,11 @@ its painting/photo/poster content. A physical frame means a visible outer
 border/frame that should be preserved and whose edge colors can be used to
 synthesize deterministic side thickness.
 
+Also classify the artwork surface/material style for side thickness: delicate or
+paper-like works use normal side depth, rough/canvas works use double side depth,
+and Chinese hanging scroll / vertical scroll artworks should not get generated
+side faces.
+
 Do not classify a white mat, crop margin, canvas whitespace, product background,
 or image content border as a physical frame unless there is a clear frame
 boundary and material-like outer rim.
@@ -136,6 +141,8 @@ Return this JSON object exactly:
   "has_frame": true|false|null,
   "confidence": 0.0-1.0,
   "frame_style": "visible_outer_frame|canvas_wrap|mat_only|border_only|none|uncertain",
+  "artwork_surface_style": "refined_paper_or_delicate|rough_or_canvas|chinese_hanging_scroll|uncertain",
+  "side_thickness_policy": "normal|double|none",
   "frame_width_ratio": {{
     "left": 0.0,
     "right": 0.0,
@@ -155,6 +162,12 @@ Rules:
 - has_frame=true only when a physical frame is clearly visible.
 - has_frame=false when no physical frame is visible.
 - has_frame=null when uncertain.
+- artwork_surface_style describes the artwork material/style for deterministic side-depth synthesis:
+  refined_paper_or_delicate = delicate print, photo, fine illustration, paper painting, Chinese painting sheet, or other thin/refined paper-like work;
+  rough_or_canvas = coarse painting, oil/acrylic on canvas, visibly rough cloth/canvas texture, thick impasto, or rustic fabric painting;
+  chinese_hanging_scroll = Chinese hanging scroll / vertical scroll with rollers or textile mounting that should stay flat in this renderer;
+  uncertain = not enough evidence.
+- side_thickness_policy should be normal for refined_paper_or_delicate or uncertain, double for rough_or_canvas, and none for chinese_hanging_scroll.
 - frame_width_ratio is approximate visible frame width divided by image size.
 - dominant_edge_colors_rgb should describe the outermost frame/edge color.
 """

@@ -117,3 +117,64 @@ def test_mount_policy_locks_visible_front_to_candidate_projection():
     assert np.allclose(np.array(policy["front_quad_original"]), expected_front, atol=1e-4)
     # Back face recedes from the locked visual front; it must not be reused as the prompt/QA polygon.
     assert not np.allclose(np.array(policy["back_quad_original"]), expected_front, atol=1e-4)
+
+
+def test_mount_policy_generates_sides_for_unframed_canvas_with_double_depth():
+    from hanging_mvp.schemas import Intrinsics, WallBasis
+    from hanging_mvp.service import _compute_artwork_mount_policy_for_candidate
+
+    basis = WallBasis(
+        origin=(0.0, 0.0, 1.0),
+        u=(1.0, 0.0, 0.0),
+        v=(0.0, -1.0, 0.0),
+        n=(0.0, 0.0, -1.0),
+        g_hat_cam=(0.0, -1.0, 0.0),
+    )
+    intr = Intrinsics(fx=100.0, fy=100.0, cx=100.0, cy=100.0)
+    policy = _compute_artwork_mount_policy_for_candidate(
+        rules={"artwork_mount": {"precompose_frame_sides_when_detected": True, "default_frame_depth_m": 0.025, "max_frame_depth_m": 0.08, "min_side_face_area_px": 0, "min_side_face_width_px": 0}},
+        artwork_analysis={"has_frame": False, "confidence": 0.94, "artwork_surface_style": "rough_or_canvas", "side_thickness_policy": "double"},
+        artwork_has_frame=False,
+        artwork_has_frame_source="artwork_vlm",
+        basis=basis,
+        axis_s=0.0,
+        center_t=0.0,
+        artwork_w_m=0.4,
+        artwork_h_m=0.4,
+        intr=intr,
+        scale_to_original=(1.0, 1.0),
+        original_size_wh=(200, 200),
+    )
+    assert policy["precompose_frame_sides"] is True
+    assert policy["side_thickness_policy"] == "double"
+    assert policy["side_depth_multiplier"] == 2.0
+    assert policy["frame_depth_m"] == 0.05
+
+
+def test_mount_policy_skips_sides_for_chinese_hanging_scroll():
+    from hanging_mvp.schemas import Intrinsics, WallBasis
+    from hanging_mvp.service import _compute_artwork_mount_policy_for_candidate
+
+    basis = WallBasis(
+        origin=(0.0, 0.0, 1.0),
+        u=(1.0, 0.0, 0.0),
+        v=(0.0, -1.0, 0.0),
+        n=(0.0, 0.0, -1.0),
+        g_hat_cam=(0.0, -1.0, 0.0),
+    )
+    policy = _compute_artwork_mount_policy_for_candidate(
+        rules={"artwork_mount": {"precompose_frame_sides_when_detected": True}},
+        artwork_analysis={"artwork_surface_style": "chinese_hanging_scroll", "side_thickness_policy": "none"},
+        artwork_has_frame=False,
+        artwork_has_frame_source="artwork_vlm",
+        basis=basis,
+        axis_s=0.0,
+        center_t=0.0,
+        artwork_w_m=0.4,
+        artwork_h_m=0.4,
+        intr=Intrinsics(fx=100.0, fy=100.0, cx=100.0, cy=100.0),
+        scale_to_original=(1.0, 1.0),
+        original_size_wh=(200, 200),
+    )
+    assert policy["precompose_frame_sides"] is False
+    assert policy["fallback_reason"] == "artwork_vlm_classified_as_chinese_hanging_scroll_no_side_faces"

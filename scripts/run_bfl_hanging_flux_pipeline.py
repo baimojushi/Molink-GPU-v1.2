@@ -205,6 +205,152 @@ def _ambient_light_hint(
         return "", {"enabled": False, "reason": "exception", "error": str(exc)}
 
 
+def _fit_affine_luma_residual(luma: np.ndarray, sample: np.ndarray) -> tuple[float, float]:
+    ys, xs = np.where(sample)
+    if xs.size < 32:
+        return 0.0, float(np.std(luma[sample])) if xs.size else 0.0
+    h, w = luma.shape[:2]
+    # Fit and remove a smooth affine lighting plane so a plain wall with a broad
+    # light/shadow gradient does not trigger the full-space render path.
+    A = np.stack([
+        xs.astype(np.float32) / max(1.0, float(w)),
+        ys.astype(np.float32) / max(1.0, float(h)),
+        np.ones_like(xs, dtype=np.float32),
+    ], axis=1)
+    b = luma[sample].astype(np.float32)
+    try:
+        coeff, *_ = np.linalg.lstsq(A, b, rcond=None)
+        pred = A @ coeff
+        return float(np.std(b - pred)), float(np.std(b))
+    except Exception:
+        return float(np.std(b)), float(np.std(b))
+
+
+def _render_full_space_texture_gate(
+    *,
+    image_path: Path,
+    edit_mask_path: Path | None,
+    object_mask_path: Path | None,
+    outer_px: int = 192,
+    inner_guard_px: int = 12,
+    min_sample_px: int = 512,
+    residual_std_threshold: float = 3.0,
+    hf_mad_threshold: float = 1.25,
+    edge_p95_threshold: float = 5.5,
+    chroma_std_threshold: float = 2.6,
+) -> tuple[bool, dict[str, Any]]:
+    """Decide whether GPT Image needs the full room instead of a local crop.
+
+    Local crop rendering is safe for flat, nearly solid-color walls.  It becomes
+    unstable on walls with visible material texture, high-frequency grain, subtle
+    low-frequency mottling, or hard light/shadow boundaries because the cropped
+    request loses full-space texture continuity.  The detector samples wall pixels
+    around the mounted object, removes a simple smooth lighting plane, and then
+    tests residual texture/edge energy.  Smooth gradual light transitions alone
+    should therefore not trigger the full-space path.
+    """
+    if not _env_truthy("MOLINK_RENDER_TEXTURE_GATE_ENABLED", "1"):
+        return False, {"enabled": False, "reason": "disabled_by_env"}
+    try:
+        rgb = np.asarray(Image.open(image_path).convert("RGB"), dtype=np.float32)
+        h, w = rgb.shape[:2]
+        if edit_mask_path is None or not edit_mask_path.exists():
+            return False, {"enabled": True, "full_space_recommended": False, "reason": "missing_edit_mask"}
+        edit = np.asarray(Image.open(edit_mask_path).convert("L"), dtype=np.uint8)
+        if edit.shape[:2] != (h, w):
+            edit = cv2.resize(edit, (w, h), interpolation=cv2.INTER_NEAREST)
+        if object_mask_path is not None and object_mask_path.exists():
+            obj = np.asarray(Image.open(object_mask_path).convert("L"), dtype=np.uint8)
+            if obj.shape[:2] != (h, w):
+                obj = cv2.resize(obj, (w, h), interpolation=cv2.INTER_NEAREST)
+        else:
+            obj = edit.copy()
+
+        edit_bool = edit > 0
+        obj_bool = obj > 0
+        anchor = obj_bool if int(np.count_nonzero(obj_bool)) else edit_bool
+        if not int(np.count_nonzero(anchor)):
+            return False, {"enabled": True, "full_space_recommended": False, "reason": "empty_masks"}
+
+        outer = _dilate_alpha(anchor.astype(np.float32), max(1, int(outer_px))) > 0.05
+        inner = _dilate_alpha(anchor.astype(np.float32), max(0, int(inner_guard_px))) > 0.05
+        sample = (outer & (~inner)) | (edit_bool & (~inner))
+        sample_count = int(np.count_nonzero(sample))
+        if sample_count < int(min_sample_px):
+            bbox = _alpha_bbox(anchor.astype(np.float32), threshold=0.2)
+            if bbox is not None:
+                x0, y0, x1, y1 = bbox
+                pad = max(24, int(outer_px))
+                rx0, ry0 = max(0, x0 - pad), max(0, y0 - pad)
+                rx1, ry1 = min(w, x1 + pad), min(h, y1 + pad)
+                rect = np.zeros((h, w), bool)
+                rect[ry0:ry1, rx0:rx1] = True
+                sample = rect & (~inner)
+                sample_count = int(np.count_nonzero(sample))
+        if sample_count < int(min_sample_px):
+            return False, {
+                "enabled": True,
+                "full_space_recommended": False,
+                "reason": "insufficient_wall_samples",
+                "sample_count": sample_count,
+                "min_sample_px": int(min_sample_px),
+            }
+
+        weights = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
+        luma = np.tensordot(rgb, weights, axes=([-1], [0])).astype(np.float32)
+        residual_std, raw_luma_std = _fit_affine_luma_residual(luma, sample)
+        blur_small = cv2.GaussianBlur(luma, (0, 0), sigmaX=3.0, sigmaY=3.0)
+        high = luma - blur_small
+        hf_values = high[sample]
+        hf_mad = float(np.median(np.abs(hf_values - np.median(hf_values))) * 1.4826)
+        blur_edge = cv2.GaussianBlur(luma, (0, 0), sigmaX=2.0, sigmaY=2.0)
+        gx = cv2.Sobel(blur_edge, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(blur_edge, cv2.CV_32F, 0, 1, ksize=3)
+        grad = np.sqrt(gx * gx + gy * gy)
+        edge_p95 = float(np.percentile(grad[sample], 95))
+        # Chroma residual catches colored plaster / material mottling even when
+        # luminance is almost constant.
+        rg = rgb[:, :, 0] - rgb[:, :, 1]
+        yb = 0.5 * (rgb[:, :, 0] + rgb[:, :, 1]) - rgb[:, :, 2]
+        chroma_std = max(_fit_affine_luma_residual(rg.astype(np.float32), sample)[0], _fit_affine_luma_residual(yb.astype(np.float32), sample)[0])
+        score_parts = {
+            "affine_removed_luma_residual_std": float(residual_std) / max(1e-6, float(residual_std_threshold)),
+            "high_frequency_luma_mad": float(hf_mad) / max(1e-6, float(hf_mad_threshold)),
+            "blurred_edge_gradient_p95": float(edge_p95) / max(1e-6, float(edge_p95_threshold)),
+            "affine_removed_chroma_residual_std": float(chroma_std) / max(1e-6, float(chroma_std_threshold)),
+        }
+        texture_score = float(max(score_parts.values()))
+        recommended = bool(texture_score >= 1.0)
+        dominant_reason = max(score_parts, key=score_parts.get)
+        return recommended, {
+            "enabled": True,
+            "full_space_recommended": recommended,
+            "reason": "candidate_wall_not_pure_color" if recommended else "candidate_wall_looks_pure_or_smooth_gradient_only",
+            "dominant_reason": dominant_reason,
+            "texture_score": texture_score,
+            "score_parts": score_parts,
+            "sample_count": sample_count,
+            "outer_px": int(outer_px),
+            "inner_guard_px": int(inner_guard_px),
+            "thresholds": {
+                "residual_std_threshold": float(residual_std_threshold),
+                "hf_mad_threshold": float(hf_mad_threshold),
+                "edge_p95_threshold": float(edge_p95_threshold),
+                "chroma_std_threshold": float(chroma_std_threshold),
+            },
+            "metrics": {
+                "raw_luma_std": float(raw_luma_std),
+                "affine_removed_luma_residual_std": float(residual_std),
+                "high_frequency_luma_mad": float(hf_mad),
+                "blurred_edge_gradient_p95": float(edge_p95),
+                "affine_removed_chroma_residual_std": float(chroma_std),
+            },
+            "smooth_lighting_transition_exclusion": "affine_luma_plane_removed_before_texture_decision",
+        }
+    except Exception as exc:
+        return False, {"enabled": True, "full_space_recommended": False, "reason": "exception", "error": str(exc)}
+
+
 def _env_float(name: str, default: float) -> float:
     try:
         return float(os.getenv(name, str(default)))
@@ -958,8 +1104,8 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             "final_render_mask_required": not using_apiyi_gpt_image2_vip,
             "final_render_contract": (
                 "gpt-image-2-vip /v1/images/edits with local bounded composite; "
-                "remote API receives images only, no mask or pixel-coordinate matrix; "
-                "local crop/composite/QA enforce edit scope"
+                "pure-color walls use local crop/composite/QA to enforce edit scope; "
+                "textured candidate walls send the full room and enforce the remote edit scope with a compressed-pixel coordinate matrix prompt"
             ) if using_apiyi_gpt_image2_vip else "masked FLUX.2 edit",
             "outputs": [],
             "errors": [],
@@ -1185,6 +1331,30 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                 ) if _env_truthy("MOLINK_RENDER_LIGHT_HINT_PROMPT", "1") else ("", {"enabled": False, "reason": "disabled_by_env"})
                 prompt_for_render = f"{prompt}\n\n{render_light_hint}" if render_light_hint else prompt
 
+                full_space_texture_render, wall_texture_gate_trace = _render_full_space_texture_gate(
+                    image_path=hard_paste_after_erase,
+                    edit_mask_path=render_mask,
+                    object_mask_path=render_object_mask,
+                    outer_px=max(16, int(os.getenv("MOLINK_RENDER_TEXTURE_GATE_OUTER_PX", "192"))),
+                    inner_guard_px=max(0, int(os.getenv("MOLINK_RENDER_TEXTURE_GATE_INNER_GUARD_PX", "12"))),
+                    min_sample_px=max(32, int(os.getenv("MOLINK_RENDER_TEXTURE_GATE_MIN_SAMPLE_PX", "512"))),
+                    residual_std_threshold=max(0.1, _env_float("MOLINK_RENDER_TEXTURE_GATE_RESIDUAL_STD", 3.0)),
+                    hf_mad_threshold=max(0.1, _env_float("MOLINK_RENDER_TEXTURE_GATE_HF_MAD", 1.25)),
+                    edge_p95_threshold=max(0.1, _env_float("MOLINK_RENDER_TEXTURE_GATE_EDGE_P95", 5.5)),
+                    chroma_std_threshold=max(0.1, _env_float("MOLINK_RENDER_TEXTURE_GATE_CHROMA_STD", 2.6)),
+                )
+                full_space_coordinate_prompt_requested = bool(using_apiyi_gpt_image2_vip and full_space_texture_render)
+                if full_space_coordinate_prompt_requested:
+                    render_input_semantics["final_render_scope"] = "full_space_image_with_remote_pixel_coordinate_matrix_prompt"
+                    render_input_semantics["mask_crop_disabled_reason"] = "candidate_wall_texture_not_pure_color"
+                    render_input_semantics["coordinate_space"] = "exact_compressed_api_upload_pixels"
+                else:
+                    render_input_semantics["final_render_scope"] = "local_mask_crop_composite_or_native_mask"
+
+                render_front_polygon_px = item.get("front_polygon_px") or item.get("polygon_px") or quad
+                render_front_bbox_px = item.get("front_bbox_px") or item.get("bbox_px")
+                render_mount_bbox_px = item.get("mount_bbox_px")
+
                 render_result = render_hanging(
                     provider,
                     render_primary,
@@ -1204,8 +1374,17 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                         "render_reference_count": len(render_refs),
                         "light_context_reference_mode": light_context_reference_mode,
                         "render_light_hint": render_light_hint_trace,
-                        "remote_pixel_coordinate_matrix_supported": False,
-                        "remote_pixel_coordinate_matrix_sent": False,
+                        "wall_texture_gate": wall_texture_gate_trace,
+                        "full_space_coordinate_prompt_requested": full_space_coordinate_prompt_requested,
+                        "full_space_render_reason": "candidate_wall_texture_not_pure_color" if full_space_coordinate_prompt_requested else None,
+                        "remote_pixel_coordinate_matrix_supported": bool(using_apiyi_gpt_image2_vip),
+                        "remote_pixel_coordinate_matrix_sent": bool(full_space_coordinate_prompt_requested),
+                        "front_polygon_px": render_front_polygon_px,
+                        "polygon_px": render_front_polygon_px,
+                        "front_bbox_px": render_front_bbox_px,
+                        "bbox_px": render_front_bbox_px,
+                        "mount_bbox_px": render_mount_bbox_px,
+                        "target_quad_original": quad,
                         "art_region_mask_usage": "front_region_mask_for_core_qa; selected_render_mask_sent_to_provider",
                         "render_mask_path": str(render_mask),
                         "render_mask_source": render_mask_source,
@@ -1413,15 +1592,21 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                 selected_trace = dict(selected_render_result.trace or {})
                 selected_mask_sent = bool(selected_trace.get("mask_sent_to_flux2"))
                 selected_apiyi_gpt_image2_vip = bool(selected_trace.get("apiyi_images_edit_request")) and str(selected_trace.get("provider")) == "apiyi_gpt_image2_vip"
+                selected_remote_native_mask_sent = bool(selected_mask_sent and not selected_apiyi_gpt_image2_vip and not using_mock_provider)
                 selected_mask_enforced_locally = bool(selected_trace.get("mask_enforced_locally") or selected_trace.get("mask_local_composite"))
-                selected_edit_scope_ok = selected_mask_sent or (selected_apiyi_gpt_image2_vip and selected_mask_enforced_locally)
+                selected_remote_coordinate_matrix = bool(selected_trace.get("remote_coordinate_matrix_sent") or selected_trace.get("full_space_coordinate_prompt"))
+                selected_edit_scope_ok = selected_mask_sent or (selected_apiyi_gpt_image2_vip and (selected_mask_enforced_locally or selected_remote_coordinate_matrix))
                 selected_edit_scope = (
                     "mask_sent"
                     if selected_mask_sent
                     else (
                         "gpt_image2_vip_mask_photometric_composite"
                         if bool(selected_trace.get("mask_photometric_composite"))
-                        else ("gpt_image2_vip_mask_local_composite" if selected_mask_enforced_locally else "unmasked_unknown")
+                        else (
+                            "gpt_image2_vip_full_space_coordinate_prompt"
+                            if selected_remote_coordinate_matrix
+                            else ("gpt_image2_vip_mask_local_composite" if selected_mask_enforced_locally else "unmasked_unknown")
+                        )
                     )
                 )
                 render_failure_diagnosis = _render_failure_diagnosis(
@@ -1449,9 +1634,10 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                     },
                     "guarantee_final_hd": guarantee_final_hd,
                     "selected_flux_file_ok": selected_flux_file_ok,
-                    "selected_flux2_mask_sent": selected_mask_sent,
+                    "selected_flux2_mask_sent": selected_remote_native_mask_sent,
                     "selected_apiyi_gpt_image2_vip": selected_apiyi_gpt_image2_vip,
                     "selected_mask_enforced_locally": selected_mask_enforced_locally,
+                    "selected_remote_coordinate_matrix": selected_remote_coordinate_matrix,
                     "selected_edit_scope": selected_edit_scope,
                     "selected_edit_scope_ok": selected_edit_scope_ok,
                     "never_silent_hardpaste_success": True,
@@ -1489,7 +1675,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                         "message": f"No deliverable final render was available for {asset_id}; hardpaste preview saved for manual review",
                         "qa": selected_render_size_qa,
                         "qa_hard_block_reasons": qa_hard_block_reasons,
-                        "selected_flux2_mask_sent": selected_mask_sent,
+                        "selected_flux2_mask_sent": selected_remote_native_mask_sent,
                         "render_failure_diagnosis": render_failure_diagnosis,
                     })
                 finalization_trace.update({
@@ -1514,9 +1700,11 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                     "render_reference_count": len(render_refs),
                     "light_context_reference_mode": locals().get("light_context_reference_mode"),
                     "render_light_hint": locals().get("render_light_hint_trace"),
-                    "remote_pixel_coordinate_matrix_supported": False,
-                    "remote_pixel_coordinate_matrix_sent": False,
-                    "flux2_mask_sent": selected_mask_sent,
+                    "wall_texture_gate": locals().get("wall_texture_gate_trace"),
+                    "full_space_coordinate_prompt_requested": locals().get("full_space_coordinate_prompt_requested"),
+                    "remote_pixel_coordinate_matrix_supported": bool(using_apiyi_gpt_image2_vip),
+                    "remote_pixel_coordinate_matrix_sent": bool(selected_remote_coordinate_matrix),
+                    "flux2_mask_sent": selected_remote_native_mask_sent,
                     "final_render_edit_scope": selected_edit_scope,
                     "selected_apiyi_gpt_image2_vip": selected_apiyi_gpt_image2_vip,
                     "flux2_edit_mask_path": str(flux2_edit_mask),

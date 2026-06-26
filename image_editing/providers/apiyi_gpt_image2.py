@@ -121,6 +121,104 @@ def _maybe_compress_upload(path: Path, tmp_dir: Path, *, max_bytes: int, enabled
     return out
 
 
+def _image_size_wh(path: Path) -> tuple[int, int]:
+    with Image.open(path) as img:
+        return tuple(int(v) for v in img.size)
+
+
+def _round_coord(value: float) -> int | float:
+    rounded = round(float(value), 2)
+    if abs(rounded - round(rounded)) < 1e-6:
+        return int(round(rounded))
+    return rounded
+
+
+def _scale_bbox_for_sent_image(value: Any, *, sx: float, sy: float) -> list[int | float] | None:
+    if not isinstance(value, (list, tuple)) or len(value) < 4:
+        return None
+    try:
+        return [
+            _round_coord(float(value[0]) * sx),
+            _round_coord(float(value[1]) * sy),
+            _round_coord(float(value[2]) * sx),
+            _round_coord(float(value[3]) * sy),
+        ]
+    except Exception:
+        return None
+
+
+def _scale_polygon_for_sent_image(value: Any, *, sx: float, sy: float) -> list[list[int | float]] | None:
+    if not isinstance(value, (list, tuple)) or len(value) < 4:
+        return None
+    out: list[list[int | float]] = []
+    try:
+        for pt in list(value)[:4]:
+            if not isinstance(pt, (list, tuple)) or len(pt) < 2:
+                return None
+            out.append([_round_coord(float(pt[0]) * sx), _round_coord(float(pt[1]) * sy)])
+    except Exception:
+        return None
+    return out
+
+
+def _build_full_space_coordinate_prompt(
+    metadata: Mapping[str, Any],
+    *,
+    original_size_wh: tuple[int, int],
+    sent_size_wh: tuple[int, int],
+) -> tuple[str, dict[str, Any]]:
+    """Build a remote coordinate lock in the exact pixels of the uploaded image.
+
+    The API易 image-edit endpoint does not expose a mask field.  For textured
+    walls we intentionally send the full room instead of a crop, so the only
+    remote edit boundary is text.  The model sees the compressed upload, not the
+    original file, therefore all prompt coordinates must be scaled to that upload
+    size.
+    """
+    ow, oh = int(original_size_wh[0]), int(original_size_wh[1])
+    sw, sh = int(sent_size_wh[0]), int(sent_size_wh[1])
+    sx = float(sw) / max(1.0, float(ow))
+    sy = float(sh) / max(1.0, float(oh))
+    front_polygon = _scale_polygon_for_sent_image(
+        metadata.get("front_polygon_px") or metadata.get("polygon_px") or metadata.get("target_quad_original"),
+        sx=sx,
+        sy=sy,
+    )
+    mount_polygon = _scale_polygon_for_sent_image(
+        metadata.get("mount_polygon_px") or metadata.get("mount_quad_original"),
+        sx=sx,
+        sy=sy,
+    )
+    edit_polygon = mount_polygon or front_polygon
+    front_bbox = _scale_bbox_for_sent_image(metadata.get("front_bbox_px") or metadata.get("bbox_px"), sx=sx, sy=sy)
+    mount_bbox = _scale_bbox_for_sent_image(metadata.get("mount_bbox_px"), sx=sx, sy=sy)
+    edit_bbox = mount_bbox or front_bbox
+
+    matrix: dict[str, Any] = {
+        "coordinate_space": "pixels_in_the_exact_compressed_image_1_sent_to_api",
+        "image_1_sent_size_px": [sw, sh],
+        "source_original_size_px": [ow, oh],
+        "scale_from_original_to_sent": [sx, sy],
+        "front_polygon_px": front_polygon,
+        "front_bbox_px": front_bbox,
+        "edit_polygon_px": edit_polygon,
+        "edit_bbox_px": edit_bbox,
+    }
+    # Drop empty fields from the text payload but keep trace context explicit.
+    compact = {k: v for k, v in matrix.items() if v is not None}
+    matrix_json = json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
+    text = (
+        "\n\nFULL-SPACE REMOTE COORDINATE LOCK. 图1是完整房间图，不是局部裁剪。"
+        "以下坐标全部是你实际收到的压缩后图1像素坐标，不是原图坐标，也不是归一化坐标："
+        f"{matrix_json}。"
+        "只允许在 edit_polygon_px / edit_bbox_px 所限定的挂画对象、边侧、接触阴影和极窄融合边缘内做渲染；"
+        "该坐标范围以外的墙面纹理、肌理、光影分界、门窗、地面、天花、家具、结构线、镜头畸变和构图必须保持不变。"
+        "不要移动、缩放、拉伸、重画、复制或替换挂画。不要矫正透视畸变、镜头畸变、墙面线条、房间结构或相机视角；"
+        "保持当前照片中的自然透视和畸变。"
+    )
+    return text, {**matrix, "prompt_json": compact, "enabled": True}
+
+
 def _mask_bbox(mask: Image.Image, image_size: tuple[int, int]) -> tuple[int, int, int, int] | None:
     gray = mask.convert("L")
     if gray.size != image_size:
@@ -933,7 +1031,22 @@ class ApiyiGptImage2Client:
         core_mask_path = _coerce_optional_path(core_mask_source)
 
         normalized_mask_edit_mode = self.mask_edit_mode.replace("-", "_")
-        if request.mask and normalized_mask_edit_mode in {
+        full_space_coordinate_prompt_requested = bool(request.metadata.get("full_space_coordinate_prompt_requested"))
+        if request.mask and full_space_coordinate_prompt_requested:
+            target_for_api = image
+            output_scope = "full_space_coordinate_prompt"
+            mask_trace.update({
+                "mask_enforcement": "remote_full_space_coordinate_prompt_no_local_crop",
+                "mask_enforced_locally": False,
+                "local_crop_disabled": True,
+                "remote_coordinate_matrix_sent": True,
+                "pixel_coordinate_matrix_sent": True,
+                "remote_edit_region_control": "prompt_side_compressed_pixel_coordinate_matrix",
+                "full_space_image_sent": True,
+                "mask_path": str(request.mask),
+                "reason": request.metadata.get("full_space_render_reason") or "wall_texture_gate_recommended_full_space_render",
+            })
+        elif request.mask and normalized_mask_edit_mode in {
             "photometric_composite",
             "photometric_core_edge_composite",
             "structure_preserving_composite",
@@ -1020,15 +1133,37 @@ class ApiyiGptImage2Client:
                 "set APIYI_GPT_IMAGE_ALLOW_UNMASKED_FALLBACK=1 only for diagnostics"
             )
 
-        upload_paths = [
-            _maybe_compress_upload(target_for_api, upload_tmp, max_bytes=self.max_input_bytes, enabled=self.compress_inputs),
-            *[
-                _maybe_compress_upload(ref, upload_tmp, max_bytes=self.max_input_bytes, enabled=self.compress_inputs)
-                for ref in references
-            ],
+        target_upload_path = _maybe_compress_upload(target_for_api, upload_tmp, max_bytes=self.max_input_bytes, enabled=self.compress_inputs)
+        reference_upload_paths = [
+            _maybe_compress_upload(ref, upload_tmp, max_bytes=self.max_input_bytes, enabled=self.compress_inputs)
+            for ref in references
         ]
+        upload_paths = [target_upload_path, *reference_upload_paths]
 
-        prompt = self._build_prompt(request.prompt, reference_count=len(references), output_scope=output_scope)
+        coordinate_prompt = ""
+        coordinate_prompt_trace: dict[str, Any] = {"enabled": False}
+        if output_scope == "full_space_coordinate_prompt":
+            try:
+                coordinate_prompt, coordinate_prompt_trace = _build_full_space_coordinate_prompt(
+                    request.metadata,
+                    original_size_wh=_image_size_wh(target_for_api),
+                    sent_size_wh=_image_size_wh(target_upload_path),
+                )
+            except Exception as exc:
+                coordinate_prompt_trace = {"enabled": False, "error": str(exc)}
+                coordinate_prompt = (
+                    "\n\nFULL-SPACE REMOTE COORDINATE LOCK failed to build numeric coordinates; "
+                    "use the visible hard-pasted artwork as the only editable object and do not modify any other room pixels. "
+                    "不要矫正透视畸变、镜头畸变、墙面线条或相机视角。"
+                )
+            mask_trace["remote_coordinate_matrix"] = coordinate_prompt_trace
+
+        prompt = self._build_prompt(
+            request.prompt,
+            reference_count=len(references),
+            output_scope=output_scope,
+            coordinate_prompt=coordinate_prompt,
+        )
         data: dict[str, Any] = {
             "model": self.model,
             "prompt": prompt,
@@ -1153,15 +1288,17 @@ class ApiyiGptImage2Client:
             "mask_local_composite": output_scope in {"mask_local_composite", "mask_photometric_composite", "mask_wall_rgb_only_composite"},
             "mask_photometric_composite": output_scope == "mask_photometric_composite",
             "mask_wall_rgb_only_composite": output_scope == "mask_wall_rgb_only_composite",
+            "full_space_coordinate_prompt": output_scope == "full_space_coordinate_prompt",
             "mask_enforced_locally": output_scope in {"mask_local_composite", "mask_photometric_composite", "mask_wall_rgb_only_composite"},
             "mask_contract": (
-                "API易 gpt-image-2-vip image-edit endpoint has no multipart mask field and no pixel-coordinate matrix field; "
-                "the adapter enforces bounded repaint locally by cropping the mask bbox and compositing/QA outside the remote request. "
-                "In photometric mode, artwork core pixels are not hard-restored from hard-paste; "
+                "API易 gpt-image-2-vip image-edit endpoint has no multipart mask field. "
+                "For pure-color walls the adapter enforces bounded repaint locally by cropping the mask bbox and compositing/QA outside the remote request. "
+                "For textured candidate walls the adapter sends the full room image and uses a prompt-side pixel coordinate matrix in the exact compressed upload coordinate space. "
+                "In photometric crop mode, artwork core pixels are not hard-restored from hard-paste; "
                 "they receive only low-frequency exposure/color transfer from the generated crop, while direct generated pixels are limited to the edge/shadow region. "
                 "In wall_rgb_only mode, the GPT Image crop is preserved and only wall RGB outside the object mask is corrected."
             ),
-            "remote_coordinate_matrix_sent": False,
+            "remote_coordinate_matrix_sent": output_scope == "full_space_coordinate_prompt",
             "mask_adapter": mask_trace,
             "local_composite": composite_trace,
             "apiyi_images_edit_request": True,
@@ -1196,7 +1333,7 @@ class ApiyiGptImage2Client:
         raise RuntimeError(f"APIYI GPT Image request failed after {self.max_retries} attempts: {last_error}")
 
     @staticmethod
-    def _build_prompt(prompt: str, *, reference_count: int, output_scope: str) -> str:
+    def _build_prompt(prompt: str, *, reference_count: int, output_scope: str, coordinate_prompt: str = "") -> str:
         if output_scope in {"mask_local_composite", "mask_photometric_composite", "mask_wall_rgb_only_composite"}:
             if output_scope == "mask_photometric_composite":
                 prefix = (
@@ -1221,14 +1358,23 @@ class ApiyiGptImage2Client:
                     "保持图1内部挂画位置、挂画尺寸、透视、画芯内容、边框/画框外观、边框固有色和裁切稳定。"
                     "只允许最小化的光照一致性调整，不要改变画作和边框的固有颜色，不要改动挂画以外的区域。"
                     "不要新增、移动、缩放、复制、替换画作，不要改变画芯图案，不要改边框颜色、厚度、样式或开口。"
-                    "输出保持图1的构图比例，便于回贴到原图。"
+                    "不要矫正透视畸变、镜头畸变、墙面线条或相机视角。输出保持图1的构图比例，便于回贴到原图。"
                 )
+        elif output_scope == "full_space_coordinate_prompt":
+            prefix = (
+                "修改图1。图1是完整房间画面，不是局部裁剪；输出也必须保持完整房间构图和图1比例。"
+                "以图1中已经硬贴好的挂画为唯一权威目标，只做自然环境光、接触阴影、投影和边缘融合渲染。"
+                "不要重绘、替换、移动、压扁、缩放、拉伸、复制或重新设计挂画、画框、白衬/卡纸或画芯内容。"
+                "坐标矩阵限定范围之外的墙面肌理、纹理、光影分界、窗户、地面、天花、家具、结构线和房间内容都必须保持不变。"
+                "不要矫正透视畸变、镜头畸变、墙面线条、房间结构或相机视角；保留原照片的自然透视和畸变。"
+            )
         else:
             prefix = (
                 "修改图1。以图1作为唯一权威画布和最终构图。"
                 "保持房间结构、墙面、挂画位置、挂画尺寸、透视、边框/画框外观、边框固有色、画芯内容和画面裁切稳定。"
                 "只允许对挂画对象本身进行最小化的低频光影/明度调整，不要改动固有色，也不要改动挂画以外的区域。"
                 "不要新增、移动、缩放、复制、替换画作，不要改变边框样式或画芯图案，不要重绘非挂画区域。"
+                "不要矫正透视畸变、镜头畸变、墙面线条或相机视角。"
             )
         if reference_count:
             prefix += (
@@ -1236,7 +1382,9 @@ class ApiyiGptImage2Client:
                 "如果参考图中没有挂画或挂画位置为空，这是正常的 erase 后空间参考，不代表要删除、移动或替换图1中的挂画。"
                 "不得让参考图覆盖图1的构图、画作位置、边框形状或画芯内容。"
             )
-        return f"{prefix}\n\n原始渲染指令：{prompt}"
+        if "不要矫正透视畸变" not in prefix:
+            prefix += "不要矫正透视畸变、镜头畸变、墙面线条、房间结构或相机视角；保持原照片的自然透视和畸变。"
+        return f"{prefix}{coordinate_prompt}\n\n原始渲染指令：{prompt}"
 
 
 class ApiyiGptImage2VipRenderProvider:

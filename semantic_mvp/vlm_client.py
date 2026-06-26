@@ -172,6 +172,42 @@ def normalize_artwork_frame_result(raw: Dict[str, Any], *, source: str = "vlm") 
         confidence = 0.0
     confidence = max(0.0, min(1.0, confidence))
     frame_style = str(raw.get("frame_style") or ("visible_outer_frame" if has_frame else "none" if has_frame is False else "uncertain"))
+    surface_style_raw = str(raw.get("artwork_surface_style") or raw.get("surface_style") or raw.get("material_style") or "uncertain").strip().lower()
+    surface_aliases = {
+        "fine": "refined_paper_or_delicate",
+        "delicate": "refined_paper_or_delicate",
+        "refined": "refined_paper_or_delicate",
+        "paper": "refined_paper_or_delicate",
+        "paper_painting": "refined_paper_or_delicate",
+        "chinese_paper": "refined_paper_or_delicate",
+        "guohua": "refined_paper_or_delicate",
+        "国画": "refined_paper_or_delicate",
+        "rough": "rough_or_canvas",
+        "coarse": "rough_or_canvas",
+        "canvas": "rough_or_canvas",
+        "canvas_wrap": "rough_or_canvas",
+        "fabric": "rough_or_canvas",
+        "oil_painting": "rough_or_canvas",
+        "acrylic": "rough_or_canvas",
+        "impasto": "rough_or_canvas",
+        "scroll": "chinese_hanging_scroll",
+        "hanging_scroll": "chinese_hanging_scroll",
+        "chinese_scroll": "chinese_hanging_scroll",
+        "guohua_hanging_scroll": "chinese_hanging_scroll",
+        "vertical_scroll": "chinese_hanging_scroll",
+        "立轴": "chinese_hanging_scroll",
+        "国画立轴": "chinese_hanging_scroll",
+    }
+    artwork_surface_style = surface_aliases.get(surface_style_raw, surface_style_raw)
+    if artwork_surface_style not in {"refined_paper_or_delicate", "rough_or_canvas", "chinese_hanging_scroll", "uncertain"}:
+        artwork_surface_style = "uncertain"
+    policy_raw = str(raw.get("side_thickness_policy") or "").strip().lower()
+    if policy_raw in {"none", "no", "flat", "skip", "0"} or artwork_surface_style == "chinese_hanging_scroll":
+        side_thickness_policy = "none"
+    elif policy_raw in {"double", "thick", "2x", "two_x"} or artwork_surface_style == "rough_or_canvas":
+        side_thickness_policy = "double"
+    else:
+        side_thickness_policy = "normal"
     ratios_raw = raw.get("frame_width_ratio") if isinstance(raw.get("frame_width_ratio"), dict) else {}
     ratios = {}
     for edge in ("left", "right", "top", "bottom"):
@@ -193,6 +229,8 @@ def normalize_artwork_frame_result(raw: Dict[str, Any], *, source: str = "vlm") 
         "has_frame": has_frame,
         "confidence": float(confidence),
         "frame_style": frame_style,
+        "artwork_surface_style": artwork_surface_style,
+        "side_thickness_policy": side_thickness_policy,
         "frame_width_ratio": ratios,
         "dominant_edge_colors_rgb": colors,
         "should_precompose_frame_sides": should_precompose,

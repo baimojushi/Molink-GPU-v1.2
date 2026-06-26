@@ -217,10 +217,10 @@ def build_render_prompt(
     mount_policy = artwork_mount_policy if isinstance(artwork_mount_policy, Mapping) else (candidate.get("artwork_mount_policy") if isinstance(candidate.get("artwork_mount_policy"), Mapping) else {})
     if mount_policy.get("precompose_frame_sides"):
         frame_rule = (
-            "The artwork target already includes deterministic 3D frame side faces generated from the original artwork edge colors. "
-            "Treat the visible front border / frame / surround as identity-locked. "
-            "Do not add, redraw, restyle, recolor, thicken, shrink, replace, or reinterpret the frame; do not add mat board; do not create a black matte surround. "
-            "Do not change the front artwork, frame color, frame thickness, mounted geometry, or painting core size. "
+            "The artwork target already includes deterministic 3D frame side faces / artwork side faces generated from the original artwork edge colors. "
+            "Treat the visible front artwork, border/frame if present, and generated side faces as identity-locked. "
+            "Do not add, redraw, thicken, restyle, recolor, shrink, replace, or reinterpret the side faces or frame; do not add mat board; do not create a black matte surround. "
+            "Do not change the front artwork, side color, side thickness, mounted geometry, or painting core size. "
             "Only render subtle contact shadow, local light consistency, and edge blending around the mounted object."
         )
     elif frame_known:
@@ -273,6 +273,7 @@ def build_render_prompt(
         "Within the mounted object, any allowed change must be photometric-only, low-frequency, and achromatic with respect to intrinsic color. "
         "Do not edit non-artwork pixels, wall texture, windows, doors, wall corners, floor, ceiling, architectural lines, lens perspective, or camera. "
         "Do not remove or alter anything outside the artwork region. "
+        "Do not correct perspective distortion, lens distortion, wall lines, room structure, or camera viewpoint; preserve the original photo perspective exactly. "
         f"{frame_rule} "
         "FINAL SIZE LOCK AFTER FRAME RULE: keep the painting core pixel footprint exactly unchanged; do not expand the artwork or any frame-like surround into the editable wall area."
     )

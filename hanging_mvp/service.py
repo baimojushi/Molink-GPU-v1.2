@@ -574,21 +574,36 @@ def _compute_artwork_mount_policy_for_candidate(
     original_size_wh: tuple[int, int],
 ) -> dict:
     enabled = bool(rule_value(rules, ["artwork_mount", "precompose_frame_sides_when_detected"], True))
+    analysis = artwork_analysis or {}
+    surface_style = str(analysis.get("artwork_surface_style") or analysis.get("surface_style") or "uncertain").strip().lower()
+    side_thickness_policy = str(analysis.get("side_thickness_policy") or "normal").strip().lower()
+    if surface_style in {"chinese_hanging_scroll", "scroll", "hanging_scroll", "chinese_scroll", "guohua_hanging_scroll", "vertical_scroll", "立轴", "国画立轴"}:
+        side_thickness_policy = "none"
+    elif surface_style in {"rough_or_canvas", "rough", "coarse", "canvas", "canvas_wrap", "fabric", "oil_painting", "acrylic", "impasto"}:
+        side_thickness_policy = "double"
+    elif side_thickness_policy not in {"normal", "double", "none"}:
+        side_thickness_policy = "normal"
     base = {
         "mode": "flat_hardpaste",
         "precompose_frame_sides": False,
         "frame_source": artwork_has_frame_source,
         "artwork_has_frame": artwork_has_frame,
-        "artwork_analysis": artwork_analysis or {},
+        "artwork_analysis": analysis,
+        "artwork_surface_style": surface_style,
+        "side_thickness_policy": side_thickness_policy,
     }
-    if not enabled or artwork_has_frame is not True:
-        base["fallback_reason"] = "frame_not_confirmed_or_precompose_disabled"
+    if not enabled:
+        base["fallback_reason"] = "precompose_frame_sides_disabled"
+        return base
+    if side_thickness_policy == "none":
+        base["fallback_reason"] = "artwork_vlm_classified_as_chinese_hanging_scroll_no_side_faces"
         return base
 
     min_depth = float(rule_value(rules, ["artwork_mount", "min_frame_depth_m"], 0.012))
     max_depth = float(rule_value(rules, ["artwork_mount", "max_frame_depth_m"], 0.055))
     default_depth = float(rule_value(rules, ["artwork_mount", "default_frame_depth_m"], 0.025))
-    frame_depth_m = float(max(min_depth, min(max_depth, default_depth)))
+    side_depth_multiplier = 2.0 if side_thickness_policy == "double" else 1.0
+    frame_depth_m = float(max(min_depth, min(max_depth, default_depth * side_depth_multiplier)))
     max_faces = max(1, int(rule_value(rules, ["artwork_mount", "max_visible_side_faces"], 2)))
     min_area = float(rule_value(rules, ["artwork_mount", "min_side_face_area_px"], 3))
     min_width = float(rule_value(rules, ["artwork_mount", "min_side_face_width_px"], 1.5))
@@ -656,6 +671,8 @@ def _compute_artwork_mount_policy_for_candidate(
             "mode": "flat_hardpaste",
             "fallback_reason": "no_visible_side_face_after_projection",
             "frame_depth_m": frame_depth_m,
+            "side_depth_multiplier": float(side_depth_multiplier),
+            "side_thickness_policy": side_thickness_policy,
             "front_quad_original": _jsonable_quad(front_orig),
             "back_quad_original": _jsonable_quad(back_orig),
             "front_anchor_mode": "candidate_projection_visual_front_locked",
@@ -668,6 +685,9 @@ def _compute_artwork_mount_policy_for_candidate(
         "frame_source": artwork_has_frame_source,
         "artwork_has_frame": artwork_has_frame,
         "frame_depth_m": float(frame_depth_m),
+        "side_depth_multiplier": float(side_depth_multiplier),
+        "side_thickness_policy": side_thickness_policy,
+        "artwork_surface_style": surface_style,
         "front_quad_original": _jsonable_quad(front_orig),
         "back_quad_original": _jsonable_quad(back_orig),
         "front_anchor_mode": "candidate_projection_visual_front_locked",
@@ -677,7 +697,7 @@ def _compute_artwork_mount_policy_for_candidate(
         "side_shading_strength": float(side_shading_strength),
         "max_visible_side_faces": int(max_faces),
         "edge_color_source": "original_artwork_outer_edge_average_color",
-        "artwork_analysis": artwork_analysis or {},
+        "artwork_analysis": analysis,
     }
 
 
