@@ -491,6 +491,12 @@ def _adaptive_object_relight_delta_field(
     paper_med = float(under.get("paper_luma_median", under.get("p50", 0.0)) or 0.0)
     if under_score > 0:
         art_compensation = min(22.0, max(0.0, (178.0 - p95) * 0.22) + max(0.0, (170.0 - paper_med) * 0.14))
+
+    # When render darkens the artwork more than the environment, compensate
+    # to keep artwork brightness consistent with surroundings.
+    if render_object_delta < ambient_delta - 3.0:
+        darkening_gap = ambient_delta - render_object_delta
+        art_compensation = max(art_compensation, min(darkening_gap * 0.6, 20.0))
     max_brighten = min(
         float(max_brighten_cap),
         max(
@@ -1649,8 +1655,17 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                         "hardpaste_core_pixel_restore_allowed": False,
                     },
                 )
+                # Run QA first to decide whether photometric_lock is needed
+                primary_render_size_qa = _run_mask_anchored_qa(
+                    args,
+                    hard_paste=hard_paste_after_erase,
+                    render=render_result.image,
+                    art_mask=qa_art_mask,
+                )
+                qa_passed = primary_render_size_qa.get("qa_passed", False) if primary_render_size_qa else False
+
                 post_render_photometric_lock_trace: dict[str, Any] | None = None
-                if _env_truthy("MOLINK_FINAL_PHOTOMETRIC_LOCK", "1"):
+                if _env_truthy("MOLINK_FINAL_PHOTOMETRIC_LOCK", "1") and (not qa_passed or _env_truthy("MOLINK_FORCE_PHOTOMETRIC_LOCK", "0")):
                     final_postprocess_mode_env = (
                         os.getenv("MOLINK_FINAL_POSTPROCESS_MODE")
                         or os.getenv("MOLINK_FINAL_PHOTOMETRIC_LOCK_MODE")
@@ -1707,13 +1722,6 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                             "output_path": str(locked_path),
                         },
                     )
-
-                primary_render_size_qa = _run_mask_anchored_qa(
-                    args,
-                    hard_paste=hard_paste_after_erase,
-                    render=render_result.image,
-                    art_mask=qa_art_mask,
-                )
 
                 dual_ab_compare_trace: dict[str, Any] | None = None
                 if (

@@ -70,10 +70,10 @@ LABEL_ALIASES = {
     "wall_art": "existing_art",
     "art": "existing_art",
     "artwork": "existing_art",
-    "painting": "painting",
-    "poster": "poster",
-    "framed painting": "framed_art",
-    "framed artwork": "framed_art",
+    "painting": "existing_art",
+    "poster": "existing_art",
+    "framed painting": "existing_art",
+    "framed artwork": "existing_art",
     "frame": "framed_art",
     "picture": "existing_art",
     "green board": "green_board",
@@ -1087,9 +1087,13 @@ def _remap_objects_to_processed_space(objects, processed_w, processed_h, sx, sy)
             if poly_orig:
                 obj2["polygon_original"] = poly_orig
         if poly_orig:
-            obj2["polygon"] = scale_polygon(poly_orig, sx, sy)
+            # Keep polygon in original image coordinates — hanging pipeline
+            # works in original space and will remap if needed.
+            obj2["polygon"] = poly_orig
+            obj2["polygon_original"] = poly_orig
         elif len(bbox_proc) == 4:
             obj2["polygon"] = bbox_to_polygon(bbox_proc, processed_w, processed_h)
+            obj2["polygon_original"] = scale_polygon(obj2["polygon"], 1.0/sx, 1.0/sy) if sx > 0 and sy > 0 else obj2["polygon"]
 
         if obj2.get("source"):
             source = str(obj2.get("source"))
