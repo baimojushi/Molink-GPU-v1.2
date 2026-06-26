@@ -16,7 +16,8 @@ from PIL import Image, ImageOps
 from .metric3d_io import load_metric3d_zip
 from .masks import load_semantic_masks, masks_by_label, masks_by_role, semantic_label_matches
 from .geometry import (
-    backproject, estimate_g_hat_from_floor_normals, fit_plane_ransac, make_wall_basis,
+    backproject, estimate_g_hat_from_floor_normals, estimate_g_hat_from_global_floor_like_normals,
+    estimate_g_hat_from_horizontal_reference_normals, fit_plane_ransac, make_wall_basis,
     points_from_mask, project_points, project_quad, polygon_mask, ray_plane_depth_for_mask, scale_points_to_original
 )
 from .hardpaste import load_rgba, warp_artwork_mount_to_geometry, warp_artwork_to_quad
@@ -767,21 +768,119 @@ async def analyze_hanging_mvp(
     objects = load_semantic_masks(semantics, (h, w))
     walls = masks_by_role(objects, "wall") or masks_by_label(objects, {"wall"})
     floors = masks_by_label(objects, {"floor"})
+    roofs = masks_by_label(objects, {"roof"})
+    tables = masks_by_label(objects, {"table"})
     structural_forbidden_labels = set(rules.get("forbidden_classes", ["window", "door", "arch", "opening", "tv", "mirror", "lamp", "track_lighting"]))
     existing_content_labels = set(rules.get("existing_content_classes", ["existing_art", "painting", "poster", "framed_art", "wall_clutter", "wall_label", "hook", "nail", "small_shelf", "green_board", "notice_board"]))
     artwork_analysis = semantics.get("artwork_analysis") if isinstance(semantics.get("artwork_analysis"), dict) else {}
     resolved_artwork_has_frame, artwork_has_frame_source = _resolve_artwork_has_frame(rules, artwork_analysis)
 
+    def _union_reference_masks(items):
+        if not items:
+            return None
+        merged = np.zeros((h, w), np.uint8)
+        for item in items:
+            mask = item.get("mask")
+            if isinstance(mask, np.ndarray) and mask.shape[:2] == (h, w):
+                merged = cv2.bitwise_or(merged, mask.astype(np.uint8))
+        return merged if np.count_nonzero(merged) > 0 else None
+
+    # Preserve the existing height-anchor behavior (first semantic floor mask).
+    # A union of floor boxes is used only for gravity estimation; roof/table are
+    # gravity references only and never replace the floor height anchor.
     floor_mask = floors[0]["mask"] if floors else None
-    g_hat, g_conf, g_debug = estimate_g_hat_from_floor_normals(
-        normal,
-        floor_mask,
-        normal_y_max=float(rule_value(rules, ["camera", "floor_normal_filter", "normal_y_max"], -0.75)),
-        abs_z_max=float(rule_value(rules, ["camera", "floor_normal_filter", "abs_z_max"], 0.45)),
-        min_pixels=int(rule_value(rules, ["camera", "floor_normal_filter", "min_pixels"], 1000)),
-        angular_variance_soft_limit_rad=float(rule_value(rules, ["camera", "floor_normal_filter", "angular_variance_soft_limit_rad"], 0.08)),
-        full_confidence_pixels=int(rule_value(rules, ["camera", "floor_normal_filter", "full_confidence_pixels"], 5000)),
-    )
+    floor_gravity_mask = _union_reference_masks(floors)
+    normal_y_max = float(rule_value(rules, ["camera", "floor_normal_filter", "normal_y_max"], -0.75))
+    abs_z_max = float(rule_value(rules, ["camera", "floor_normal_filter", "abs_z_max"], 0.45))
+    min_g_pixels = int(rule_value(rules, ["camera", "floor_normal_filter", "min_pixels"], 1000))
+    angular_variance_soft_limit = float(rule_value(rules, ["camera", "floor_normal_filter", "angular_variance_soft_limit_rad"], 0.08))
+    full_confidence_pixels = int(rule_value(rules, ["camera", "floor_normal_filter", "full_confidence_pixels"], 5000))
+
+    gravity_attempts = []
+    g_hat = None
+    g_conf = 0.0
+    g_debug = {}
+    gravity_source = None
+    reference_sets = [
+        ("floor", floors, floor_gravity_mask),
+        ("roof", roofs, _union_reference_masks(roofs)),
+        ("table", tables, _union_reference_masks(tables)),
+    ]
+    for reference_label, reference_objects, reference_mask in reference_sets:
+        if not reference_objects:
+            gravity_attempts.append({
+                "reference_label": reference_label,
+                "status": "missing",
+                "object_count": 0,
+            })
+            continue
+        if reference_label == "floor":
+            candidate_g, candidate_conf, candidate_debug = estimate_g_hat_from_floor_normals(
+                normal,
+                reference_mask,
+                normal_y_max=normal_y_max,
+                abs_z_max=abs_z_max,
+                min_pixels=min_g_pixels,
+                angular_variance_soft_limit_rad=angular_variance_soft_limit,
+                full_confidence_pixels=full_confidence_pixels,
+            )
+        else:
+            candidate_g, candidate_conf, candidate_debug = estimate_g_hat_from_horizontal_reference_normals(
+                normal,
+                reference_mask,
+                reference_label=reference_label,
+                abs_y_min=abs(normal_y_max),
+                abs_z_max=abs_z_max,
+                min_pixels=min_g_pixels,
+                angular_variance_soft_limit_rad=angular_variance_soft_limit,
+                full_confidence_pixels=full_confidence_pixels,
+            )
+        attempt = {
+            "reference_label": reference_label,
+            "status": "accepted" if float(candidate_conf) > 0.0 else "unusable",
+            "object_count": len(reference_objects),
+            "object_ids": [obj.get("object_id") for obj in reference_objects],
+            "confidence": float(candidate_conf),
+            "debug": candidate_debug,
+        }
+        gravity_attempts.append(attempt)
+        if float(candidate_conf) > 0.0:
+            g_hat = candidate_g
+            g_conf = float(candidate_conf)
+            g_debug = dict(candidate_debug)
+            gravity_source = f"semantic_{reference_label}_mask"
+            break
+
+    if g_hat is None:
+        candidate_g, candidate_conf, candidate_debug = estimate_g_hat_from_global_floor_like_normals(
+            normal,
+            normal_y_max=normal_y_max,
+            abs_z_max=abs_z_max,
+            min_pixels=min_g_pixels,
+            angular_variance_soft_limit_rad=angular_variance_soft_limit,
+            full_confidence_pixels=full_confidence_pixels,
+        )
+        g_hat = candidate_g
+        g_conf = float(candidate_conf)
+        g_debug = dict(candidate_debug)
+        gravity_source = "metric3d_global_floor_like_normals"
+        gravity_attempts.append({
+            "reference_label": "global_metric3d_floor_like",
+            "status": "accepted" if float(candidate_conf) > 0.0 else "unusable_default_up",
+            "confidence": float(candidate_conf),
+            "debug": candidate_debug,
+        })
+
+    g_debug.update({
+        "source": gravity_source,
+        "reference_priority": ["floor", "roof", "table", "metric3d_global_floor_like_normals"],
+        "semantic_reference_counts": {
+            "floor": len(floors),
+            "roof": len(roofs),
+            "table": len(tables),
+        },
+        "attempts": gravity_attempts,
+    })
 
     auto_multiwall_debug = {
         "enabled": True,

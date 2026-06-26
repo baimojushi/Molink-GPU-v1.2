@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 LABEL_POLICY = {
-    "support": ["sofa", "floor", "table", "cabinet"],
+    "support": ["sofa", "floor", "roof", "table", "cabinet"],
     "structural_forbidden": ["window", "door", "tv", "mirror", "lamp", "track_lighting", "arch", "opening"],
     "existing_content": ["existing_art", "painting", "poster", "framed_art", "artwork", "wall_clutter", "wall_label", "hook", "nail", "small_shelf", "green_board", "notice_board"],
     "non_support": ["pedestal", "plinth", "display_stand"],
@@ -30,7 +30,7 @@ Return an object:
 Coordinate system: pixels of the image attached in this request.
 Prioritize high-recall boxes. Coarse bbox is acceptable for MVP.
 Required labels when visible:
-wall, floor, sofa, table, cabinet, window, door, tv, mirror, lamp,
+wall, floor, roof, sofa, table, cabinet, window, door, tv, mirror, lamp,
 track_lighting, arch, opening, existing_art, painting, poster, framed_art,
 artwork, wall_clutter, wall_label, hook, nail, small_shelf, green_board,
 notice_board, person, human, people, pedestal, plinth, display_stand,
@@ -70,6 +70,7 @@ Gallery-specific rules:
 - track lights and spotlights are track_lighting or lamp / forbidden.
 - pedestal/plinth/display stand are non_support, not table/cabinet support.
 - floor is support for height rule, not clutter.
+- roof/ceiling must be returned as label=roof with role=support when visible; it is a gravity-reference surface, not a wall.
 
 - Detect separate wall planes even if they visually touch at a corner.
 - Front wall and side wall must be different wall objects.
@@ -90,7 +91,7 @@ def user_prompt(scene_profile: str, width: int, height: int) -> str:
 Scene profile: {scene_profile}
 Image size: {width}x{height}
 
-Detect wall, support, forbidden, existing_content and foreground/non_support objects.
+Detect wall, floor, roof, table, support, forbidden, existing_content and foreground/non_support objects.
 Return JSON only.
 
 Also enforce:
@@ -99,6 +100,7 @@ Also enforce:
 - if visible, include opening/arch/window/door as separate forbidden objects
 - include existing wall artworks as existing_art / painting / poster / framed_art objects
 - include visible people as person foreground objects
+- include every visible roof/ceiling region as label=roof, role=support, with its own bbox
 - include wall labels, hooks, nails, small shelves, green boards and notice boards as existing_content objects
 
 Also enforce:
@@ -107,6 +109,7 @@ Also enforce:
 - if visible, include opening/arch as separate forbidden objects inside the scene
 - include existing wall artworks as existing_art / painting / poster / framed_art objects
 - include visible people as person foreground objects
+- include every visible roof/ceiling region as label=roof, role=support, with its own bbox
 - include wall labels/hooks/nails/small shelves/green boards/notice boards separately as existing_content objects
 """
 

@@ -117,6 +117,139 @@ def estimate_g_hat_from_floor_normals(
         "full_confidence_pixels": int(full_confidence_pixels),
     }
 
+
+def estimate_g_hat_from_horizontal_reference_normals(
+    normal_xyz: np.ndarray,
+    reference_mask: Optional[np.ndarray],
+    *,
+    reference_label: str,
+    abs_y_min: float = 0.75,
+    abs_z_max: float = 0.45,
+    min_pixels: int = 1000,
+    angular_variance_soft_limit_rad: float = 0.08,
+    full_confidence_pixels: int = 5000,
+) -> Tuple[np.ndarray, float, Dict[str, Any]]:
+    """Estimate camera-up from a horizontal semantic reference surface.
+
+    Roof/ceiling and table normals may be emitted with either sign by a normal
+    backend.  Select near-horizontal normals by magnitude, then orient every
+    sample toward camera-up (negative camera-y in the current Metric3D/OpenCV
+    convention) before averaging.
+    """
+    label = str(reference_label or "horizontal_reference").strip().lower()
+    default_up = np.array([0.0, -1.0, 0.0], np.float32)
+    if reference_mask is None or reference_mask.shape[:2] != normal_xyz.shape[:2]:
+        return default_up, 0.0, {"reason": f"no_{label}_mask", "reference_label": label}
+
+    n = normal_xyz[reference_mask > 0].reshape(-1, 3).astype(np.float32)
+    if len(n) == 0:
+        return default_up, 0.0, {"reason": f"empty_{label}_mask", "reference_label": label}
+
+    finite = np.isfinite(n).all(axis=1)
+    norm = np.linalg.norm(n, axis=1)
+    n = n[finite & (norm > EPS)]
+    if len(n) == 0:
+        return default_up, 0.0, {"reason": f"no_finite_{label}_normals", "reference_label": label}
+    n = n / np.maximum(np.linalg.norm(n, axis=1, keepdims=True), EPS)
+
+    sel = n[(np.abs(n[:, 1]) > float(abs_y_min)) & (np.abs(n[:, 2]) < float(abs_z_max))]
+    if len(sel) < int(min_pixels):
+        return default_up, 0.0, {
+            "reason": f"not_enough_{label}_normal_pixels",
+            "reference_label": label,
+            "count": int(len(sel)),
+            "min_pixels": int(min_pixels),
+            "abs_y_min": float(abs_y_min),
+            "abs_z_max": float(abs_z_max),
+        }
+
+    # Resolve the arbitrary normal sign before averaging.  This lets ceiling
+    # normals and table-top normals act as the same camera-up reference.
+    flip = (sel @ default_up) < 0.0
+    sel = sel.copy()
+    sel[flip] *= -1.0
+    mean = normalize(np.mean(sel, axis=0).astype(np.float32))
+    dots = np.clip(sel @ mean, -1.0, 1.0)
+    ang = np.arccos(dots)
+    var = float(np.var(ang))
+    soft_limit = float(angular_variance_soft_limit_rad)
+    conf = 1.0
+    if var > soft_limit:
+        conf *= max(0.0, soft_limit / var)
+    conf *= min(1.0, len(sel) / float(full_confidence_pixels))
+    return mean.astype(np.float32), float(conf), {
+        "reference_label": label,
+        "count": int(len(sel)),
+        "flipped_normal_count": int(np.count_nonzero(flip)),
+        "angular_variance_rad": var,
+        "abs_y_min": float(abs_y_min),
+        "abs_z_max": float(abs_z_max),
+        "min_pixels": int(min_pixels),
+        "angular_variance_soft_limit_rad": soft_limit,
+        "full_confidence_pixels": int(full_confidence_pixels),
+    }
+
+
+def estimate_g_hat_from_global_floor_like_normals(
+    normal_xyz: np.ndarray,
+    *,
+    normal_y_max: float = -0.75,
+    abs_z_max: float = 0.45,
+    min_pixels: int = 1000,
+    angular_variance_soft_limit_rad: float = 0.08,
+    full_confidence_pixels: int = 5000,
+    lower_image_start_ratio: float = 0.55,
+) -> Tuple[np.ndarray, float, Dict[str, Any]]:
+    """Global Metric3D floor-like fallback used when semantic references fail."""
+    default_up = np.array([0.0, -1.0, 0.0], np.float32)
+    if normal_xyz is None or normal_xyz.ndim != 3 or normal_xyz.shape[-1] != 3:
+        return default_up, 0.0, {"reason": "normal_missing_or_invalid"}
+
+    h, w, _ = normal_xyz.shape
+    finite = np.isfinite(normal_xyz).all(axis=-1)
+    floor_like = finite & (normal_xyz[..., 1] < float(normal_y_max)) & (np.abs(normal_xyz[..., 2]) < float(abs_z_max))
+    lower = np.zeros((h, w), dtype=bool)
+    lower[int(round(h * float(lower_image_start_ratio))):, :] = True
+
+    selected_region = "lower_image"
+    cand = floor_like & lower
+    if int(np.count_nonzero(cand)) < int(min_pixels):
+        selected_region = "full_image"
+        cand = floor_like
+    count = int(np.count_nonzero(cand))
+    if count < int(min_pixels):
+        return default_up, 0.0, {
+            "reason": "insufficient_global_floor_like_normals",
+            "count": count,
+            "min_pixels": int(min_pixels),
+            "normal_y_max": float(normal_y_max),
+            "abs_z_max": float(abs_z_max),
+            "lower_image_start_ratio": float(lower_image_start_ratio),
+        }
+
+    sel = normal_xyz[cand].reshape(-1, 3).astype(np.float32)
+    sel = sel / np.maximum(np.linalg.norm(sel, axis=1, keepdims=True), EPS)
+    mean = normalize(np.mean(sel, axis=0).astype(np.float32))
+    dots = np.clip(sel @ mean, -1.0, 1.0)
+    ang = np.arccos(dots)
+    var = float(np.var(ang))
+    soft_limit = float(angular_variance_soft_limit_rad)
+    conf = 1.0
+    if var > soft_limit:
+        conf *= max(0.0, soft_limit / var)
+    conf *= min(1.0, len(sel) / float(full_confidence_pixels))
+    return mean.astype(np.float32), float(conf), {
+        "count": int(len(sel)),
+        "selected_region": selected_region,
+        "angular_variance_rad": var,
+        "normal_y_max": float(normal_y_max),
+        "abs_z_max": float(abs_z_max),
+        "min_pixels": int(min_pixels),
+        "angular_variance_soft_limit_rad": soft_limit,
+        "full_confidence_pixels": int(full_confidence_pixels),
+        "lower_image_start_ratio": float(lower_image_start_ratio),
+    }
+
 def make_wall_basis(plane: WallPlane, points: np.ndarray, g_hat_cam: np.ndarray) -> WallBasis:
     n = np.array(plane.n, np.float32)
     # Force normal toward camera origin: plane point c; if n points away from camera, flip.

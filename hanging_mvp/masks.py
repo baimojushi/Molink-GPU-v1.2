@@ -9,6 +9,9 @@ import numpy as np
 _INSTANCE_SUFFIX_RE = re.compile(r"^(?P<base>.+?)[_\-\s]+\d{1,4}$")
 
 _LABEL_ALIASES = {
+    "ceiling": "roof",
+    "ceilings": "roof",
+    "roof ceiling": "roof",
     "wall art": "existing_art",
     "wall_art": "existing_art",
     "art": "existing_art",
@@ -31,7 +34,7 @@ _LABEL_ALIASES = {
 }
 
 _KNOWN_CANONICAL_LABELS = {
-    "wall", "floor", "sofa", "table", "cabinet", "window", "door", "tv", "mirror",
+    "wall", "floor", "roof", "sofa", "table", "cabinet", "window", "door", "tv", "mirror",
     "lamp", "track_lighting", "arch", "opening", "existing_art", "painting", "poster",
     "framed_art", "artwork", "green_board", "notice_board", "wall_clutter", "wall_label",
     "hook", "nail", "small_shelf", "pedestal", "plinth", "display_stand",

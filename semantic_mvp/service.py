@@ -27,6 +27,7 @@ app = FastAPI(title="semantic-mvp-bbox-api")
 ROLE_BY_LABEL = {
     "wall": "wall",
     "floor": "support",
+    "roof": "support",
     "sofa": "support",
     "table": "support",
     "cabinet": "support",
@@ -62,6 +63,9 @@ ROLE_BY_LABEL = {
 }
 
 LABEL_ALIASES = {
+    "ceiling": "roof",
+    "ceilings": "roof",
+    "roof ceiling": "roof",
     "wall art": "existing_art",
     "wall_art": "existing_art",
     "art": "existing_art",
