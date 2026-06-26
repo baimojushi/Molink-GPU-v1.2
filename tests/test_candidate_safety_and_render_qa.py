@@ -102,3 +102,51 @@ def test_supersampled_hardpaste_supports_tiny_artwork_without_empty_mask():
     assert pasted.shape == room.shape
     assert mask.shape == room.shape[:2]
     assert np.count_nonzero(mask) > 0
+
+
+def test_adaptive_relight_qa_accepts_explainable_luma_boost(tmp_path: Path):
+    target = np.zeros((80, 80, 3), np.uint8) + 150
+    target[25:55, 25:55] = [120, 120, 120]
+    mask = np.zeros((80, 80), np.uint8)
+    mask[25:55, 25:55] = 255
+    render = target.copy().astype(np.int16)
+    # Nearby environment brightens, and the originally dark neutral artwork is
+    # brightened in a low-frequency, chroma-preserving way.
+    render[18:62, 18:62] = np.clip(render[18:62, 18:62] + 16, 0, 255)
+    render[25:55, 25:55] = np.clip(target[25:55, 25:55].astype(np.int16) + 26, 0, 255)
+    target_path = _save(tmp_path / "target.png", target)
+    render_path = _save(tmp_path / "render.png", render.astype(np.uint8))
+    mask_path = _save(tmp_path / "mask.png", mask)
+    qa = evaluate_mask_anchored_render_qa(
+        hard_paste_path=target_path,
+        render_path=render_path,
+        art_region_mask_path=mask_path,
+        max_core_color_delta=10,
+        min_core_masked_ssim=0.96,
+    )
+    assert qa["passed"] is True
+    assert qa["adaptive_relight"]["core_luma_change_explained"] is True
+    assert qa["adaptive_relight"]["self_glow_risk"] is False
+
+
+def test_adaptive_relight_qa_rejects_unexplained_self_glow(tmp_path: Path):
+    target = np.zeros((80, 80, 3), np.uint8) + 150
+    target[25:55, 25:55] = [185, 185, 185]
+    mask = np.zeros((80, 80), np.uint8)
+    mask[25:55, 25:55] = 255
+    render = target.copy().astype(np.int16)
+    # Artwork brightens dramatically by itself; surrounding wall is unchanged.
+    render[25:55, 25:55] = np.clip(target[25:55, 25:55].astype(np.int16) + 45, 0, 255)
+    target_path = _save(tmp_path / "target.png", target)
+    render_path = _save(tmp_path / "render.png", render.astype(np.uint8))
+    mask_path = _save(tmp_path / "mask.png", mask)
+    qa = evaluate_mask_anchored_render_qa(
+        hard_paste_path=target_path,
+        render_path=render_path,
+        art_region_mask_path=mask_path,
+        max_core_color_delta=10,
+        min_core_masked_ssim=0.96,
+    )
+    assert qa["passed"] is False
+    assert "adaptive_self_glow_unexplained_brightening" in qa["failures"]
+    assert qa["adaptive_relight"]["self_glow_risk"] is True

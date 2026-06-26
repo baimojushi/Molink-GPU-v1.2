@@ -381,6 +381,171 @@ def _darken_only_luma_transfer_full(original_arr: np.ndarray, generated_arr: np.
     return np.clip(original_arr + dark_delta[..., None], 0, 255)
 
 
+def _clamp01(value: float) -> float:
+    return float(max(0.0, min(1.0, float(value))))
+
+
+def _safe_median(values: np.ndarray, default: float = 0.0) -> float:
+    arr = np.asarray(values, dtype=np.float32)
+    if arr.size == 0:
+        return float(default)
+    return float(np.median(arr))
+
+
+def _adaptive_underexposed_score_from_object(locked_arr: np.ndarray, object_mask: np.ndarray) -> dict[str, Any]:
+    weights = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
+    luma = np.tensordot(locked_arr.astype(np.float32), weights, axes=([-1], [0]))
+    mask = np.asarray(object_mask, dtype=bool)
+    vals = luma[mask]
+    if vals.size < 16:
+        return {
+            "score": 0.0,
+            "reason": "insufficient_object_pixels",
+            "p05": 0.0,
+            "p50": 0.0,
+            "p95": 0.0,
+            "dynamic_range": 0.0,
+            "paper_like_area_ratio": 0.0,
+            "paper_luma_median": 0.0,
+        }
+    p05 = float(np.percentile(vals, 5))
+    p50 = float(np.percentile(vals, 50))
+    p95 = float(np.percentile(vals, 95))
+    dynamic_range = max(0.0, p95 - p05)
+    rgb = locked_arr[mask].astype(np.float32)
+    sat_proxy = np.max(rgb, axis=1) - np.min(rgb, axis=1)
+    paper_like = (sat_proxy <= 18.0) & (vals.reshape(-1) >= max(45.0, p50 - 10.0))
+    paper_like_area_ratio = float(np.mean(paper_like)) if paper_like.size else 0.0
+    paper_luma_median = _safe_median(vals.reshape(-1)[paper_like], p50) if np.any(paper_like) else p50
+    score = 0.0
+    if p95 < 165.0:
+        score += 0.35 * (1.0 - max(0.0, p95 - 110.0) / 55.0)
+    if paper_like_area_ratio > 0.12 and paper_luma_median < 180.0:
+        score += 0.40 * min(1.0, (180.0 - paper_luma_median) / 70.0)
+    if dynamic_range < 75.0 and p95 < 190.0:
+        score += 0.25 * (1.0 - dynamic_range / 75.0)
+    return {
+        "score": _clamp01(score),
+        "p05": p05,
+        "p50": p50,
+        "p95": p95,
+        "dynamic_range": float(dynamic_range),
+        "paper_like_area_ratio": float(paper_like_area_ratio),
+        "paper_luma_median": float(paper_luma_median),
+    }
+
+
+def _adaptive_object_relight_delta_field(
+    *,
+    hard_rgb: Image.Image,
+    locked_rgb: Image.Image,
+    render_rgb: Image.Image,
+    object_alpha: np.ndarray,
+    edit_alpha: np.ndarray,
+    blur_px: int,
+    strength: float,
+    base_max_brighten: float,
+    underexposed_extra_brighten: float,
+    scene_light_extra_brighten: float,
+    render_extra_brighten: float,
+    max_brighten_cap: float,
+    max_darken: float,
+    self_glow_margin: float,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    weights = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
+    hard_arr = np.asarray(hard_rgb.convert("RGB"), dtype=np.float32)
+    locked_arr = np.asarray(locked_rgb.convert("RGB"), dtype=np.float32)
+    render_arr = np.asarray(render_rgb.convert("RGB"), dtype=np.float32)
+    hard_luma = np.tensordot(hard_arr, weights, axes=([-1], [0]))
+    locked_luma = np.tensordot(locked_arr, weights, axes=([-1], [0]))
+    render_luma = np.tensordot(render_arr, weights, axes=([-1], [0]))
+    object_mask = np.asarray(object_alpha, dtype=np.float32) > 0.20
+    if int(np.count_nonzero(object_mask)) < 16:
+        fallback = _low_frequency_luma_delta_image(locked_rgb, render_rgb, blur_px=blur_px, max_delta=max_darken, strength=strength)
+        return fallback, {"enabled": True, "mode": "adaptive", "fallback": "insufficient_object_pixels"}
+
+    ring_outer = _dilate_alpha(object_alpha, int(os.getenv("MOLINK_FINAL_OBJECT_RELIGHT_RING_OUTER_PX", "32"))) > 0.05
+    ring_inner = _dilate_alpha(object_alpha, int(os.getenv("MOLINK_FINAL_OBJECT_RELIGHT_RING_INNER_PX", "6"))) > 0.05
+    ring = ring_outer & (~ring_inner)
+    edit_mask = np.asarray(edit_alpha, dtype=np.float32) > 0.05
+    ring_in_edit = ring & edit_mask
+    if int(np.count_nonzero(ring_in_edit)) >= 32:
+        ring = ring_in_edit
+    elif int(np.count_nonzero(ring)) < 32:
+        ring = np.zeros_like(object_mask, dtype=bool)
+
+    render_minus_hard = render_luma - hard_luma
+    render_minus_locked = render_luma - locked_luma
+    ambient_delta = _safe_median(render_minus_hard[ring]) if np.any(ring) else 0.0
+    render_object_delta = _safe_median(render_minus_locked[object_mask])
+    under = _adaptive_underexposed_score_from_object(locked_arr, object_mask)
+    under_score = float(under.get("score", 0.0))
+    scene_light_score = _clamp01(max(ambient_delta, 0.0) / 14.0)
+    positive_core = max(render_object_delta, 0.0)
+    positive_env = max(ambient_delta, 0.0)
+    delta_consistency = 1.0 if positive_core <= 1.0 else _clamp01(1.0 - abs(positive_core - positive_env) / 32.0)
+    render_coherence_score = _clamp01(0.50 * scene_light_score + 0.35 * delta_consistency + 0.15 * under_score)
+
+    art_compensation = 0.0
+    p95 = float(under.get("p95", 0.0) or 0.0)
+    paper_med = float(under.get("paper_luma_median", under.get("p50", 0.0)) or 0.0)
+    if under_score > 0:
+        art_compensation = min(22.0, max(0.0, (178.0 - p95) * 0.22) + max(0.0, (170.0 - paper_med) * 0.14))
+    max_brighten = min(
+        float(max_brighten_cap),
+        max(
+            4.0,
+            float(base_max_brighten)
+            + float(underexposed_extra_brighten) * under_score
+            + float(scene_light_extra_brighten) * scene_light_score
+            + float(render_extra_brighten) * render_coherence_score,
+        ),
+    )
+    max_darken = max(0.0, float(max_darken))
+
+    raw_render_field = _low_frequency_luma_delta_image(locked_rgb, render_rgb, blur_px=blur_px, max_delta=max(max_darken, max_brighten_cap), strength=1.0)
+    w_env = 0.55 + 0.25 * scene_light_score
+    w_art = 0.35 * under_score
+    w_render = 0.45 * render_coherence_score
+    denom = max(1e-6, w_env + w_art + w_render)
+    env_delta = 0.65 * ambient_delta
+    target_delta = (w_env * env_delta + w_art * art_compensation + w_render * raw_render_field) / denom
+    target_delta = np.clip(target_delta, -max_darken, max_brighten) * float(strength)
+
+    projected_positive_delta = _safe_median(target_delta[..., 0][object_mask & (target_delta[..., 0] > 0)], 0.0)
+    allowed_brightening = 6.0 + 0.8 * positive_env + float(underexposed_extra_brighten) * under_score + float(render_extra_brighten) * render_coherence_score
+    unexplained_brightening = max(0.0, projected_positive_delta - allowed_brightening)
+    self_glow_guard_triggered = bool(unexplained_brightening > float(self_glow_margin))
+    if self_glow_guard_triggered:
+        # Soft fallback: keep environment and underexposure compensation, but
+        # remove most direct render-object brightening and clamp to budget.
+        w_render2 = 0.10 * render_coherence_score
+        denom2 = max(1e-6, w_env + w_art + w_render2)
+        target_delta = (w_env * env_delta + w_art * art_compensation + w_render2 * raw_render_field) / denom2
+        target_delta = np.clip(target_delta, -max_darken, min(max_brighten, allowed_brightening)) * float(strength)
+
+    return target_delta.astype(np.float32), {
+        "enabled": True,
+        "mode": "adaptive_explainable_relight",
+        "ambient_delta": float(ambient_delta),
+        "render_object_delta": float(render_object_delta),
+        "underexposed_score": float(under_score),
+        "underexposed_features": under,
+        "scene_light_score": float(scene_light_score),
+        "render_coherence_score": float(render_coherence_score),
+        "art_compensation_delta": float(art_compensation),
+        "max_brighten": float(max_brighten),
+        "max_darken": float(max_darken),
+        "weights": {"env": float(w_env), "art": float(w_art), "render": float(w_render)},
+        "allowed_brightening": float(allowed_brightening),
+        "projected_positive_delta": float(projected_positive_delta),
+        "unexplained_brightening": float(unexplained_brightening),
+        "self_glow_guard_triggered": bool(self_glow_guard_triggered),
+        "ring_sample_count": int(np.count_nonzero(ring)),
+        "policy": "blend ambient ring, underexposure compensation, and coherent render relight; clamp by explainable brightening budget",
+    }
+
+
 def _alpha_bbox(alpha: np.ndarray, *, threshold: float = 0.2) -> tuple[int, int, int, int] | None:
     arr = np.asarray(alpha)
     if arr.ndim == 3:
@@ -657,6 +822,14 @@ def _apply_final_photometric_lock(
     wall_rgb_correction_strength: float,
     object_edge_guard_px: int,
     postprocess_mode: str = "photometric_lock",
+    object_relight_mode: str = "adaptive",
+    object_base_max_brighten: float = 5.0,
+    object_underexposed_extra_brighten: float = 16.0,
+    object_scene_light_extra_brighten: float = 10.0,
+    object_render_extra_brighten: float = 8.0,
+    object_max_brighten_cap: float = 30.0,
+    object_max_darken: float = 34.0,
+    object_self_glow_margin: float = 8.0,
 ) -> dict[str, Any]:
     with Image.open(hard_paste) as hard_img, Image.open(render) as render_img, Image.open(object_mask) as object_mask_img:
         hard_rgb = hard_img.convert("RGB")
@@ -767,15 +940,38 @@ def _apply_final_photometric_lock(
         hard_arr = np.asarray(hard_rgb, dtype=np.float32)
         locked_arr = np.asarray(locked_rgb, dtype=np.float32)
         render_arr = np.asarray(render_rgb, dtype=np.float32)
-        delta = _low_frequency_luma_delta_image(
-            locked_rgb,
-            render_rgb,
-            blur_px=blur_px,
-            max_delta=max_delta,
-            strength=strength,
-        )
-        # Apply render-derived lightness to the locked texture, including the
-        # slightly grayer frame appearance, without changing artwork identity.
+        relight_mode = str(object_relight_mode or "adaptive").strip().lower().replace("-", "_")
+        if relight_mode == "adaptive":
+            delta, adaptive_relight_trace = _adaptive_object_relight_delta_field(
+                hard_rgb=hard_rgb,
+                locked_rgb=locked_rgb,
+                render_rgb=render_rgb,
+                object_alpha=locked_object_alpha,
+                edit_alpha=edit_alpha_2d,
+                blur_px=blur_px,
+                strength=strength,
+                base_max_brighten=object_base_max_brighten,
+                underexposed_extra_brighten=object_underexposed_extra_brighten,
+                scene_light_extra_brighten=object_scene_light_extra_brighten,
+                render_extra_brighten=object_render_extra_brighten,
+                max_brighten_cap=object_max_brighten_cap,
+                max_darken=object_max_darken,
+                self_glow_margin=object_self_glow_margin,
+            )
+        elif relight_mode in {"off", "none", "disabled"}:
+            delta = np.zeros_like(locked_arr[:, :, :1], dtype=np.float32)
+            adaptive_relight_trace = {"enabled": False, "mode": relight_mode, "reason": "disabled_by_mode"}
+        else:
+            delta = _low_frequency_luma_delta_image(
+                locked_rgb,
+                render_rgb,
+                blur_px=blur_px,
+                max_delta=max_delta,
+                strength=strength,
+            )
+            adaptive_relight_trace = {"enabled": False, "mode": relight_mode, "reason": "legacy_low_frequency_luma_delta"}
+        # Apply explainable low-frequency lightness to the locked texture,
+        # without changing artwork identity or chroma.
         adjusted_object = np.clip(locked_arr + delta, 0, 255)
         guard_shadow = _darken_only_luma_transfer_full(
             hard_arr,
@@ -821,6 +1017,7 @@ def _apply_final_photometric_lock(
         "intrinsic_color_policy": "artwork_object_achromatic_low_frequency_luma_delta_only",
         "anchor_relocation": relocation_trace,
         "wall_rgb_correction": wall_rgb_trace,
+        "adaptive_relight": adaptive_relight_trace,
         "blur_px": int(blur_px),
         "max_delta": float(max_delta),
         "strength": float(strength),
@@ -969,6 +1166,12 @@ def _run_mask_anchored_qa(args: argparse.Namespace, *, hard_paste: Path, render:
         shadow_min_darkening_delta=float(args.qa_shadow_min_darkening_delta),
         shadow_max_brighten_delta=float(args.qa_shadow_max_brighten_delta),
         shadow_max_chroma_delta=float(args.qa_shadow_max_chroma_delta),
+        adaptive_relight_qa_enabled=bool(args.qa_adaptive_relight),
+        adaptive_ambient_inner_px=int(args.qa_adaptive_ambient_inner_px),
+        adaptive_ambient_outer_px=int(args.qa_adaptive_ambient_outer_px),
+        adaptive_self_glow_margin=float(args.qa_adaptive_self_glow_margin),
+        adaptive_max_core_chroma_delta=float(args.qa_adaptive_max_core_chroma_delta),
+        adaptive_min_identity_hf_ssim=float(args.qa_adaptive_min_identity_hf_ssim),
     )
 
 
@@ -991,16 +1194,20 @@ def _qa_hard_block_reasons(qa: dict[str, Any] | None, args: argparse.Namespace) 
     if not isinstance(qa, dict) or qa.get("passed"):
         return []
     reasons: list[str] = []
+    adaptive = qa.get("adaptive_relight") if isinstance(qa.get("adaptive_relight"), dict) else {}
+    adaptive_explained = bool(adaptive.get("core_luma_change_explained"))
     try:
-        if float(qa.get("core_masked_ssim", 1.0)) < float(args.qa_hard_min_core_masked_ssim):
+        if float(qa.get("core_masked_ssim", 1.0)) < float(args.qa_hard_min_core_masked_ssim) and not adaptive_explained:
             reasons.append("hard_core_masked_ssim_too_low")
     except Exception:
         pass
     try:
-        if float(qa.get("core_color_delta", 0.0)) > float(args.qa_hard_max_core_color_delta):
+        if float(qa.get("core_color_delta", 0.0)) > float(args.qa_hard_max_core_color_delta) and not adaptive_explained:
             reasons.append("hard_core_color_delta_too_high")
     except Exception:
         pass
+    if bool(adaptive.get("self_glow_risk")):
+        reasons.append("hard_adaptive_self_glow_risk")
     try:
         if float(qa.get("forbidden_outer_guard_changed_ratio", 0.0)) > float(args.qa_hard_max_forbidden_outer_guard_changed_ratio):
             reasons.append("hard_forbidden_outer_guard_changed_ratio_too_high")
@@ -1014,7 +1221,9 @@ def _qa_quality_score(qa: dict[str, Any] | None) -> float:
         return -1.0
     if qa.get("passed"):
         return 100.0
-    score = 0.0
+    adaptive = qa.get("adaptive_relight") if isinstance(qa.get("adaptive_relight"), dict) else {}
+    adaptive_explained = bool(adaptive.get("core_luma_change_explained"))
+    score = 10.0 if adaptive_explained else 0.0
     try:
         score += float(qa.get("core_masked_ssim", 0.0)) * 40.0
     except Exception:
@@ -1062,6 +1271,8 @@ def _render_failure_diagnosis(
         diagnosis["forbidden_outer_guard_changed_ratio"] = float(qa.get("forbidden_outer_guard_changed_ratio"))
     except Exception:
         pass
+    if isinstance(qa.get("adaptive_relight"), dict):
+        diagnosis["adaptive_relight"] = qa.get("adaptive_relight")
 
     if (
         provider == "bfl"
@@ -1478,6 +1689,14 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                         wall_rgb_correction_strength=max(0.0, _env_float("MOLINK_FINAL_WALL_RGB_CORRECTION_STRENGTH", 1.0)),
                         object_edge_guard_px=max(0, int(os.getenv("MOLINK_FINAL_OBJECT_EDGE_GUARD_PX", "2"))),
                         postprocess_mode=final_postprocess_mode,
+                        object_relight_mode=os.getenv("MOLINK_FINAL_OBJECT_RELIGHT_MODE", "adaptive"),
+                        object_base_max_brighten=max(0.0, _env_float("MOLINK_FINAL_OBJECT_BASE_MAX_BRIGHTEN", 5.0)),
+                        object_underexposed_extra_brighten=max(0.0, _env_float("MOLINK_FINAL_OBJECT_UNDEREXPOSED_EXTRA_BRIGHTEN", 16.0)),
+                        object_scene_light_extra_brighten=max(0.0, _env_float("MOLINK_FINAL_OBJECT_SCENE_LIGHT_EXTRA_BRIGHTEN", 10.0)),
+                        object_render_extra_brighten=max(0.0, _env_float("MOLINK_FINAL_OBJECT_RENDER_EXTRA_BRIGHTEN", 8.0)),
+                        object_max_brighten_cap=max(0.0, _env_float("MOLINK_FINAL_OBJECT_MAX_BRIGHTEN_CAP", 30.0)),
+                        object_max_darken=max(0.0, _env_float("MOLINK_FINAL_OBJECT_MAX_DARKEN", 34.0)),
+                        object_self_glow_margin=max(0.0, _env_float("MOLINK_FINAL_SELF_GLOW_MARGIN", 8.0)),
                     )
                     render_result = ImageEditResult(
                         image=locked_path,
@@ -1832,7 +2051,14 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--qa-shadow-min-darkening-delta", type=float, default=float(os.getenv("MOLINK_FLUX_QA_SHADOW_MIN_DARKENING_DELTA", "4")))
     parser.add_argument("--qa-shadow-max-brighten-delta", type=float, default=float(os.getenv("MOLINK_FLUX_QA_SHADOW_MAX_BRIGHTEN_DELTA", "3")))
     parser.add_argument("--qa-shadow-max-chroma-delta", type=float, default=float(os.getenv("MOLINK_FLUX_QA_SHADOW_MAX_CHROMA_DELTA", "6")))
-    parser.add_argument("--qa-hard-min-core-masked-ssim", type=float, default=float(os.getenv("MOLINK_FLUX_QA_HARD_MIN_CORE_MASKED_SSIM", "0.45")), help="Hard delivery gate: below this artwork-core SSIM, a Flux render cannot enter final_hd even under qa_advisory.")
+    parser.add_argument("--qa-adaptive-relight", dest="qa_adaptive_relight", action="store_true", default=_env_truthy("MOLINK_FLUX_QA_ADAPTIVE_RELIGHT", "1"), help="Accept artwork-core brightness changes when underexposure, nearby ambient light, and render coherence explain them.")
+    parser.add_argument("--qa-no-adaptive-relight", dest="qa_adaptive_relight", action="store_false")
+    parser.add_argument("--qa-adaptive-ambient-inner-px", type=int, default=int(os.getenv("MOLINK_FLUX_QA_ADAPTIVE_AMBIENT_INNER_PX", "6")))
+    parser.add_argument("--qa-adaptive-ambient-outer-px", type=int, default=int(os.getenv("MOLINK_FLUX_QA_ADAPTIVE_AMBIENT_OUTER_PX", "32")))
+    parser.add_argument("--qa-adaptive-self-glow-margin", type=float, default=float(os.getenv("MOLINK_FLUX_QA_ADAPTIVE_SELF_GLOW_MARGIN", "8")))
+    parser.add_argument("--qa-adaptive-max-core-chroma-delta", type=float, default=float(os.getenv("MOLINK_FLUX_QA_ADAPTIVE_MAX_CORE_CHROMA_DELTA", "16")))
+    parser.add_argument("--qa-adaptive-min-identity-hf-ssim", type=float, default=float(os.getenv("MOLINK_FLUX_QA_ADAPTIVE_MIN_IDENTITY_HF_SSIM", "0.55")))
+    parser.add_argument("--qa-hard-min-core-masked-ssim", type=float, default=float(os.getenv("MOLINK_FLUX_QA_HARD_MIN_CORE_MASKED_SSIM", "0.45")), help="Hard delivery gate: below this artwork-core SSIM, a Flux render cannot enter final_hd even under qa_advisory unless adaptive relight proves the luma change is explainable.")
     parser.add_argument("--qa-hard-max-core-color-delta", type=float, default=float(os.getenv("MOLINK_FLUX_QA_HARD_MAX_CORE_COLOR_DELTA", "90")), help="Hard delivery gate: above this artwork-core color delta, a Flux render cannot enter final_hd even under qa_advisory.")
     parser.add_argument("--qa-hard-max-forbidden-outer-guard-changed-ratio", type=float, default=float(os.getenv("MOLINK_FLUX_QA_HARD_MAX_FORBIDDEN_OUTER_GUARD_CHANGED_RATIO", "0.85")), help="Hard delivery gate for severe outer-region change around the target artwork.")
     parser.add_argument("--finalize-policy", default=os.getenv("MOLINK_FLUX_FINALIZE_POLICY", "qa_advisory"), choices=["qa_gate_only", "qa_advisory", "lax", "always_final"], help="qa_advisory keeps QA metrics but allows non-empty Flux renders into final_hd.")

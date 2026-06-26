@@ -94,3 +94,31 @@ When a metric floor anchor is not trusted, the client result must expose a provi
 - candidate/plan：`light_components?: object`、`light_risk_band?: "none"|"caution"|"concern"`、`light_penalty_band?: "none"|"caution"|"concern"`、`light_semantics?: object`、`light_facts?: object`、`artwork_analysis?: object`
 
 `HANGING_CAUSAL_DECISION=0` 时不改变候选 `score`、排序、`risk_level`、交付门。`light_components` 只作为叙事与影子观测字段。`light_risk_band` 表示 R_light 风险，`light_penalty_band` 表示 P_backdrop/P_view 等降序惩罚，二者均不抬升 `_risk_level`。
+
+## 可选扩展：自适应画作明度融合与解释型 QA
+
+本扩展针对最终渲染里“画作像自发光”的问题，目标不是禁止提亮，而是让提亮有证据：原始作品暗拍、周围环境同步变亮、render 打光方向一致时允许提亮；只有无法解释的提亮才触发 self-glow 风险。
+
+新增环境变量：
+
+- `MOLINK_FINAL_OBJECT_RELIGHT_MODE=adaptive`：最终对象锁后使用自适应 relight。可选 `adaptive` / `legacy` / `off`，默认 `adaptive`。
+- `MOLINK_FINAL_OBJECT_BASE_MAX_BRIGHTEN=5`：基础可提亮预算。
+- `MOLINK_FINAL_OBJECT_UNDEREXPOSED_EXTRA_BRIGHTEN=16`：作品暗拍评分带来的额外提亮预算。
+- `MOLINK_FINAL_OBJECT_SCENE_LIGHT_EXTRA_BRIGHTEN=10`：周围环境同步变亮带来的额外提亮预算。
+- `MOLINK_FINAL_OBJECT_RENDER_EXTRA_BRIGHTEN=8`：render 打光可信时带来的额外提亮预算。
+- `MOLINK_FINAL_OBJECT_MAX_BRIGHTEN_CAP=30`：提亮预算硬上限。
+- `MOLINK_FINAL_OBJECT_MAX_DARKEN=34`：暗化硬上限。
+- `MOLINK_FINAL_SELF_GLOW_MARGIN=8`：超过可解释预算多少后触发 soft fallback。
+
+QA 从“必须像 hard-paste”升级为“明度变化解释得通”：
+
+- `MOLINK_FLUX_QA_ADAPTIVE_RELIGHT=1`：启用解释型 relight QA，默认 `1`。
+- `MOLINK_FLUX_QA_ADAPTIVE_AMBIENT_INNER_PX=6` / `MOLINK_FLUX_QA_ADAPTIVE_AMBIENT_OUTER_PX=32`：环境环采样范围。
+- `MOLINK_FLUX_QA_ADAPTIVE_SELF_GLOW_MARGIN=8`：不可解释提亮失败阈值。
+- `MOLINK_FLUX_QA_ADAPTIVE_MAX_CORE_CHROMA_DELTA=16`：允许作为明度变化解释的最大核心色度残差。
+- `MOLINK_FLUX_QA_ADAPTIVE_MIN_IDENTITY_HF_SSIM=0.55`：高频结构保真下限。低频明度变化可被解释，高频重绘仍失败。
+
+新增 trace 字段：
+
+- `selected_render_trace.post_render_photometric_lock.adaptive_relight`：记录 `underexposed_score`、`ambient_delta`、`render_coherence_score`、`max_brighten`、`allowed_brightening`、`self_glow_guard_triggered` 等。
+- `selected_render_size_qa.adaptive_relight`：记录 `core_luma_delta`、`ambient_luma_delta`、`underexposed_score`、`render_coherence_score`、`unexplained_brightening`、`self_glow_risk`、`core_luma_change_explained` 等。
