@@ -880,11 +880,51 @@ def _apply_final_photometric_lock(
                 strength=wall_rgb_correction_strength,
                 apply_to_wall_only=True,
             )
+            # Apply adaptive relight to object region even in wall_rgb_only mode
+            # Use anchor relocation to find actual rendered artwork position
+            relocation_trace = _estimate_anchor_similarity_full(
+                hard_rgb=hard_rgb,
+                render_rgb=corrected_render_rgb,
+                anchor_alpha=object_alpha,
+                max_shift_px=relocation_search_px,
+                min_score=relocation_min_score,
+                scale_min=relocation_scale_min,
+                scale_max=relocation_scale_max,
+                scale_steps=relocation_scale_steps,
+            )
+            # Warp object mask to match rendered artwork position
+            transform_matrix = relocation_trace.get("matrix_hard_to_render") or [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+            relocated_object_alpha = _warp_full_alpha_similarity(object_alpha, matrix=transform_matrix, size_wh=hard_rgb.size)
+
+            relight_delta, relight_trace = _adaptive_object_relight_delta_field(
+                hard_rgb=hard_rgb,
+                locked_rgb=corrected_render_rgb,
+                render_rgb=corrected_render_rgb,
+                object_alpha=relocated_object_alpha,
+                edit_alpha=edit_alpha_2d,
+                blur_px=blur_px, max_delta=max_delta, strength=strength,
+                base_max_brighten=object_base_max_brighten,
+                underexposed_extra_brighten=object_underexposed_extra_brighten,
+                scene_light_extra_brighten=object_scene_light_extra_brighten,
+                render_extra_brighten=object_render_extra_brighten,
+                max_brighten_cap=object_max_brighten_cap,
+                max_darken=object_max_darken,
+                self_glow_margin=object_self_glow_margin,
+            )
+            # Apply relight delta to the relocated object region
+            from scipy.ndimage import gaussian_filter
+            corrected_arr = np.asarray(corrected_render_rgb.convert("RGB"), dtype=np.float32)
+            luma_delta = relight_delta[..., 0]
+            luma_delta_blurred = gaussian_filter(luma_delta, sigma=max(1, blur_px // 2))
+            corrected_arr[:, :, 0] = np.clip(corrected_arr[:, :, 0] + luma_delta_blurred, 0, 255)
+            corrected_arr[:, :, 1] = np.clip(corrected_arr[:, :, 1] + luma_delta_blurred, 0, 255)
+            corrected_arr[:, :, 2] = np.clip(corrected_arr[:, :, 2] + luma_delta_blurred, 0, 255)
+            final_rgb = Image.fromarray(np.clip(corrected_arr, 0, 255).astype(np.uint8))
             out_path.parent.mkdir(parents=True, exist_ok=True)
-            corrected_render_rgb.save(out_path)
+            final_rgb.save(out_path)
             return {
                 "enabled": True,
-                "mode": "post_provider_wall_rgb_only_no_locked_texture",
+                "mode": "post_provider_wall_rgb_only_with_relight",
                 "postprocess_mode": normalized_postprocess_mode,
                 "input_render_path": str(render),
                 "hard_paste_path": str(hard_paste),
@@ -894,9 +934,11 @@ def _apply_final_photometric_lock(
                 "output_path": str(out_path),
                 "locked_texture_pasted": False,
                 "hardpaste_frame_core_repasted": False,
-                "anchor_relocation_applied": False,
+                "anchor_relocation_applied": True,
+                "anchor_relocation_trace": relocation_trace,
                 "render_pixels_preserved": True,
                 "wall_rgb_correction": wall_rgb_trace,
+                "adaptive_relight": relight_trace,
                 "feather_px": int(feather_px),
                 "shadow_feather_px": int(shadow_feather_px),
             }
@@ -1655,73 +1697,20 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                         "hardpaste_core_pixel_restore_allowed": False,
                     },
                 )
-                # Run QA first to decide whether photometric_lock is needed
+                # QA runs for diagnostics only — render output is always used directly
                 primary_render_size_qa = _run_mask_anchored_qa(
                     args,
                     hard_paste=hard_paste_after_erase,
                     render=render_result.image,
                     art_mask=qa_art_mask,
                 )
-                qa_passed = primary_render_size_qa.get("qa_passed", False) if primary_render_size_qa else False
 
-                post_render_photometric_lock_trace: dict[str, Any] | None = None
-                if _env_truthy("MOLINK_FINAL_PHOTOMETRIC_LOCK", "1") and (not qa_passed or _env_truthy("MOLINK_FORCE_PHOTOMETRIC_LOCK", "0")):
-                    final_postprocess_mode_env = (
-                        os.getenv("MOLINK_FINAL_POSTPROCESS_MODE")
-                        or os.getenv("MOLINK_FINAL_PHOTOMETRIC_LOCK_MODE")
-                        or "photometric_lock"
-                    ).strip().lower().replace("-", "_")
-                    if full_space_coordinate_prompt_requested:
-                        final_postprocess_mode = (
-                            os.getenv("MOLINK_FULLSPACE_FINAL_POSTPROCESS_MODE")
-                            or "photometric_lock_no_wall_rgb"
-                        ).strip().lower().replace("-", "_")
-                    else:
-                        final_postprocess_mode = final_postprocess_mode_env
-                    if final_postprocess_mode in {"wall_rgb_only", "wall_rgb_correction_only", "render_wall_rgb_only"}:
-                        locked_path = item_dir / ("03_flux2_render_wall_rgb_corrected.png" if sequence_mode.startswith("v7") else "02_flux2_render_wall_rgb_corrected.png")
-                    else:
-                        locked_path = item_dir / ("03_flux2_render_photometric_locked.png" if sequence_mode.startswith("v7") else "02_flux2_render_photometric_locked.png")
-                    post_render_photometric_lock_trace = _apply_final_photometric_lock(
-                        hard_paste=hard_paste_after_erase,
-                        render=render_result.image,
-                        object_mask=render_object_mask,
-                        edit_mask=render_mask,
-                        out_path=locked_path,
-                        blur_px=max(1, int(os.getenv("MOLINK_FINAL_PHOTOMETRIC_LOCK_BLUR_PX", "18"))),
-                        max_delta=max(0.0, _env_float("MOLINK_FINAL_PHOTOMETRIC_LOCK_MAX_DELTA", 32.0)),
-                        strength=max(0.0, _env_float("MOLINK_FINAL_PHOTOMETRIC_LOCK_STRENGTH", 1.0)),
-                        feather_px=max(0, int(os.getenv("MOLINK_FINAL_PHOTOMETRIC_LOCK_FEATHER_PX", "1"))),
-                        shadow_feather_px=max(0, int(os.getenv("MOLINK_FINAL_SHADOW_FEATHER_PX", "2"))),
-                        relocation_search_px=max(0, int(os.getenv("MOLINK_FINAL_RELOCATION_SEARCH_PX", "24"))),
-                        relocation_min_score=max(0.0, _env_float("MOLINK_FINAL_RELOCATION_MIN_SCORE", 0.38)),
-                        relocation_scale_min=_env_float("MOLINK_FINAL_RELOCATION_SCALE_MIN", 0.92),
-                        relocation_scale_max=_env_float("MOLINK_FINAL_RELOCATION_SCALE_MAX", 1.08),
-                        relocation_scale_steps=max(1, int(os.getenv("MOLINK_FINAL_RELOCATION_SCALE_STEPS", "17"))),
-                        wall_sample_exclusion_px=max(0, int(os.getenv("MOLINK_FINAL_WALL_SAMPLE_EXCLUSION_PX", "12"))),
-                        wall_sample_max_delta=max(0.0, _env_float("MOLINK_FINAL_WALL_SAMPLE_MAX_DELTA", 18.0)),
-                        wall_rgb_max_delta=max(0.0, _env_float("MOLINK_FINAL_WALL_RGB_MAX_DELTA", 24.0)),
-                        wall_rgb_correction_strength=max(0.0, _env_float("MOLINK_FINAL_WALL_RGB_CORRECTION_STRENGTH", 1.0)),
-                        object_edge_guard_px=max(0, int(os.getenv("MOLINK_FINAL_OBJECT_EDGE_GUARD_PX", "2"))),
-                        postprocess_mode=final_postprocess_mode,
-                        object_relight_mode=os.getenv("MOLINK_FINAL_OBJECT_RELIGHT_MODE", "adaptive"),
-                        object_base_max_brighten=max(0.0, _env_float("MOLINK_FINAL_OBJECT_BASE_MAX_BRIGHTEN", 5.0)),
-                        object_underexposed_extra_brighten=max(0.0, _env_float("MOLINK_FINAL_OBJECT_UNDEREXPOSED_EXTRA_BRIGHTEN", 16.0)),
-                        object_scene_light_extra_brighten=max(0.0, _env_float("MOLINK_FINAL_OBJECT_SCENE_LIGHT_EXTRA_BRIGHTEN", 10.0)),
-                        object_render_extra_brighten=max(0.0, _env_float("MOLINK_FINAL_OBJECT_RENDER_EXTRA_BRIGHTEN", 8.0)),
-                        object_max_brighten_cap=max(0.0, _env_float("MOLINK_FINAL_OBJECT_MAX_BRIGHTEN_CAP", 30.0)),
-                        object_max_darken=max(0.0, _env_float("MOLINK_FINAL_OBJECT_MAX_DARKEN", 34.0)),
-                        object_self_glow_margin=max(0.0, _env_float("MOLINK_FINAL_SELF_GLOW_MARGIN", 8.0)),
-                    )
-                    render_result = ImageEditResult(
-                        image=locked_path,
-                        trace={
-                            **dict(render_result.trace),
-                            "post_render_photometric_lock": post_render_photometric_lock_trace,
-                            "output_path_before_photometric_lock": dict(render_result.trace).get("output_path"),
-                            "output_path": str(locked_path),
-                        },
-                    )
+                # No photometric_lock — render output from GPT Image is used as-is
+                post_render_photometric_lock_trace = {
+                    "enabled": False,
+                    "reason": "disabled_use_render_output_directly",
+                    "qa_result": primary_render_size_qa,
+                }
 
                 dual_ab_compare_trace: dict[str, Any] | None = None
                 if (
