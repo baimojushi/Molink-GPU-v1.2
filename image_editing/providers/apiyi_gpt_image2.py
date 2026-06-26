@@ -7,7 +7,7 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 
 import requests
 import cv2
@@ -1163,6 +1163,7 @@ class ApiyiGptImage2Client:
             reference_count=len(references),
             output_scope=output_scope,
             coordinate_prompt=coordinate_prompt,
+            metadata=request.metadata,
         )
         data: dict[str, Any] = {
             "model": self.model,
@@ -1333,7 +1334,23 @@ class ApiyiGptImage2Client:
         raise RuntimeError(f"APIYI GPT Image request failed after {self.max_retries} attempts: {last_error}")
 
     @staticmethod
-    def _build_prompt(prompt: str, *, reference_count: int, output_scope: str, coordinate_prompt: str = "") -> str:
+    def _build_prompt(
+        prompt: str,
+        *,
+        reference_count: int,
+        output_scope: str,
+        coordinate_prompt: str = "",
+        metadata: Mapping[str, Any] | None = None,
+    ) -> str:
+        metadata = metadata or {}
+        mount_policy = metadata.get("artwork_mount_policy") if isinstance(metadata.get("artwork_mount_policy"), Mapping) else {}
+        visible_side_faces = mount_policy.get("visible_side_faces_original") if isinstance(mount_policy.get("visible_side_faces_original"), Sequence) else []
+        visible_side_edges = [
+            str(face.get("source_edge"))
+            for face in visible_side_faces
+            if isinstance(face, Mapping) and face.get("source_edge") in {"left", "right", "top", "bottom"}
+        ]
+        hidden_side_edges = [edge for edge in ("left", "right", "top", "bottom") if edge not in visible_side_edges]
         if output_scope in {"mask_local_composite", "mask_photometric_composite", "mask_wall_rgb_only_composite"}:
             if output_scope == "mask_photometric_composite":
                 prefix = (
@@ -1365,9 +1382,17 @@ class ApiyiGptImage2Client:
                 "修改图1。图1是完整房间画面，不是局部裁剪；输出也必须保持完整房间构图和图1比例。"
                 "以图1中已经硬贴好的挂画为唯一权威目标，只做自然环境光、接触阴影、投影和边缘融合渲染。"
                 "不要重绘、替换、移动、压扁、缩放、拉伸、复制或重新设计挂画、画框、白衬/卡纸或画芯内容。"
+                "挂画正面与已存在的可见厚度边都是锁定对象，只能保持，不可改造。"
                 "坐标矩阵限定范围之外的墙面肌理、纹理、光影分界、窗户、地面、天花、家具、结构线和房间内容都必须保持不变。"
                 "不要矫正透视畸变、镜头畸变、墙面线条、房间结构或相机视角；保留原照片的自然透视和畸变。"
             )
+            if mount_policy.get("precompose_frame_sides"):
+                vis = "、".join(visible_side_edges) if visible_side_edges else "现有可见侧面"
+                hid = "、".join(hidden_side_edges) if hidden_side_edges else "其余边"
+                prefix += (
+                    f"当前只有{vis}可以表现厚度；隐藏边例如{hid}不得新增任何黑边、白边、装饰框、卡纸框或四周一圈的包边。"
+                    "不要把画的正面四周都描出一圈边，不要把两面可见厚度误画成四边可见边框。"
+                )
         else:
             prefix = (
                 "修改图1。以图1作为唯一权威画布和最终构图。"

@@ -358,7 +358,18 @@ class Worker:
             flush=True,
         )
 
-        await ws.send(json.dumps(payload, ensure_ascii=False))
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                await ws.send(json.dumps(payload, ensure_ascii=False))
+                return
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(0.5 * (attempt + 1))
+                    continue
+                print(f"[progress] failed to send after {max_retries} attempts: {e}", flush=True)
+                print(f"[progress] progress message dropped, pipeline continues", flush=True)
+                return
 
     def _reset_causal_engine(self, job: dict | None = None) -> None:
         self._causal_engine = CausalEngine() if _causal_enabled() else None
@@ -399,7 +410,10 @@ class Worker:
         self._current_job_id = None
         self._causal_engine = None
         self._causal_base_delta = {}
-        await ws.send(json.dumps({"type": "worker_idle", "instance_id": INSTANCE_ID}))
+        try:
+            await ws.send(json.dumps({"type": "worker_idle", "instance_id": INSTANCE_ID}))
+        except Exception as e:
+            print(f"[on_job_complete] idle message failed: {e}, countdown starts anyway", flush=True)
         self.idle_since = time.time()
         self._shutdown_task = asyncio.create_task(self._idle_countdown(ws))
 

@@ -688,6 +688,7 @@ def _apply_final_photometric_lock(
         edit_alpha_2d = np.asarray(edit_mask_for_shadow, dtype=np.float32) / 255.0
 
         normalized_postprocess_mode = str(postprocess_mode or "photometric_lock").strip().lower().replace("-", "_")
+        no_wall_rgb_modes = {"photometric_lock_no_wall_rgb", "fullspace_object_lock", "full_space_object_lock"}
         if normalized_postprocess_mode in {"wall_rgb_only", "wall_rgb_correction_only", "render_wall_rgb_only"}:
             corrected_render_rgb, wall_rgb_trace = _correct_render_wall_rgb_full(
                 hard_rgb=hard_rgb,
@@ -736,16 +737,23 @@ def _apply_final_photometric_lock(
         locked_object_alpha = _warp_full_alpha_similarity(object_alpha, matrix=transform_matrix, size_wh=hard_rgb.size)
 
         wall_exclusion_alpha = np.maximum(object_alpha, locked_object_alpha)
-        render_rgb, wall_rgb_trace = _correct_render_wall_rgb_full(
-            hard_rgb=hard_rgb,
-            render_rgb=render_rgb,
-            edit_alpha=edit_alpha_2d,
-            object_alpha=wall_exclusion_alpha,
-            exclusion_px=wall_sample_exclusion_px,
-            sample_max_delta=wall_sample_max_delta,
-            max_rgb_delta=wall_rgb_max_delta,
-            strength=wall_rgb_correction_strength,
-        )
+        if normalized_postprocess_mode in no_wall_rgb_modes:
+            wall_rgb_trace = {
+                "applied": False,
+                "reason": "disabled_for_full_space_provider_render",
+                "apply_scope": "none",
+            }
+        else:
+            render_rgb, wall_rgb_trace = _correct_render_wall_rgb_full(
+                hard_rgb=hard_rgb,
+                render_rgb=render_rgb,
+                edit_alpha=edit_alpha_2d,
+                object_alpha=wall_exclusion_alpha,
+                exclusion_px=wall_sample_exclusion_px,
+                sample_max_delta=wall_sample_max_delta,
+                max_rgb_delta=wall_rgb_max_delta,
+                strength=wall_rgb_correction_strength,
+            )
 
         # Preserve provider-rendered contact shadow / projection outside the
         # locked artwork object, while pasting a high-quality resampled locked
@@ -787,7 +795,11 @@ def _apply_final_photometric_lock(
         Image.fromarray(np.clip(out, 0, 255).astype(np.uint8), mode="RGB").save(out_path)
     return {
         "enabled": True,
-        "mode": "post_provider_shadow_preserving_photometric_object_lock_relocated_wall_corrected",
+        "mode": (
+            "post_provider_shadow_preserving_photometric_object_lock_relocated_no_wall_rgb"
+            if normalized_postprocess_mode in no_wall_rgb_modes
+            else "post_provider_shadow_preserving_photometric_object_lock_relocated_wall_corrected"
+        ),
         "postprocess_mode": str(postprocess_mode or "photometric_lock").strip().lower().replace("-", "_"),
         "input_render_path": str(render),
         "hard_paste_path": str(hard_paste),
@@ -797,7 +809,11 @@ def _apply_final_photometric_lock(
         "output_path": str(out_path),
         "outside_object_pixels_preserved_from_hardpaste": False,
         "rendered_shadow_preserved_outside_object": True,
-        "generated_pixels_pasted": "outside_similarity_locked_object_within_edit_mask_after_wall_rgb_correction",
+        "generated_pixels_pasted": (
+            "outside_similarity_locked_object_within_edit_mask_no_wall_rgb_correction"
+            if normalized_postprocess_mode in no_wall_rgb_modes
+            else "outside_similarity_locked_object_within_edit_mask_after_wall_rgb_correction"
+        ),
         "locked_texture_transform": "hardpaste_texture_warped_to_provider_translation_and_scale",
         "locked_texture_resampling": "cv2.INTER_LANCZOS4_rgb_and_linear_alpha",
         "object_edge_guard_px": int(object_edge_guard_px),
@@ -1329,7 +1345,27 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                     band_px=max(8, int(os.getenv("MOLINK_RENDER_LIGHT_HINT_BAND_PX", "64"))),
                     exclude_px=max(0, int(os.getenv("MOLINK_RENDER_LIGHT_HINT_EXCLUDE_PX", "8"))),
                 ) if _env_truthy("MOLINK_RENDER_LIGHT_HINT_PROMPT", "1") else ("", {"enabled": False, "reason": "disabled_by_env"})
-                prompt_for_render = f"{prompt}\n\n{render_light_hint}" if render_light_hint else prompt
+                prompt_parts = [prompt]
+                if render_light_hint:
+                    prompt_parts.append(render_light_hint)
+                mount_policy_render = item.get("artwork_mount_policy") if isinstance(item.get("artwork_mount_policy"), dict) else {}
+                visible_side_faces = mount_policy_render.get("visible_side_faces_original") if isinstance(mount_policy_render.get("visible_side_faces_original"), list) else []
+                visible_side_edges = [
+                    str(face.get("source_edge"))
+                    for face in visible_side_faces
+                    if isinstance(face, dict) and face.get("source_edge") in {"left", "right", "top", "bottom"}
+                ]
+                hidden_side_edges = [edge for edge in ("left", "right", "top", "bottom") if edge not in visible_side_edges]
+                if mount_policy_render.get("precompose_frame_sides"):
+                    vis = ", ".join(visible_side_edges) if visible_side_edges else "the already visible side faces"
+                    hid = ", ".join(hidden_side_edges) if hidden_side_edges else "the remaining perimeter"
+                    prompt_parts.append(
+                        "FRAME-SIDE LOCK: the hard-paste target already contains the correct visible thickness faces. "
+                        f"Only these side faces may be visible: {vis}. "
+                        f"Do not invent frame thickness, a matte surround, or a perimeter border on hidden edges such as {hid}. "
+                        "Do not draw a thin border around all four sides of the front artwork."
+                    )
+                prompt_for_render = "\n\n".join(part for part in prompt_parts if part)
 
                 full_space_texture_render, wall_texture_gate_trace = _render_full_space_texture_gate(
                     image_path=hard_paste_after_erase,
@@ -1385,6 +1421,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                         "bbox_px": render_front_bbox_px,
                         "mount_bbox_px": render_mount_bbox_px,
                         "target_quad_original": quad,
+                        "artwork_mount_policy": item.get("artwork_mount_policy") if isinstance(item.get("artwork_mount_policy"), dict) else None,
                         "art_region_mask_usage": "front_region_mask_for_core_qa; selected_render_mask_sent_to_provider",
                         "render_mask_path": str(render_mask),
                         "render_mask_source": render_mask_source,
@@ -1403,11 +1440,18 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                 )
                 post_render_photometric_lock_trace: dict[str, Any] | None = None
                 if _env_truthy("MOLINK_FINAL_PHOTOMETRIC_LOCK", "1"):
-                    final_postprocess_mode = (
+                    final_postprocess_mode_env = (
                         os.getenv("MOLINK_FINAL_POSTPROCESS_MODE")
                         or os.getenv("MOLINK_FINAL_PHOTOMETRIC_LOCK_MODE")
                         or "photometric_lock"
                     ).strip().lower().replace("-", "_")
+                    if full_space_coordinate_prompt_requested:
+                        final_postprocess_mode = (
+                            os.getenv("MOLINK_FULLSPACE_FINAL_POSTPROCESS_MODE")
+                            or "photometric_lock_no_wall_rgb"
+                        ).strip().lower().replace("-", "_")
+                    else:
+                        final_postprocess_mode = final_postprocess_mode_env
                     if final_postprocess_mode in {"wall_rgb_only", "wall_rgb_correction_only", "render_wall_rgb_only"}:
                         locked_path = item_dir / ("03_flux2_render_wall_rgb_corrected.png" if sequence_mode.startswith("v7") else "02_flux2_render_wall_rgb_corrected.png")
                     else:

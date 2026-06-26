@@ -178,3 +178,29 @@ def test_mount_policy_skips_sides_for_chinese_hanging_scroll():
     )
     assert policy["precompose_frame_sides"] is False
     assert policy["fallback_reason"] == "artwork_vlm_classified_as_chinese_hanging_scroll_no_side_faces"
+
+
+def test_mount_aware_prompt_explicitly_locks_visible_side_edges_only():
+    prompt = build_render_prompt(
+        {
+            "candidate_id": "cand_mount_edges",
+            "wall_id": "wall_front",
+            "projection": {"projected_quad_px_original": [[10, 10], [50, 10], [50, 40], [10, 40]]},
+            "artwork_mount_policy": {
+                "precompose_frame_sides": True,
+                "visible_side_faces_original": [
+                    {"source_edge": "left", "quad": [[10, 10], [10, 40], [8, 42], [8, 12]]},
+                    {"source_edge": "bottom", "quad": [[10, 40], [50, 40], [52, 42], [8, 42]]},
+                ],
+            },
+        },
+        artwork_mount_policy={
+            "precompose_frame_sides": True,
+            "visible_side_faces_original": [
+                {"source_edge": "left", "quad": [[10, 10], [10, 40], [8, 42], [8, 12]]},
+                {"source_edge": "bottom", "quad": [[10, 40], [50, 40], [52, 42], [8, 42]]},
+            ],
+        },
+    )
+    assert "Only these side faces are visible and allowed to remain visible: left, bottom." in prompt
+    assert "Do not invent a perimeter border or thickness strip on hidden edges such as right, top." in prompt

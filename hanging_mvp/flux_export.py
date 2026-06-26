@@ -215,11 +215,23 @@ def build_render_prompt(
     region_text = "; ".join(region_parts) if region_parts else "the visible pasted artwork region in the target image"
 
     mount_policy = artwork_mount_policy if isinstance(artwork_mount_policy, Mapping) else (candidate.get("artwork_mount_policy") if isinstance(candidate.get("artwork_mount_policy"), Mapping) else {})
+    visible_side_faces = mount_policy.get("visible_side_faces_original") if isinstance(mount_policy.get("visible_side_faces_original"), Sequence) else []
+    visible_side_edges = [
+        str(face.get("source_edge"))
+        for face in visible_side_faces
+        if isinstance(face, Mapping) and face.get("source_edge")
+    ]
+    visible_side_edges = [edge for edge in visible_side_edges if edge in {"left", "right", "top", "bottom"}]
+    visible_side_text = ", ".join(visible_side_edges) if visible_side_edges else "the already visible side faces"
+    hidden_side_edges = [edge for edge in ("left", "right", "top", "bottom") if edge not in visible_side_edges]
+    hidden_side_text = ", ".join(hidden_side_edges) if hidden_side_edges else "the remaining perimeter"
     if mount_policy.get("precompose_frame_sides"):
         frame_rule = (
             "The artwork target already includes deterministic 3D frame side faces / artwork side faces generated from the original artwork edge colors. "
             "Treat the visible front artwork, border/frame if present, and generated side faces as identity-locked. "
-            "Do not add, redraw, thicken, restyle, recolor, shrink, replace, or reinterpret the side faces or frame; do not add mat board; do not create a black matte surround. "
+            f"Only these side faces are visible and allowed to remain visible: {visible_side_text}. "
+            f"Do not invent a perimeter border or thickness strip on hidden edges such as {hidden_side_text}. "
+            "Do not add, redraw, thicken, restyle, recolor, shrink, replace, or reinterpret the side faces or frame; do not add mat board; do not create a black matte surround; do not add a thin border around all four edges. "
             "Do not change the front artwork, side color, side thickness, mounted geometry, or painting core size. "
             "Only render subtle contact shadow, local light consistency, and edge blending around the mounted object."
         )

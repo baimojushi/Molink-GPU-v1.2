@@ -85,6 +85,7 @@ When a metric floor anchor is not trusted, the client result must expose a provi
 - `HANGING_CAUSAL_DECISION=1`：把 `light_components.delta` 回灌到候选 `score`，参与既有排序；同时追加 `light_caution` / `light_concern` / `light_deprioritized` 等光线标签到软风险与原因标签。默认 `0`。
 - `MOLINK_CAUSAL_VLM_FIELDS=1`：semantic 单次 VLM 调用额外输出顶层 `light` 对象。默认 `0`。
 - `MOLINK_CAUSAL_LIGHT_IN_NARRATION=1`：worker bundle 的 `facts.light_analysis` 写入光线分量明细，供业务端 LLM 正文解释排序原因。默认 `0`。
+- `MOLINK_FULLSPACE_FINAL_POSTPROCESS_MODE=photometric_lock_no_wall_rgb`：当 textured-wall 触发"整图送模型 + 远端坐标矩阵"时，默认改用对象锁 + 阴影保留，但不做墙面 RGB 校正。可选值：`photometric_lock_no_wall_rgb` / `fullspace_object_lock` / `full_space_object_lock`；若显式改回 `wall_rgb_only` 会重新启用墙面 RGB 校正。
 
 新增字段：
 
