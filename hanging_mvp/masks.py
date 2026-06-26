@@ -100,7 +100,7 @@ def load_semantic_masks(semantics: Dict[str, Any], size_hw: Tuple[int, int]) -> 
         poly = obj.get("polygon") or obj.get("points") or []
         mask = mask_from_polygon(size_hw, poly)
         raw_label = obj.get("label", "unknown")
-        out[oid] = {
+        record = {
             "object_id": oid,
             "label": canonical_semantic_label(raw_label),
             "raw_label": raw_label,
@@ -109,6 +109,11 @@ def load_semantic_masks(semantics: Dict[str, Any], size_hw: Tuple[int, int]) -> 
             "mask": mask,
             "polygon": poly,
         }
+        for extra_key in ("surface_active_light", "surface_active_light_scope",
+                          "landscape_competition_score", "landscape_competition_scope"):
+            if obj.get(extra_key) is not None:
+                record[extra_key] = obj.get(extra_key)
+        out[oid] = record
     return out
 
 def union_masks(items: Iterable[Dict[str, Any]]) -> np.ndarray:

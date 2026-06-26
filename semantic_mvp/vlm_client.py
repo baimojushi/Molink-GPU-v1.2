@@ -222,6 +222,13 @@ def normalize_artwork_frame_result(raw: Dict[str, Any], *, source: str = "vlm") 
         and confidence >= float(os.getenv("ARTWORK_FRAME_MIN_CONFIDENCE", "0.72"))
         and frame_style in {"visible_outer_frame", "canvas_wrap", "frame", "framed"}
     )
+    mood_raw = str(raw.get("mood_register") or "").strip().lower()
+    mood_register = mood_raw if mood_raw in {"calm", "contemplative", "dynamic", "melancholic", "joyful"} else None
+    try:
+        visual_complexity = raw.get("visual_complexity")
+        visual_complexity = None if visual_complexity is None or visual_complexity == "" else max(0.0, min(1.0, float(visual_complexity)))
+    except Exception:
+        visual_complexity = None
     return {
         "enabled": True,
         "source": source,
@@ -234,6 +241,8 @@ def normalize_artwork_frame_result(raw: Dict[str, Any], *, source: str = "vlm") 
         "frame_width_ratio": ratios,
         "dominant_edge_colors_rgb": colors,
         "should_precompose_frame_sides": should_precompose,
+        "mood_register": mood_register,
+        "visual_complexity": visual_complexity,
         "reason": str(raw.get("reason") or ""),
     }
 
@@ -269,6 +278,8 @@ def parse_artwork_frame_with_vlm(image_bytes: bytes, mode: str, width: int, heig
             "frame_width_ratio": {"left": 0.0, "right": 0.0, "top": 0.0, "bottom": 0.0},
             "dominant_edge_colors_rgb": {"left": [0, 0, 0], "right": [0, 0, 0], "top": [0, 0, 0], "bottom": [0, 0, 0]},
             "should_precompose_frame_sides": False,
+            "mood_register": None,
+            "visual_complexity": None,
             "reason": "mock mode does not inspect artwork frame unless ARTWORK_FRAME_MOCK_HAS_FRAME is set",
         }
     if mode_norm == "openai_compatible" or (mode_norm == "auto" and os.getenv("VLM_PROVIDER", "").strip() == "openai_compatible"):
@@ -288,6 +299,8 @@ def parse_artwork_frame_with_vlm(image_bytes: bytes, mode: str, width: int, heig
         "frame_width_ratio": {"left": 0.0, "right": 0.0, "top": 0.0, "bottom": 0.0},
         "dominant_edge_colors_rgb": {"left": [0, 0, 0], "right": [0, 0, 0], "top": [0, 0, 0], "bottom": [0, 0, 0]},
         "should_precompose_frame_sides": False,
+        "mood_register": None,
+        "visual_complexity": None,
         "reason": "no artwork VLM provider configured",
     }
 

@@ -96,6 +96,82 @@ EXISTING_CONTENT_LABELS = {
 FOREGROUND_LABELS = {"person", "human", "people", "foreground_object", "plant", "chair"}
 
 
+def _truthy_env(name: str, default: str = "0") -> bool:
+    value = os.getenv(name, default)
+    return str(value).strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def _causal_light_fields_enabled() -> bool:
+    return _truthy_env("MOLINK_CAUSAL_ENABLED", "0") and _truthy_env("MOLINK_CAUSAL_VLM_FIELDS", "0")
+
+
+def _coerce_optional_float(value: Any, *, lo: float = 0.0, hi: float = 1.0) -> float | None:
+    try:
+        if value is None or value == "":
+            return None
+        return max(lo, min(hi, float(value)))
+    except Exception:
+        return None
+
+
+def _normalize_light_payload(raw: Any) -> dict[str, Any] | None:
+    if not _causal_light_fields_enabled() or not isinstance(raw, dict):
+        return None
+
+    def pick(name: str, allowed: set[str]) -> str | None:
+        value = str(raw.get(name) or "").strip().lower()
+        return value if value in allowed else None
+
+    out = {
+        "theta": pick("theta", {"same", "opposite", "perpendicular", "none"}),
+        "exterior_brightness_class": pick("exterior_brightness_class", {"bright_direct", "overcast", "artificial"}),
+        "ambient_light_mode": pick("ambient_light_mode", {"gallery_ambient", "soft_diffuse", "direct_dramatic", "flat_artificial", "mixed"}),
+        "shadow_presence": pick("shadow_presence", {"none", "subtle", "moderate", "dramatic"}),
+        "temporal_light_quality": pick("temporal_light_quality", {"static", "dynamic"}),
+        "ceiling_height": pick("ceiling_height", {"low", "standard", "high", "dramatic"}),
+        "landscape_competition_score": _coerce_optional_float(raw.get("landscape_competition_score")),
+    }
+    if out.get("landscape_competition_score") is not None:
+        out["landscape_competition_scope"] = "scene"
+    if isinstance(raw.get("surface_active_light"), bool):
+        out["surface_active_light"] = raw.get("surface_active_light")
+        out["surface_active_light_scope"] = "scene"
+    else:
+        text = str(raw.get("surface_active_light") or "").strip().lower()
+        out["surface_active_light"] = True if text in {"true", "1", "yes"} else False if text in {"false", "0", "no"} else None
+        if out["surface_active_light"] is not None:
+            out["surface_active_light_scope"] = "scene"
+    return {k: v for k, v in out.items() if v is not None}
+
+
+def _normalize_wall_light_extras(raw: Any) -> dict[str, Any]:
+    if not _causal_light_fields_enabled() or not isinstance(raw, dict):
+        return {}
+    out: dict[str, Any] = {}
+    score = _coerce_optional_float(raw.get("landscape_competition_score"))
+    if score is not None:
+        out["landscape_competition_score"] = score
+        out["landscape_competition_scope"] = "wall"
+    sal = raw.get("surface_active_light")
+    if isinstance(sal, bool):
+        out["surface_active_light"] = sal
+        out["surface_active_light_scope"] = "wall"
+    else:
+        text = str(sal or "").strip().lower()
+        if text in {"true", "1", "yes"}:
+            out["surface_active_light"] = True
+            out["surface_active_light_scope"] = "wall"
+        elif text in {"false", "0", "no"}:
+            out["surface_active_light"] = False
+            out["surface_active_light_scope"] = "wall"
+    return out
+
+
+def _copy_wall_light_extras(src: dict[str, Any], dst: dict[str, Any]) -> None:
+    for k, v in _normalize_wall_light_extras(src).items():
+        dst[k] = v
+
+
 _INSTANCE_SUFFIX_RE = re.compile(r"^(?P<base>.+?)[_\-\s]+\d{1,4}$")
 
 
@@ -1017,7 +1093,7 @@ def _build_vlm_objects_in_original_space(raw, original_w, original_h, bbox_coord
         if bbox_coordinate_space != 'original_pixels':
             source += "+bbox_normalized"
             notes = (notes + f" | bbox normalized from {bbox_coordinate_space} to original pixels").strip()
-        out.append({
+        record = {
             "object_id": obj.get("object_id") or f"{label}_{i:02d}",
             "label": label,
             "role": role,
@@ -1032,7 +1108,9 @@ def _build_vlm_objects_in_original_space(raw, original_w, original_h, bbox_coord
             "confidence": float(obj.get("confidence", 0.5)),
             "source": source,
             "notes": notes,
-        })
+        }
+        _copy_wall_light_extras(obj, record)
+        out.append(record)
     return out
 
 def require_auth(a):
@@ -1191,6 +1269,8 @@ async def parse_semantics_mvp(
     # Preserve order while deduplicating.
     warnings = list(dict.fromkeys([str(w) for w in warnings if w]))
 
+    light_payload = _normalize_light_payload((seed_payload or raw or {}).get("light"))
+
     semantic_payload = {
         "status": "ok",
         "coordinate_space": "processed" if metric_zip_bytes else "original",
@@ -1208,6 +1288,8 @@ async def parse_semantics_mvp(
         "semantic_seed_debug": seed_debug,
         "warnings": warnings
     }
+    if light_payload:
+        semantic_payload["light"] = light_payload
 
     if return_debug_assets:
         debug_img = draw_semantic_wall_debug(image_np, out, multiwall_split_debug, target_space="original")

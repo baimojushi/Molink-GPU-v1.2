@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import asdict
 import json
 import os
 import tempfile
@@ -16,6 +17,12 @@ from pathlib import Path
 import websockets
 
 from worker import pipeline, render_api, r2_upload, result_builder, autodl_api, diagnostics
+
+try:
+    from molink_causal import CausalEngine, Event
+except Exception:  # pragma: no cover - optional integration
+    CausalEngine = None
+    Event = None
 
 MOLINK_WS_URL = os.getenv("MOLINK_WS_URL", "wss://www.molink.art/api/gpu/worker-connect")
 WORKER_SECRET = os.getenv("WORKER_SECRET", "")
@@ -45,6 +52,106 @@ GPU_MODEL = os.getenv("GPU_MODEL", "TITAN Xp")
 GPU_COUNT = int(os.getenv("GPU_COUNT", "1"))
 IDLE_TIMEOUT_S = int(os.getenv("IDLE_TIMEOUT_S", "300"))
 WORKER_VERSION = "1.0.0"
+
+
+def _truthy_env(name: str, default: str = "0") -> bool:
+    value = os.getenv(name, default)
+    return str(value).strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def _causal_enabled() -> bool:
+    return _truthy_env("MOLINK_CAUSAL_ENABLED", "0") and CausalEngine is not None and Event is not None
+
+
+def _safe_json_load(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _count_semantic_space(semantics: dict) -> dict:
+    objects = semantics.get("objects") if isinstance(semantics, dict) else []
+    if not isinstance(objects, list):
+        objects = []
+
+    def label_is(obj, names):
+        label = str((obj or {}).get("label") or "").strip().lower()
+        role = str((obj or {}).get("role") or "").strip().lower()
+        return label in names or role in names
+
+    return {
+        "wall_count": sum(1 for o in objects if label_is(o, {"wall"})),
+        "window_count": sum(1 for o in objects if label_is(o, {"window"})),
+        "door_count": sum(1 for o in objects if label_is(o, {"door"})),
+        "furniture_count": sum(1 for o in objects if str((o or {}).get("label") or "").strip().lower() in {"sofa", "table", "cabinet", "chair"}),
+        "existing_art_count": sum(1 for o in objects if str((o or {}).get("role") or "").strip().lower() == "existing_content"),
+        "person_count": sum(1 for o in objects if str((o or {}).get("label") or "").strip().lower() in {"person", "human", "people"}),
+    }
+
+
+def _best_plan_delta(client_res: dict) -> dict:
+    best = client_res.get("best_plan") if isinstance(client_res, dict) else None
+    if not isinstance(best, dict):
+        return {}
+    install = best.get("install_reference") or {}
+    comp = best.get("composition_context") or {}
+    light_sem = best.get("light_semantics") or {}
+    artwork_analysis = best.get("artwork_analysis") or {}
+    axis_center = comp.get("axis_centering")
+    delta = {
+        "best_plan": {
+            "wall_id": best.get("wall_id") or "",
+            "wall_position_zh": best.get("wall_position_zh") or comp.get("above_furniture_label_zh") or "",
+            "is_primary_wall": int(best.get("rank") or 0) == 1,
+            "artwork_wall_area_ratio": comp.get("artwork_wall_area_ratio") or 0.0,
+            "center_height_cm": install.get("center_height_cm") or install.get("provisional_center_height_cm"),
+            "bottom_edge_cm": install.get("bottom_edge_cm"),
+            "top_edge_cm": install.get("top_edge_cm"),
+            "height_finalized": bool(install.get("metric_height_finalized")),
+            "above_furniture_label_zh": comp.get("above_furniture_label_zh"),
+            "bottom_gap_to_furniture_cm": comp.get("bottom_gap_to_furniture_cm"),
+            "axis_centering": True if axis_center in (True, "居中", "center", "centered") else False,
+            "composition_zh": "，".join(str(x) for x in [comp.get("above_furniture_label_zh"), comp.get("axis_centering"), comp.get("height_rule_label")] if x),
+            "risk_level": best.get("risk_level") or "unknown",
+            "window_edge_clearance_cm": comp.get("window_edge_clearance_cm"),
+            "surface_active_light": light_sem.get("surface_active_light") if light_sem.get("surface_active_light_scope") == "wall" else None,
+            "landscape_competition_score": light_sem.get("landscape_competition_score") if light_sem.get("landscape_competition_scope") == "wall" else None,
+            "light_components": best.get("light_components"),
+            "light_risk_band": best.get("light_risk_band"),
+            "light_penalty_band": best.get("light_penalty_band") or (best.get("light_components") or {}).get("penalty_band"),
+            "needs_review": bool(best.get("needs_review")),
+            "production_usable": True,
+        },
+        "light": {
+            **(best.get("light_facts") or {}),
+            **{k: v for k, v in light_sem.items() if k in {"theta", "exterior_brightness_class", "ambient_light_mode", "shadow_presence", "temporal_light_quality", "ceiling_height"}},
+        },
+    }
+    art_delta = {
+        "mood_register": artwork_analysis.get("mood_register"),
+        "visual_complexity": artwork_analysis.get("visual_complexity") or artwork_analysis.get("complexity_score"),
+    }
+    art_delta = {k: v for k, v in art_delta.items() if v is not None}
+    if art_delta:
+        delta["artwork"] = art_delta
+    return delta
+
+
+def _result_delivery_delta(payload: dict) -> dict:
+    candidates = payload.get("candidates") or []
+    partials = payload.get("partial_review_images") or []
+    final_count = sum(1 for c in candidates if isinstance(c, dict) and c.get("final_image_url"))
+    return {
+        "delivery": {
+            "final_url_count": int(final_count),
+            "partial_review_count": int(len(partials)),
+        },
+        "qa": {
+            "status": "passed" if final_count else ("review" if partials else "failed"),
+        },
+    }
+
 
 DEFAULT_RENDER_PROVIDER = "apiyi_gpt_image2_vip"
 RENDER_PROVIDER_ALIASES = {
@@ -135,6 +242,8 @@ class Worker:
         self.idle_since: float | None = None
         self._shutdown_task: asyncio.Task | None = None
         self._current_job_id: str | None = None
+        self._causal_engine = None
+        self._causal_base_delta: dict = {}
 
     async def _create_ws(self):
         """Create a fresh WebSocket connection to the business server."""
@@ -153,6 +262,17 @@ class Worker:
         print(f"[worker] 已注册 {INSTANCE_ID} ({GPU_MODEL})")
 
     async def send_result(self, ws, job, payload) -> None:
+        if isinstance(payload, dict) and payload.get("narration_bundle") is None:
+            result_stage = "r2_upload" if payload.get("status") in {"succeeded", "succeeded_partial", "render_review"} else "failed"
+            result_state = "done" if result_stage == "r2_upload" else "failed"
+            result_pct = 100 if payload.get("status") in {"succeeded", "succeeded_partial"} else 92
+            bundle = self._narration_bundle(
+                result_stage, result_state, result_pct,
+                "完成" if result_state == "done" else "本次自动生成遇到异常，团队会继续为您处理…",
+                delta=_result_delivery_delta(payload),
+            )
+            if bundle:
+                payload["narration_bundle"] = bundle
         print(
             f"[worker-debug] send_result job_id={job.get('job_id')} order_id={job.get('order_id')} "
             f"status={payload.get('status')} exit_code={payload.get('exit_code')} "
@@ -211,7 +331,7 @@ class Worker:
             except Exception:
                 return
 
-    async def progress(self, ws, job, stage, state, pct, message, advisor_message=None) -> None:
+    async def progress(self, ws, job, stage, state, pct, message, advisor_message=None, causal_delta=None) -> None:
         payload = {
             "type": "progress",
             "job_id": job["job_id"],
@@ -223,6 +343,9 @@ class Worker:
         }
         if advisor_message:
             payload["advisor_message"] = advisor_message
+        bundle = self._narration_bundle(stage, state, pct, message, advisor_message, causal_delta)
+        if bundle:
+            payload["narration_bundle"] = bundle
 
         print(
             "[worker-progress:send] "
@@ -237,6 +360,34 @@ class Worker:
 
         await ws.send(json.dumps(payload, ensure_ascii=False))
 
+    def _reset_causal_engine(self, job: dict | None = None) -> None:
+        self._causal_engine = CausalEngine() if _causal_enabled() else None
+        artwork = (job or {}).get("artwork") or {}
+        self._causal_base_delta = {
+            "artwork": {
+                "width_cm": round(float(artwork.get("physical_width_m") or 0.0) * 100.0, 1) if artwork else 0.0,
+                "height_cm": round(float(artwork.get("physical_height_m") or 0.0) * 100.0, 1) if artwork else 0.0,
+                "has_frame": bool(artwork.get("has_frame", False)) if artwork else False,
+            }
+        } if self._causal_engine is not None else {}
+
+    def _narration_bundle(self, stage, state, pct, message, advisor_message=None, delta=None):
+        if self._causal_engine is None or Event is None:
+            return None
+        try:
+            merged = dict(self._causal_base_delta or {})
+            for group, value in (delta or {}).items():
+                if isinstance(value, dict) and isinstance(merged.get(group), dict):
+                    merged[group] = {**merged[group], **value}
+                else:
+                    merged[group] = value
+            merged["progress"] = {"message": message or "", "advisor_message": advisor_message}
+            bundle = self._causal_engine.on_event(Event(stage, state, float(pct or 0), merged))
+            return asdict(bundle)
+        except Exception as exc:
+            print(f"[causal] narration bundle skipped: {exc}", flush=True)
+            return None
+
     async def on_job_received(self, job_id) -> None:
         if self._shutdown_task:
             self._shutdown_task.cancel()
@@ -246,6 +397,8 @@ class Worker:
 
     async def on_job_complete(self, ws) -> None:
         self._current_job_id = None
+        self._causal_engine = None
+        self._causal_base_delta = {}
         await ws.send(json.dumps({"type": "worker_idle", "instance_id": INSTANCE_ID}))
         self.idle_since = time.time()
         self._shutdown_task = asyncio.create_task(self._idle_countdown(ws))
@@ -268,6 +421,7 @@ class Worker:
     async def run_job(self, ws, job) -> None:
         print(f"[worker-debug] job_received job_id={job.get('job_id')} order_id={job.get('order_id')} r2_prefix={job.get('r2_output_prefix')}", flush=True)
         await self.on_job_received(job["job_id"])
+        self._reset_causal_engine(job)
         await ws.send(json.dumps({"type": "job_accepted", "job_id": job["job_id"], "instance_id": INSTANCE_ID}))
         print(f"[worker-debug] job_accepted job_id={job.get('job_id')}", flush=True)
 
@@ -320,7 +474,11 @@ class Worker:
                 semantics = await asyncio.to_thread(pipeline.call_semantic, inputs["room"], metric_zip, scene_profile, work_dir)
                 diag_later(diag.copy_file, semantics, "03_semantic/semantics.json")
 
-                await self.progress(ws, job, "hanging", "running", 55, "正在筛选安全挂画位置…")
+                semantic_payload = _safe_json_load(semantics)
+                semantic_delta = {"space": _count_semantic_space(semantic_payload)}
+                if isinstance(semantic_payload.get("light"), dict):
+                    semantic_delta["light"] = semantic_payload.get("light")
+                await self.progress(ws, job, "hanging", "running", 55, "正在筛选安全挂画位置…", causal_delta=semantic_delta)
                 rules_json = pipeline.build_rules_overrides(job)
                 if rules_json:
                     diag_later(diag.write_text, "04_hanging/rules_overrides.json", rules_json)
@@ -336,6 +494,7 @@ class Worker:
                     ws, job, "hanging", "running", 60,
                     "已完成挂画方案筛选，正在进入效果图渲染…",
                     advisor_message=_advisor_progress_from_client_result(client_res),
+                    causal_delta=_best_plan_delta(client_res),
                 )
 
                 exit_code = str(client_res.get("exit_code", ""))

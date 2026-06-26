@@ -72,3 +72,24 @@ Failed Flux QA must never be silently published as `OK_SELECTED`. Failed items r
 - explicit single-wall downgrade.
 
 When a metric floor anchor is not trusted, the client result must expose a provisional preview height rather than a finalized installation height.
+
+
+
+## 可选扩展：挂画因果层 narration bundle 与光线评分
+
+本扩展为 append-only 字段。旧消费方可忽略未知键。
+
+环境变量：
+
+- `MOLINK_CAUSAL_ENABLED=1`：启用因果层计算、worker `narration_bundle` 输出与候选 `light_components` 影子记录。默认 `0`。
+- `HANGING_CAUSAL_DECISION=1`：把 `light_components.delta` 回灌到候选 `score`，参与既有排序；同时追加 `light_caution` / `light_concern` / `light_deprioritized` 等光线标签到软风险与原因标签。默认 `0`。
+- `MOLINK_CAUSAL_VLM_FIELDS=1`：semantic 单次 VLM 调用额外输出顶层 `light` 对象。默认 `0`。
+- `MOLINK_CAUSAL_LIGHT_IN_NARRATION=1`：worker bundle 的 `facts.light_analysis` 写入光线分量明细，供业务端 LLM 正文解释排序原因。默认 `0`。
+
+新增字段：
+
+- progress 消息：`narration_bundle?: { task, char_limit, state, pct, facts, fired, copy_hints, light_components, constraints }`
+- result payload：`narration_bundle?: object`
+- candidate/plan：`light_components?: object`、`light_risk_band?: "none"|"caution"|"concern"`、`light_penalty_band?: "none"|"caution"|"concern"`、`light_semantics?: object`、`light_facts?: object`、`artwork_analysis?: object`
+
+`HANGING_CAUSAL_DECISION=0` 时不改变候选 `score`、排序、`risk_level`、交付门。`light_components` 只作为叙事与影子观测字段。`light_risk_band` 表示 R_light 风险，`light_penalty_band` 表示 P_backdrop/P_view 等降序惩罚，二者均不抬升 `_risk_level`。

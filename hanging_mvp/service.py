@@ -5,6 +5,7 @@ import json
 import os
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, List, Mapping, Optional
 
 import cv2
@@ -43,9 +44,228 @@ from .candidate_safety import (
 )
 from .height_fit_contract import floor_source_is_metric_trusted, room_corner_floor_fit_contract
 
+try:
+    from molink_causal import imaging as causal_imaging
+    from molink_causal import light_model as causal_light_model
+except Exception:  # pragma: no cover - causal layer is optional at runtime
+    causal_imaging = None
+    causal_light_model = None
+
 API_KEY = os.getenv("API_KEY", "")
 ALLOW_UNAUTH_LOCAL = os.getenv("ALLOW_UNAUTH_LOCAL", "").strip().lower() in {"1", "true", "yes", "on"}
 PORT = int(os.getenv("HANGING_MVP_PORT", "6010"))
+
+
+def _truthy_env(name: str, default: str = "0") -> bool:
+    value = os.getenv(name, default)
+    return str(value).strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def _causal_enabled() -> bool:
+    return _truthy_env("MOLINK_CAUSAL_ENABLED", "0") and causal_imaging is not None and causal_light_model is not None
+
+
+def _causal_decision_enabled() -> bool:
+    return _causal_enabled() and _truthy_env("HANGING_CAUSAL_DECISION", "0")
+
+
+def _clamp01_local(value: float) -> float:
+    try:
+        return float(max(0.0, min(1.0, float(value))))
+    except Exception:
+        return 0.0
+
+
+def _union_masks_for_shape(items: List[Mapping[str, Any]], shape_hw: tuple[int, int]) -> np.ndarray | None:
+    if not items:
+        return None
+    out = np.zeros(shape_hw, np.uint8)
+    for item in items:
+        m = item.get("mask") if isinstance(item, Mapping) else None
+        if m is None:
+            continue
+        try:
+            arr = np.asarray(m)
+            if arr.shape[:2] == shape_hw:
+                out[arr > 0] = 255
+        except Exception:
+            continue
+    return out if np.any(out) else None
+
+
+def _semantic_light_fields(semantics: Mapping[str, Any]) -> dict[str, Any]:
+    raw = semantics.get("light") if isinstance(semantics, Mapping) else None
+    if not isinstance(raw, Mapping):
+        return {}
+    return {k: v for k, v in raw.items() if v is not None}
+
+
+def _wall_causal_semantic_light(global_light: Mapping[str, Any], wall_obj: Mapping[str, Any]) -> dict[str, Any]:
+    """Return semantic light scoped to this wall.
+
+    Top-level VLM light values are scene-level. They are useful for narration, but
+    fields such as surface_active_light and landscape_competition_score must not be
+    blindly applied to every candidate wall. Wall-object values override scene
+    values and are the only values used for per-candidate P_view/T13 decisions.
+    """
+    out = dict(global_light or {})
+    if "landscape_competition_score" in out:
+        out["landscape_competition_scene_score"] = out.pop("landscape_competition_score")
+        out.setdefault("landscape_competition_scope", "scene")
+    if "surface_active_light" in out:
+        out["surface_active_light_scene"] = out.pop("surface_active_light")
+        out.setdefault("surface_active_light_scope", "scene")
+
+    if isinstance(wall_obj, Mapping):
+        try:
+            if wall_obj.get("landscape_competition_score") is not None:
+                out["landscape_competition_score"] = _clamp01_local(float(wall_obj.get("landscape_competition_score")))
+                out["landscape_competition_scope"] = "wall"
+        except Exception:
+            pass
+        sal = wall_obj.get("surface_active_light")
+        if isinstance(sal, bool):
+            out["surface_active_light"] = sal
+            out["surface_active_light_scope"] = "wall"
+    return {k: v for k, v in out.items() if v is not None}
+
+
+def _estimate_artwork_visual_complexity(art_rgba: np.ndarray) -> float | None:
+    try:
+        arr = np.asarray(art_rgba)
+        if arr.ndim != 3 or arr.shape[0] < 8 or arr.shape[1] < 8:
+            return None
+        rgb = arr[:, :, :3].astype(np.uint8)
+        alpha = arr[:, :, 3] if arr.shape[2] >= 4 else None
+        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+        if alpha is not None and np.count_nonzero(alpha > 8) > 100:
+            mask = (alpha > 8).astype(np.uint8)
+        else:
+            mask = np.ones(gray.shape, np.uint8)
+        vals = gray[mask > 0]
+        if vals.size < 100:
+            return None
+        lap = cv2.Laplacian(gray, cv2.CV_32F)
+        edges = cv2.Canny(gray, 40, 120)
+        edge_density = float(np.count_nonzero((edges > 0) & (mask > 0)) / max(1, np.count_nonzero(mask > 0)))
+        lap_energy = float(np.mean(np.abs(lap[mask > 0])) / 60.0)
+        tonal_var = float(np.std(vals) / 80.0)
+        score = 0.45 * min(1.0, edge_density * 8.0) + 0.35 * min(1.0, lap_energy) + 0.20 * min(1.0, tonal_var)
+        return round(_clamp01_local(score), 3)
+    except Exception:
+        return None
+
+
+def _augment_artwork_analysis_with_pix(artwork_analysis: Mapping[str, Any], art_rgba: np.ndarray) -> dict[str, Any]:
+    out = dict(artwork_analysis or {})
+    if out.get("visual_complexity") is None and out.get("complexity_score") is None:
+        complexity = _estimate_artwork_visual_complexity(art_rgba)
+        if complexity is not None:
+            out["visual_complexity"] = complexity
+            out["visual_complexity_source"] = "pix_hf_energy"
+    return out
+
+
+def _light_room_mask(shape_hw: tuple[int, int], window_mask: np.ndarray | None) -> np.ndarray:
+    room = np.ones(shape_hw, dtype=bool)
+    if window_mask is not None:
+        room[window_mask > 0] = False
+    if not np.any(room):
+        room[:, :] = True
+    return room
+
+
+def _candidate_window_clearance_cm(candidate: Mapping[str, Any]) -> float | None:
+    hard = candidate.get("hard_constraints", {}) if isinstance(candidate, Mapping) else {}
+    sc = hard.get("structural_clearance_policy", {}) if isinstance(hard, Mapping) else {}
+    vals: list[float] = []
+    if isinstance(sc, Mapping):
+        for key in ("considered_objects", "blocking_objects"):
+            for obj in sc.get(key, []) or []:
+                if not isinstance(obj, Mapping):
+                    continue
+                if str(obj.get("label") or "").strip().lower() != "window":
+                    continue
+                try:
+                    vals.append(float(obj.get("edge_clearance_m")) * 100.0)
+                except Exception:
+                    continue
+    return round(min(vals), 1) if vals else None
+
+
+def _candidate_wall_area_ratio(candidate: Mapping[str, Any]) -> float | None:
+    hard = candidate.get("hard_constraints", {}) if isinstance(candidate, Mapping) else {}
+    if not isinstance(hard, Mapping):
+        return None
+    try:
+        sr = hard.get("visible_wall_s_range_m") or []
+        tr = hard.get("visible_wall_t_range_m") or []
+        wall_area = max(1e-6, abs(float(sr[1]) - float(sr[0])) * abs(float(tr[1]) - float(tr[0])))
+        art_area = max(0.0, float(hard.get("artwork_width_m") or 0.0) * float(hard.get("artwork_height_m") or 0.0))
+        if art_area <= 0.0:
+            return None
+        return round(float(art_area / wall_area), 4)
+    except Exception:
+        return None
+
+
+def _candidate_visual_complexity(candidate: Mapping[str, Any]) -> float | None:
+    art = candidate.get("artwork_analysis") if isinstance(candidate, Mapping) else None
+    if not isinstance(art, Mapping):
+        return None
+    for key in ("visual_complexity", "complexity_score"):
+        try:
+            if art.get(key) is not None:
+                return _clamp01_local(float(art.get(key)))
+        except Exception:
+            pass
+    return None
+
+
+def _causal_light_for_candidate(
+    candidate: Mapping[str, Any],
+    global_light: Mapping[str, Any],
+) -> tuple[dict[str, Any] | None, str | None, float | None]:
+    if not _causal_enabled() or not global_light:
+        return None, None, None
+    facts = dict(global_light.get("light_facts") or {})
+    if not facts:
+        return None, None, None
+    semantic_light = dict(global_light.get("semantic_light") or {})
+    for key in ("theta", "exterior_brightness_class", "ambient_light_mode", "shadow_presence", "temporal_light_quality"):
+        if semantic_light.get(key) is not None:
+            facts[key] = semantic_light[key]
+    ceiling_height = semantic_light.get("ceiling_height")
+    view = SimpleNamespace(
+        window_edge_clearance_cm=_candidate_window_clearance_cm(candidate),
+        landscape_competition_score=semantic_light.get("landscape_competition_score"),
+        artwork_wall_area_ratio=_candidate_wall_area_ratio(candidate),
+    )
+    try:
+        score = causal_light_model.evaluate(
+            SimpleNamespace(**facts),
+            view,
+            ceiling_height=ceiling_height,
+            artwork_complexity=_candidate_visual_complexity(candidate),
+        )
+    except Exception as exc:
+        try:
+            candidate.setdefault("ranking_policy", {})["causal_light_error"] = str(exc)
+        except Exception:
+            pass
+        return None, None, None
+    components = dict(score.components or {})
+    components.update({
+        "r_light": score.r_light,
+        "bonus": score.bonus,
+        "penalty": score.penalty,
+        "delta": score.delta,
+        "risk_band": score.risk_band,
+        "penalty_band": score.penalty_band,
+        "source": "molink_causal.light_model",
+    })
+    return components, score.risk_band, float(score.delta)
+
 
 app = FastAPI(title="hanging-art-mvp-geometry-api")
 
@@ -768,12 +988,20 @@ async def analyze_hanging_mvp(
     objects = load_semantic_masks(semantics, (h, w))
     walls = masks_by_role(objects, "wall") or masks_by_label(objects, {"wall"})
     floors = masks_by_label(objects, {"floor"})
-    roofs = masks_by_label(objects, {"roof"})
+    roofs = masks_by_label(objects, {"roof", "ceiling"})
     tables = masks_by_label(objects, {"table"})
+    window_masks_for_causal = masks_by_label(objects, {"window"})
+    ceiling_masks_for_causal = masks_by_label(objects, {"roof", "ceiling"})
     structural_forbidden_labels = set(rules.get("forbidden_classes", ["window", "door", "arch", "opening", "tv", "mirror", "lamp", "track_lighting"]))
     existing_content_labels = set(rules.get("existing_content_classes", ["existing_art", "painting", "poster", "framed_art", "wall_clutter", "wall_label", "hook", "nail", "small_shelf", "green_board", "notice_board"]))
     artwork_analysis = semantics.get("artwork_analysis") if isinstance(semantics.get("artwork_analysis"), dict) else {}
+    artwork_analysis = _augment_artwork_analysis_with_pix(artwork_analysis, art_rgba)
     resolved_artwork_has_frame, artwork_has_frame_source = _resolve_artwork_has_frame(rules, artwork_analysis)
+
+    causal_semantic_light = _semantic_light_fields(semantics) if _causal_enabled() else {}
+    causal_window_mask = _union_masks_for_shape(window_masks_for_causal, (h, w)) if _causal_enabled() else None
+    causal_ceiling_mask = _union_masks_for_shape(ceiling_masks_for_causal, (h, w)) if _causal_enabled() else None
+    causal_room_mask = _light_room_mask((h, w), causal_window_mask) if _causal_enabled() else None
 
     def _union_reference_masks(items):
         if not items:
@@ -1249,6 +1477,38 @@ async def analyze_hanging_mvp(
         if wall_id in wall_debug_registry:
             wall_debug_registry[wall_id]["filtered_wall_mask"] = wall_mask.copy()
             wall_debug_registry[wall_id]["summary"]["wall_filter_debug"] = wall_filter_debug
+
+        causal_wall_light: dict[str, Any] = {}
+        if _causal_enabled():
+            try:
+                wall_mask_bool = wall_mask > 0
+                stats = causal_imaging.light_statistics(
+                    room_rgb,
+                    room_mask=causal_room_mask,
+                    window_mask=causal_window_mask,
+                    wall_mask=wall_mask_bool,
+                    ceiling_mask=causal_ceiling_mask,
+                )
+                noise = causal_imaging.surface_visual_noise(room_rgb, wall_mask_bool)
+                causal_wall_light = {
+                    "light_facts": {
+                        "rho": stats.rho,
+                        "wall_lambda": stats.wall_lambda,
+                        "lambda_ceil": stats.lambda_ceil,
+                        "surface_visual_noise_score": noise.score,
+                    },
+                    "surface_visual_noise_band": noise.band,
+                    "surface_visual_noise_debug": {
+                        "edge_density": noise.edge_density,
+                        "hf_energy": noise.hf_energy,
+                        "local_std": noise.local_std,
+                    },
+                    "semantic_light": _wall_causal_semantic_light(causal_semantic_light, wall_obj),
+                }
+                if wall_id in wall_debug_registry:
+                    wall_debug_registry[wall_id]["summary"]["causal_light"] = causal_wall_light
+            except Exception as _causal_e:
+                causal_wall_light = {"error": str(_causal_e)}
 
         pts = points_from_mask(xyz, wall_mask)
         if len(pts) < 1000:
@@ -2297,11 +2557,18 @@ async def analyze_hanging_mvp(
                 "risk_level": candidate_risk_level,
                 "requires_hardpaste_vlm_review": requires_hardpaste_vlm_review,
                 "score": float(quality_score),
+                "causal_light_facts": causal_wall_light.get("light_facts") if isinstance(causal_wall_light, dict) else None,
+                "causal_light_semantics": causal_wall_light.get("semantic_light") if isinstance(causal_wall_light, dict) else None,
+                "surface_visual_noise_band": causal_wall_light.get("surface_visual_noise_band") if isinstance(causal_wall_light, dict) else None,
+                "surface_visual_noise_debug": causal_wall_light.get("surface_visual_noise_debug") if isinstance(causal_wall_light, dict) else None,
+                "artwork_wall_area_ratio": _candidate_wall_area_ratio({"hard_constraints": hard}),
+                "window_edge_clearance_cm": None,
                 "artwork_analysis": artwork_analysis,
                 "artwork_has_frame": resolved_artwork_has_frame,
                 "artwork_has_frame_source": artwork_has_frame_source,
                 "artwork_mount_policy": artwork_mount_policy,
             }
+            cand["window_edge_clearance_cm"] = _candidate_window_clearance_cm(cand)
             if reasons:
                 rejected.append({"candidate_id": candidate_id, "wall_id": wall_id, "reject_reasons": reasons, "soft_risk_reasons": soft_risk_reasons, "hard_constraints": hard})
             else:
@@ -2372,6 +2639,40 @@ async def analyze_hanging_mvp(
         return _cand
     for _hpv6_c in candidates:
         _hpv6_candidate_policy_score(_hpv6_c)
+
+    for _causal_c in candidates:
+        try:
+            _components, _band, _delta = _causal_light_for_candidate(_causal_c, {
+                "light_facts": _causal_c.get("causal_light_facts"),
+                "semantic_light": _causal_c.get("causal_light_semantics"),
+            })
+            if _components is None:
+                continue
+            _causal_c["light_components"] = _components
+            _causal_c["light_risk_band"] = _band
+            if _causal_decision_enabled():
+                _causal_c["score_before_light"] = float(_causal_c.get("score", 0.0) or 0.0)
+                _causal_c["score"] = _clamp01_local(_causal_c["score_before_light"] + float(_delta or 0.0))
+                _causal_c.setdefault("ranking_policy", {})["causal_light"] = {
+                    "decision_enabled": True,
+                    "light_delta": float(_delta or 0.0),
+                    "risk_band": _band,
+                    "score_before_light": _causal_c["score_before_light"],
+                    "score_after_light": float(_causal_c.get("score", 0.0) or 0.0),
+                }
+                if _band == "caution":
+                    _causal_c.setdefault("soft_risk_reasons", []).append("light_caution")
+                elif _band == "concern":
+                    _causal_c.setdefault("soft_risk_reasons", []).append("light_concern")
+            else:
+                _causal_c.setdefault("ranking_policy", {})["causal_light"] = {
+                    "decision_enabled": False,
+                    "light_delta": float(_delta or 0.0),
+                    "risk_band": _band,
+                    "score_unchanged": float(_causal_c.get("score", 0.0) or 0.0),
+                }
+        except Exception as _causal_e:
+            _causal_c.setdefault("ranking_policy", {})["causal_light_error"] = str(_causal_e)
 
     candidates, projected_duplicate_rejections, candidate_diversity_summary = _suppress_projected_duplicate_candidates(candidates, rules)
     rejected.extend(projected_duplicate_rejections)

@@ -1,5 +1,21 @@
 from __future__ import annotations
 
+import os
+
+
+def _truthy_env(name: str, default: str = "0") -> bool:
+    value = os.getenv(name, default)
+    return str(value).strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def _causal_enabled() -> bool:
+    return _truthy_env("MOLINK_CAUSAL_ENABLED", "0")
+
+
+def _causal_vlm_fields_enabled() -> bool:
+    return _causal_enabled() and _truthy_env("MOLINK_CAUSAL_VLM_FIELDS", "0")
+
+
 LABEL_POLICY = {
     "support": ["sofa", "floor", "roof", "table", "cabinet"],
     "structural_forbidden": ["window", "door", "tv", "mirror", "lamp", "track_lighting", "arch", "opening"],
@@ -9,6 +25,28 @@ LABEL_POLICY = {
 }
 
 def system_prompt(scene_profile: str) -> str:
+    causal_light_schema = ""
+    if _causal_vlm_fields_enabled():
+        causal_light_schema = """
+
+Optional causal light object, when visible evidence supports it:
+{
+  "light": {
+    "theta": "same|opposite|perpendicular|none|null",
+    "exterior_brightness_class": "bright_direct|overcast|artificial|null",
+    "ambient_light_mode": "gallery_ambient|soft_diffuse|direct_dramatic|flat_artificial|mixed|null",
+    "shadow_presence": "none|subtle|moderate|dramatic|null",
+    "temporal_light_quality": "static|dynamic|null",
+    "surface_active_light": true|false|null,
+    "landscape_competition_score": 0.0-1.0|null,
+    "ceiling_height": "low|standard|high|dramatic|null"
+  },
+  "wall_light_notes": {
+    "instruction": "For each wall object, add optional surface_active_light and landscape_competition_score only when evidence is wall-specific. Top-level landscape_competition_score is scene-level and will not be used for per-wall ranking."
+  }
+}
+Use null when the image does not contain enough evidence. Do not invent unseen windows or light direction.
+"""
     common = """
 You are a visual scene parser for an automated artwork hanging system.
 Return JSON only. Do not include markdown.
@@ -35,6 +73,7 @@ track_lighting, arch, opening, existing_art, painting, poster, framed_art,
 artwork, wall_clutter, wall_label, hook, nail, small_shelf, green_board,
 notice_board, person, human, people, pedestal, plinth, display_stand,
 foreground_object.
+""" + causal_light_schema + """
 
 VLM-first wall proposal rules:
 - Detect every visible wall plane as a separate object. Never merge walls with different orientations.
@@ -87,6 +126,7 @@ Home/retail rules:
 """
 
 def user_prompt(scene_profile: str, width: int, height: int) -> str:
+    causal_light_line = "- include a top-level light object with causal light fields when visible evidence is sufficient; use null for uncertain fields" if _causal_vlm_fields_enabled() else ""
     return f"""
 Scene profile: {scene_profile}
 Image size: {width}x{height}
@@ -102,6 +142,8 @@ Also enforce:
 - include visible people as person foreground objects
 - include every visible roof/ceiling region as label=roof, role=support, with its own bbox
 - include wall labels, hooks, nails, small shelves, green boards and notice boards as existing_content objects
+{causal_light_line}
+- when causal light fields are enabled, put surface_active_light / landscape_competition_score on a wall object only if the evidence is specific to that wall; otherwise leave wall fields null
 
 Also enforce:
 - multi-wall detection: output every visible wall plane separately
@@ -158,7 +200,9 @@ Return this JSON object exactly:
     "top": [r,g,b],
     "bottom": [r,g,b]
   }},
-  "reason": ""
+  "reason": "",
+  "mood_register": "calm|contemplative|dynamic|melancholic|joyful|null",
+  "visual_complexity": 0.0-1.0|null
 }}
 
 Rules:
@@ -173,4 +217,6 @@ Rules:
 - side_thickness_policy should be normal for refined_paper_or_delicate or uncertain, double for rough_or_canvas, and none for chinese_hanging_scroll.
 - frame_width_ratio is approximate visible frame width divided by image size.
 - dominant_edge_colors_rgb should describe the outermost frame/edge color.
+- mood_register describes the artwork's visible emotional register only when there is clear visual evidence; otherwise null.
+- visual_complexity estimates line/texture/color density from 0.0 (minimal) to 1.0 (dense/complex); use null when uncertain.
 """

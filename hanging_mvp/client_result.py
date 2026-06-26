@@ -42,6 +42,16 @@ SOFT_RISK_ZH = {
         "实墙固体支撑比例低于阈值",
     "plane_support_ratio_below_threshold_v6":
         "透视平面一致性低于阈值",
+    "light_caution":
+        "候选墙光线条件需留意，已在效果图说明中标注光线影响",
+    "light_concern":
+        "候选墙存在较明显光线干扰，已作为排序参考",
+    "light_deprioritized":
+        "候选墙的背景安静度或景观竞争已作为排序参考",
+    "light_quiet_backdrop":
+        "候选墙面纹理会与作品表达竞争，已作为背景安静度参考",
+    "light_landscape_competition":
+        "候选墙主要视线方向存在景观竞争，已作为尺度关系参考",
 }
 
 NAIL_OFFSET_CM = 3  # 挂钩至画心默认偏移，可由 rules 配置覆盖
@@ -179,13 +189,14 @@ def _geometry_confidence(hard: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _soft_risk_info(candidate: Dict[str, Any], risk_level: str) -> Dict[str, Any] | None:
-    if risk_level not in ("medium", "high"):
-        return None
     reasons = candidate.get("soft_risk_reasons", []) or []
+    has_light_soft_risk = any(str(r).startswith("light_") for r in reasons)
+    if risk_level not in ("medium", "high") and not has_light_soft_risk:
+        return None
     zh = [SOFT_RISK_ZH.get(r, r) for r in reasons]
     if not zh:
         return None
-    return {"has_soft_risk": True, "soft_risk_reasons_zh": zh}
+    return {"has_soft_risk": True, "soft_risk_reasons_zh": list(dict.fromkeys(zh))}
 
 
 def _risk_level(candidate: Dict[str, Any]) -> str:
@@ -212,6 +223,12 @@ def _risk_level(candidate: Dict[str, Any]) -> str:
     if score >= 0.70 and plane >= 0.75 and foreground <= 0.15:
         return "medium"
     return "high"
+
+
+def _light_decision_enabled_for_candidate(candidate: Dict[str, Any]) -> bool:
+    ranking = candidate.get("ranking_policy", {}) if isinstance(candidate.get("ranking_policy"), dict) else {}
+    causal = ranking.get("causal_light", {}) if isinstance(ranking.get("causal_light"), dict) else {}
+    return bool(causal.get("decision_enabled"))
 
 
 def _reason_tags(candidate: Dict[str, Any]) -> List[str]:
@@ -246,7 +263,33 @@ def _reason_tags(candidate: Dict[str, Any]) -> List[str]:
     risk = hard.get("risk_assessment", {}) if isinstance(hard.get("risk_assessment", {}), dict) else {}
     if candidate.get("requires_hardpaste_vlm_review") or risk.get("requires_hardpaste_vlm_review"):
         tags.append("需硬贴图VLM复核")
-    return tags[:5] or ["候选位置可用"]
+    light_tags = []
+    if _light_decision_enabled_for_candidate(candidate):
+        band = candidate.get("light_risk_band")
+        if band == "caution":
+            light_tags.append("light_caution")
+        elif band == "concern":
+            light_tags.append("light_concern")
+        penalty_band = candidate.get("light_penalty_band") or (candidate.get("light_components") or {}).get("penalty_band")
+        comps = candidate.get("light_components") if isinstance(candidate.get("light_components"), dict) else {}
+        if penalty_band in {"caution", "concern"}:
+            light_tags.append("light_deprioritized")
+            try:
+                if float(comps.get("P_backdrop") or 0.0) >= 0.05:
+                    light_tags.append("light_quiet_backdrop")
+            except Exception:
+                pass
+            try:
+                if float(comps.get("P_view") or 0.0) >= 0.05:
+                    light_tags.append("light_landscape_competition")
+            except Exception:
+                pass
+    base_tags = list(dict.fromkeys(tags))
+    light_tags = list(dict.fromkeys(light_tags))
+    if light_tags:
+        keep_base = max(0, 5 - len(light_tags))
+        return list(dict.fromkeys(base_tags[:keep_base] + light_tags))[:5] or ["候选位置可用"]
+    return base_tags[:5] or ["候选位置可用"]
 
 
 def _candidate_to_plan(candidate: Dict[str, Any], rank: int, base_asset_prefix: str = "",
@@ -271,7 +314,7 @@ def _candidate_to_plan(candidate: Dict[str, Any], rank: int, base_asset_prefix: 
     top_edge_cm = composition.get("top_edge_cm")
     nail_height_cm = (center_height_cm + NAIL_OFFSET_CM) if center_height_cm is not None else None
 
-    return {
+    plan = {
         "plan_id": f"{wall_id}_{cand_id}",
         "rank": rank,
         "wall_id": wall_id,
@@ -319,6 +362,25 @@ def _candidate_to_plan(candidate: Dict[str, Any], rank: int, base_asset_prefix: 
             "support_context": candidate.get("support_context", {}),
         },
     }
+    if candidate.get("light_components") is not None:
+        plan["light_components"] = candidate.get("light_components")
+    if candidate.get("light_risk_band") is not None:
+        plan["light_risk_band"] = candidate.get("light_risk_band")
+    if candidate.get("light_penalty_band") is not None:
+        plan["light_penalty_band"] = candidate.get("light_penalty_band")
+    if candidate.get("score_before_light") is not None:
+        plan["score_before_light"] = round(float(candidate.get("score_before_light", 0.0)) * 100)
+    if candidate.get("causal_light_semantics"):
+        plan["light_semantics"] = candidate.get("causal_light_semantics")
+    if candidate.get("causal_light_facts"):
+        plan["light_facts"] = candidate.get("causal_light_facts")
+    if candidate.get("window_edge_clearance_cm") is not None:
+        plan.setdefault("composition_context", {})["window_edge_clearance_cm"] = candidate.get("window_edge_clearance_cm")
+    if candidate.get("artwork_wall_area_ratio") is not None:
+        plan.setdefault("composition_context", {})["artwork_wall_area_ratio"] = candidate.get("artwork_wall_area_ratio")
+    if candidate.get("artwork_analysis"):
+        plan["artwork_analysis"] = candidate.get("artwork_analysis")
+    return plan
 
 
 def _group_rejected(rejected: Iterable[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:

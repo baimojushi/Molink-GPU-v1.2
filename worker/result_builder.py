@@ -152,6 +152,12 @@ def _plan_to_candidate(plan: Dict[str, Any], rank: int, render_info: Dict[str, A
         "structural_clearance": plan.get("structural_clearance"),
         "geometry_confidence": plan.get("geometry_confidence"),
         "soft_risk_info": plan.get("soft_risk_info"),
+        "light_components": plan.get("light_components"),
+        "light_risk_band": plan.get("light_risk_band"),
+        "light_penalty_band": plan.get("light_penalty_band"),
+        "light_semantics": plan.get("light_semantics"),
+        "light_facts": plan.get("light_facts"),
+        "artwork_analysis": plan.get("artwork_analysis"),
         # 有 final_image_url 就视作本轮 worker 可交付；若是 partial 提升，会通过下方字段保留来源。
         "needs_review": not bool(final_url),
         "final_image_url": final_url,
