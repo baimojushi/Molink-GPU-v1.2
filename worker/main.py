@@ -242,6 +242,7 @@ class Worker:
         self.idle_since: float | None = None
         self._shutdown_task: asyncio.Task | None = None
         self._current_job_id: str | None = None
+        self._executed_jobs: set[str] = set()
         self._causal_engine = None
         self._causal_base_delta: dict = {}
 
@@ -433,6 +434,11 @@ class Worker:
         await autodl_api.stop_self()
 
     async def run_job(self, ws, job) -> None:
+        job_id = job.get("job_id")
+        if job_id and job_id in self._executed_jobs:
+            print(f"[worker] duplicate job_id={job_id} — skipping (already executed)", flush=True)
+            await ws.send(json.dumps({"type": "job_skipped", "job_id": job_id, "instance_id": INSTANCE_ID, "reason": "duplicate"}))
+            return
         print(f"[worker-debug] job_received job_id={job.get('job_id')} order_id={job.get('order_id')} r2_prefix={job.get('r2_output_prefix')}", flush=True)
         await self.on_job_received(job["job_id"])
         self._reset_causal_engine(job)
@@ -553,6 +559,9 @@ class Worker:
                 await flush_diag_tasks()
                 await asyncio.to_thread(diag.finalize_zip, payload_for_diag, exc)
                 await self.on_job_complete(ws)
+            finally:
+                if job_id:
+                    self._executed_jobs.add(job_id)
 
     async def listen(self, ws) -> None:
         async for raw in ws:
