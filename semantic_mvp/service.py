@@ -644,8 +644,16 @@ def _sanitize_wall_bboxes_against_edge_structures(objects, processed_w, processe
             obj2 = dict(obj)
             new_box = [float(wx1), float(wy1), float(wx2), float(wy2)]
             obj2['bbox_xyxy_processed'] = new_box
-            obj2['bbox_xyxy_original'] = [float(new_box[0] / sx), float(new_box[1] / sy), float(new_box[2] / sx), float(new_box[3] / sy)]
+            new_box_original = [float(new_box[0] / sx), float(new_box[1] / sy), float(new_box[2] / sx), float(new_box[3] / sy)] if sx > 0 and sy > 0 else list(new_box)
+            obj2['bbox_xyxy_original'] = new_box_original
+            # The public semantic payload declares coordinate_space=processed
+            # whenever metric3d_zip is present. Keep polygon in processed
+            # coordinates and retain polygon_original separately for any later
+            # seed/debug reuse. A previous version only updated polygon, which
+            # could leave downstream consumers with mixed coordinate spaces after
+            # wall-edge trimming.
             obj2['polygon'] = bbox_to_polygon(new_box, processed_w, processed_h)
+            obj2['polygon_original'] = bbox_to_polygon(new_box_original, int(max(1, processed_w / sx)) if sx > 0 else processed_w, int(max(1, processed_h / sy)) if sy > 0 else processed_h)
             obj2['source'] = str(obj2.get('source', 'vlm_bbox_polygon')) + '+edge_structural_trim'
             obj2['notes'] = (str(obj2.get('notes', '')) + ' | edge structural trim applied: forbidden door/window/opening clipped from wall bbox').strip()
             out.append(obj2)
@@ -1057,43 +1065,84 @@ def _objects_have_original_geometry(objects):
     return False
 
 
-def _remap_objects_to_processed_space(objects, processed_w, processed_h, sx, sy):
-    """Map seed objects produced in original-image space to Metric3D processed space.
+def _clip_polygon_to_size(poly, width, height):
+    out = []
+    for pt in poly or []:
+        if not isinstance(pt, (list, tuple)) or len(pt) < 2:
+            continue
+        try:
+            x = max(0.0, min(float(width - 1), float(pt[0])))
+            y = max(0.0, min(float(height - 1), float(pt[1])))
+        except (TypeError, ValueError):
+            continue
+        out.append([x, y])
+    return out
 
-    The same /parse_semantics_mvp endpoint can be called once without
-    metric3d_zip while Metric3D is still running. That first pass runs VLM and
-    optional SAM in original image coordinates. The second call passes
-    semantic_seed_json plus metric3d_zip; this helper performs the only coupling
-    step: coordinate alignment for Hanging.
+
+def _remap_objects_to_processed_space(objects, processed_w, processed_h, sx, sy):
+    """Map semantic objects into the Metric3D processed coordinate space.
+
+    Contract: when the response declares ``coordinate_space=processed``, every
+    public ``polygon`` must also be in processed pixels. Keep original-image
+    geometry in ``polygon_original``/``bbox_xyxy_original`` only. Hanging builds
+    masks directly from ``polygon``; mixed coordinate spaces make side walls
+    disappear or over-expand.
     """
     remapped = []
     for obj in objects or []:
         obj2 = dict(obj)
-        bbox_orig = obj2.get("bbox_xyxy_original") or obj2.get("bbox_xyxy_processed") or obj2.get("bbox_xyxy") or []
-        if len(bbox_orig) == 4:
-            bbox_proc = scale_bbox([float(v) for v in bbox_orig], sx, sy)
-            bbox_proc = _clip_box_xyxy(bbox_proc, processed_w, processed_h)
-            obj2["bbox_xyxy_original"] = [float(v) for v in bbox_orig]
-            obj2["bbox_xyxy_processed"] = bbox_proc
-        else:
-            bbox_proc = obj2.get("bbox_xyxy_processed") or []
 
-        poly_orig = obj2.get("polygon_original")
-        if not poly_orig:
-            # Raw seed payloads produced without metric3d_zip use original-size
-            # as their temporary processed coordinate space, so polygon is safe
-            # to treat as original here.
-            poly_orig = obj2.get("polygon")
-            if poly_orig:
-                obj2["polygon_original"] = poly_orig
-        if poly_orig:
-            # Keep polygon in original image coordinates — hanging pipeline
-            # works in original space and will remap if needed.
-            obj2["polygon"] = poly_orig
-            obj2["polygon_original"] = poly_orig
-        elif len(bbox_proc) == 4:
-            obj2["polygon"] = bbox_to_polygon(bbox_proc, processed_w, processed_h)
-            obj2["polygon_original"] = scale_polygon(obj2["polygon"], 1.0/sx, 1.0/sy) if sx > 0 and sy > 0 else obj2["polygon"]
+        bbox_original = obj2.get("bbox_xyxy_original") or obj2.get("bbox_xyxy") or []
+        bbox_processed_existing = obj2.get("bbox_xyxy_processed") or []
+        if len(bbox_original) == 4:
+            try:
+                bbox_original = [float(v) for v in bbox_original]
+                bbox_processed = _clip_box_xyxy(scale_bbox(bbox_original, sx, sy), processed_w, processed_h)
+                obj2["bbox_xyxy_original"] = bbox_original
+                obj2["bbox_xyxy_processed"] = bbox_processed
+            except Exception:
+                bbox_processed = bbox_processed_existing if len(bbox_processed_existing) == 4 else []
+        elif len(bbox_processed_existing) == 4:
+            bbox_processed = _clip_box_xyxy([float(v) for v in bbox_processed_existing], processed_w, processed_h)
+            obj2["bbox_xyxy_processed"] = bbox_processed
+            if sx > 0 and sy > 0:
+                obj2["bbox_xyxy_original"] = [
+                    float(bbox_processed[0] / sx),
+                    float(bbox_processed[1] / sy),
+                    float(bbox_processed[2] / sx),
+                    float(bbox_processed[3] / sy),
+                ]
+        else:
+            bbox_processed = []
+
+        polygon_original = obj2.get("polygon_original") or obj2.get("polygon") or []
+        polygon_processed = []
+        if polygon_original:
+            try:
+                polygon_original = [[float(x), float(y)] for x, y in polygon_original]
+                polygon_processed = _clip_polygon_to_size(scale_polygon(polygon_original, sx, sy), processed_w, processed_h)
+                obj2["polygon_original"] = polygon_original
+                obj2["polygon"] = polygon_processed
+            except Exception:
+                polygon_processed = []
+
+        if not polygon_processed and len(bbox_processed) == 4:
+            obj2["polygon"] = bbox_to_polygon(bbox_processed, processed_w, processed_h)
+            if sx > 0 and sy > 0:
+                original_w = int(max(1, round(float(processed_w) / float(sx))))
+                original_h = int(max(1, round(float(processed_h) / float(sy))))
+                obj2["polygon_original"] = bbox_to_polygon(
+                    [
+                        float(bbox_processed[0] / sx),
+                        float(bbox_processed[1] / sy),
+                        float(bbox_processed[2] / sx),
+                        float(bbox_processed[3] / sy),
+                    ],
+                    original_w,
+                    original_h,
+                )
+            else:
+                obj2["polygon_original"] = obj2["polygon"]
 
         if obj2.get("source"):
             source = str(obj2.get("source"))
@@ -1148,9 +1197,9 @@ def _build_vlm_objects_in_original_space(raw, original_w, original_h, bbox_coord
     return out
 
 def require_auth(a):
+    if ALLOW_UNAUTH_LOCAL:
+        return
     if not API_KEY:
-        if ALLOW_UNAUTH_LOCAL:
-            return
         raise HTTPException(500, "API_KEY is not configured; set ALLOW_UNAUTH_LOCAL=1 for local development")
     if a != f"Bearer {API_KEY}":
         raise HTTPException(401, "Unauthorized")

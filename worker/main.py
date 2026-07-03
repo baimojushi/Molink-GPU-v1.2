@@ -419,6 +419,8 @@ class Worker:
         self._shutdown_task = asyncio.create_task(self._idle_countdown(ws))
 
     async def _idle_countdown(self, ws) -> None:
+        if IDLE_TIMEOUT_S <= 0:
+            return  # idle shutdown disabled
         try:
             await asyncio.sleep(IDLE_TIMEOUT_S)
         except asyncio.CancelledError:
@@ -433,11 +435,98 @@ class Worker:
         await asyncio.sleep(2)
         await autodl_api.stop_self()
 
+    async def run_supplement_job(self, ws, job) -> None:
+        """Render user-selected non-primary walls from a persisted hanging_result.zip.
+
+        This job intentionally skips Metric3D/Semantic/Hanging and only reuses the
+        existing render path with manifest filters. It is triggered by waiting-page
+        wall preferences and does not block the main recommendation delivery.
+        """
+        job_id = job.get("job_id")
+        print(f"[worker-debug] supplement_job_received job_id={job_id} order_id={job.get('order_id')} targets={job.get('target_wall_ids')}", flush=True)
+        await self.on_job_received(job["job_id"])
+        self._reset_causal_engine(job)
+        await ws.send(json.dumps({"type": "job_accepted", "job_id": job["job_id"], "instance_id": INSTANCE_ID}))
+        render_provider, render_provider_source = resolve_render_provider(job)
+        diag = diagnostics.DiagnosticsRun.create(job)
+        diag_tasks: list[asyncio.Task] = []
+
+        def diag_later(method, *args) -> None:
+            if not getattr(diag, "enabled", False):
+                return
+            diag_tasks.append(asyncio.create_task(asyncio.to_thread(method, *args)))
+
+        async def flush_diag_tasks() -> None:
+            if not diag_tasks:
+                return
+            results = await asyncio.gather(*diag_tasks, return_exceptions=True)
+            diag_tasks.clear()
+            for item in results:
+                if isinstance(item, Exception):
+                    print(f"[diagnostics] background export failed: {item}", flush=True)
+
+        with tempfile.TemporaryDirectory(prefix="hanging_supplement_") as td:
+            work_dir = Path(td)
+            payload_for_diag: dict | None = None
+            try:
+                await self.progress(ws, job, "render", "running", 70, "正在根据您点选的墙面补充生成效果图…")
+                artifact_url = str(job.get("hanging_result_zip_url") or "").strip()
+                if not artifact_url:
+                    raise RuntimeError("supplement job missing hanging_result_zip_url")
+                hanging_zip = await asyncio.to_thread(pipeline.download_to_path, artifact_url, work_dir / "hanging_result.zip")
+                diag_later(diag.copy_file, hanging_zip, "04_hanging/hanging_result.zip")
+                client_res = await asyncio.to_thread(pipeline.extract_client_result, hanging_zip)
+                diag_later(diag.write_json, "04_hanging/client_result.json", client_res)
+                flux_out = work_dir / "flux_out"
+                target_wall_ids = [str(x) for x in (job.get("target_wall_ids") or []) if str(x).strip()]
+                target_candidate_ids = [str(x) for x in (job.get("target_candidate_ids") or []) if str(x).strip()]
+                limit = (job.get("render") or {}).get("global_limit") if isinstance(job.get("render"), dict) else None
+                render_aggregate = await asyncio.to_thread(
+                    render_api.run_pipeline,
+                    str(hanging_zip), str(flux_out), provider=render_provider, limit=limit,
+                    target_wall_ids=target_wall_ids, target_candidate_ids=target_candidate_ids,
+                )
+                diag_later(diag.write_json, "05_render/render_aggregate.json", render_aggregate)
+                diag_later(diag.copy_tree, flux_out, "05_render/flux_out")
+                await self.progress(ws, job, "r2_upload", "running", 92, "正在上传您点选墙面的补充效果图…")
+                r2_result = await asyncio.to_thread(r2_upload.upload_all, flux_out, job["r2_output_prefix"])
+                diag_later(diag.write_json, "06_r2_upload/r2_result.json", r2_result)
+                payload_for_diag = result_builder.build(client_res, render_aggregate, r2_result, job)
+                payload_for_diag["job_kind"] = "hanging_supplement_render"
+                payload_for_diag["supplement"] = True
+                payload_for_diag["selected_wall_ids"] = target_wall_ids
+                payload_for_diag["target_candidate_ids"] = target_candidate_ids
+                diag_later(diag.write_json, "99_result/result_payload_pre_send.json", payload_for_diag)
+                await self.send_result(ws, job, payload_for_diag)
+                await flush_diag_tasks()
+                await asyncio.to_thread(diag.finalize_zip, payload_for_diag, None)
+                await self.on_job_complete(ws)
+            except Exception as exc:  # noqa: BLE001
+                traceback.print_exc()
+                payload_for_diag = {
+                    "job_id": job["job_id"], "order_id": job.get("order_id"),
+                    "job_kind": "hanging_supplement_render", "supplement": True,
+                    "selected_wall_ids": job.get("target_wall_ids") or [],
+                    "status": "failed", "exit_code": "FAILED_SUPPLEMENT_RENDER",
+                    "candidates": [], "not_recommended": [], "partial_review_images": [],
+                    "error": str(exc), "metrics": {"render_provider": render_provider},
+                }
+                await self.send_result(ws, job, payload_for_diag)
+                await flush_diag_tasks()
+                await asyncio.to_thread(diag.finalize_zip, payload_for_diag, exc)
+                await self.on_job_complete(ws)
+            finally:
+                if job_id:
+                    self._executed_jobs.add(job_id)
+
     async def run_job(self, ws, job) -> None:
         job_id = job.get("job_id")
         if job_id and job_id in self._executed_jobs:
             print(f"[worker] duplicate job_id={job_id} — skipping (already executed)", flush=True)
             await ws.send(json.dumps({"type": "job_skipped", "job_id": job_id, "instance_id": INSTANCE_ID, "reason": "duplicate"}))
+            return
+        if job.get("job_kind") == "hanging_supplement_render" or job.get("supplement") is True:
+            await self.run_supplement_job(ws, job)
             return
         print(f"[worker-debug] job_received job_id={job.get('job_id')} order_id={job.get('order_id')} r2_prefix={job.get('r2_output_prefix')}", flush=True)
         await self.on_job_received(job["job_id"])
@@ -508,6 +597,14 @@ class Worker:
                 )
                 diag_later(diag.copy_file, hanging_zip, "04_hanging/hanging_result.zip")
                 diag_later(diag.extract_zip, hanging_zip, "04_hanging/extracted")
+                hanging_artifact_url = None
+                hanging_artifact_key = None
+                try:
+                    hanging_artifact_key = f"{job['r2_output_prefix'].rstrip('/')}/artifacts/hanging_result.zip"
+                    hanging_artifact_url = await asyncio.to_thread(r2_upload.upload_file, hanging_zip, hanging_artifact_key)
+                    print(f"[worker-debug] persisted hanging_result_zip={hanging_artifact_url}", flush=True)
+                except Exception as artifact_exc:
+                    print(f"[worker] hanging_result.zip persist skipped: {artifact_exc}", flush=True)
                 client_res = await asyncio.to_thread(pipeline.extract_client_result, hanging_zip)
                 diag_later(diag.write_json, "04_hanging/client_result.json", client_res)
                 await self.progress(
@@ -541,6 +638,10 @@ class Worker:
                 diag_later(diag.write_json, "06_r2_upload/r2_result.json", r2_result)
 
                 payload_for_diag = result_builder.build(client_res, render_aggregate, r2_result, job)
+                if hanging_artifact_url:
+                    payload_for_diag["hanging_result_zip_url"] = hanging_artifact_url
+                if hanging_artifact_key:
+                    payload_for_diag["hanging_result_zip_key"] = hanging_artifact_key
                 diag_later(diag.write_json, "99_result/result_payload_pre_send.json", payload_for_diag)
                 await self.send_result(ws, job, payload_for_diag)
                 await flush_diag_tasks()

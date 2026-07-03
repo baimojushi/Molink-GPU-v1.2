@@ -30,6 +30,12 @@ def _download(url: str, dest: Path) -> Path:
     return dest
 
 
+def download_to_path(url: str, dest: Path) -> Path:
+    """Download a persisted artifact such as hanging_result.zip for supplement render jobs."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    return _download(url, dest)
+
+
 def fetch_inputs(job: Dict[str, Any], work_dir: Path) -> Dict[str, Path]:
     work_dir.mkdir(parents=True, exist_ok=True)
     room = _download(job["room_image_url"], work_dir / "room.jpg")

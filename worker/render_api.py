@@ -86,6 +86,8 @@ def _default_args():
         seed=None,
         safety_tolerance=None,
         limit=None,
+        wall_ids=None,
+        candidate_ids=None,
         dual_ab_compare=False,
         dual_ab_compare_limit=1,
         qa_core_erode_px=1,
@@ -103,7 +105,7 @@ def _default_args():
         render_prompt_upsampling=None,
         render_mask_scope=os.getenv("MOLINK_RENDER_MASK_SCOPE", "edit_region"),
     )
-def run_pipeline(result_zip: str, output_dir: str, provider: str = "apiyi_gpt_image2_vip", limit: int | None = None) -> Dict[str, Any]:
+def run_pipeline(result_zip: str, output_dir: str, provider: str = "apiyi_gpt_image2_vip", limit: int | None = None, target_wall_ids: list[str] | None = None, target_candidate_ids: list[str] | None = None) -> Dict[str, Any]:
     args = _default_args()
     # 调用者覆盖：必要字段 + worker 层有意与脚本默认不同的字段
     args.hanging_zip = str(result_zip)
@@ -123,4 +125,10 @@ def run_pipeline(result_zip: str, output_dir: str, provider: str = "apiyi_gpt_im
     args.qa_max_forbidden_outer_guard_changed_ratio = float(os.getenv("MOLINK_FLUX_QA_MAX_FORBIDDEN_OUTER_GUARD_CHANGED_RATIO", "0.65"))
     if limit is not None:
         args.limit = limit
+    # 用户等待页选择非首选墙后的补渲染过滤条件。
+    # 只影响 render manifest 的 item 选择，不改变 Metric3D/Semantic/Hanging 时序。
+    if target_wall_ids:
+        args.wall_ids = [str(x) for x in target_wall_ids if str(x).strip()]
+    if target_candidate_ids:
+        args.candidate_ids = [str(x) for x in target_candidate_ids if str(x).strip()]
     return bfl.run_pipeline(args)

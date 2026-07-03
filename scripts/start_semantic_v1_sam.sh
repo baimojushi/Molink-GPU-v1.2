@@ -4,6 +4,12 @@ source /root/miniconda3/etc/profile.d/conda.sh 2>/dev/null || source ~/miniconda
 conda activate "${CONDA_ENV:-metric3d}"
 cd "${ROOT:-/opt/molink/hanging}"
 [ -f /opt/metric3d_api/.env.vlm_sam ] && source /opt/metric3d_api/.env.vlm_sam
+# Local dev: allow unauthenticated requests and set API_KEY from VLM_API_KEY
+[ -f .env ] && source .env
+export ALLOW_UNAUTH_LOCAL="${ALLOW_UNAUTH_LOCAL:-1}"
+if [ -z "${API_KEY:-}" ] && [ -n "${VLM_API_KEY:-}" ]; then
+    export API_KEY="$VLM_API_KEY"
+fi
 # Fix: OMP_NUM_THREADS=0 causes OpenMP/PyTorch undefined behavior in SAM inference
 export OMP_NUM_THREADS="4"
 export SEMANTIC_MVP_PORT="${SEMANTIC_MVP_PORT:-6011}"

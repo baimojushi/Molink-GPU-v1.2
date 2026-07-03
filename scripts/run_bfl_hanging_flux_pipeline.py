@@ -67,6 +67,32 @@ def _safe_name(value: str) -> str:
     return "".join(ch if ch.isalnum() or ch in "_.-" else "_" for ch in str(value)).strip("_") or "item"
 
 
+
+def _filter_manifest_items(items: list[dict[str, Any]], args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Filter render manifest items by wall_id / candidate_id for user supplement renders."""
+    wall_ids = {str(x).strip() for x in (getattr(args, "wall_ids", None) or []) if str(x).strip()}
+    candidate_ids = {str(x).strip() for x in (getattr(args, "candidate_ids", None) or []) if str(x).strip()}
+    if not wall_ids and not candidate_ids:
+        return items, {"enabled": False, "wall_ids": [], "candidate_ids": [], "input_count": len(items), "output_count": len(items)}
+    filtered = []
+    for item in items:
+        wall_id = str((item or {}).get("wall_id") or "").strip()
+        candidate_id = str((item or {}).get("candidate_id") or "").strip()
+        asset_id = str((item or {}).get("asset_id") or "").strip()
+        if wall_ids and wall_id in wall_ids:
+            filtered.append(item)
+            continue
+        if candidate_ids and (candidate_id in candidate_ids or asset_id in candidate_ids):
+            filtered.append(item)
+    return filtered, {
+        "enabled": True,
+        "wall_ids": sorted(wall_ids),
+        "candidate_ids": sorted(candidate_ids),
+        "input_count": len(items),
+        "output_count": len(filtered),
+    }
+
+
 def _extract_zip(zip_path: Path, work_dir: Path) -> Path:
     with zipfile.ZipFile(zip_path, "r") as z:
         z.extractall(work_dir)
@@ -1359,8 +1385,10 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         extracted = _extract_zip(Path(args.hanging_zip).resolve(), Path(td))
         manifest = _load_manifest(extracted)
         items = manifest.get("items", [])
+        items, filter_meta = _filter_manifest_items(items, args)
         if args.limit is not None:
             items = items[: args.limit]
+            filter_meta["limited_count"] = len(items)
         aggregate: dict[str, Any] = {
             "version": 2,
             "source_zip": str(Path(args.hanging_zip).resolve()),
@@ -1373,6 +1401,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             "manifest_scope": manifest.get("scope"),
             "manifest_version": manifest.get("version"),
             "input_item_count": len(items),
+            "manifest_filter": filter_meta,
             "erase_order": "original_room_then_hardpaste_after_erase",
             "flux2_mask_required": not using_apiyi_gpt_image2_vip,
             "flux2_mask_sent": not using_apiyi_gpt_image2_vip,
@@ -2034,6 +2063,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--no-render-prompt-upsampling", dest="render_prompt_upsampling", action="store_false", help="Disable provider-side prompt upsampling for final render.")
     parser.add_argument("--render-mask-scope", default=os.getenv("MOLINK_RENDER_MASK_SCOPE", "edit_region"), choices=["art_only", "front_only", "edit_region"], help="Final render mask scope: art_only forbids edits outside the mounted artwork object; front_only restricts to the visible front face; edit_region keeps the legacy wider halo.")
     parser.add_argument("--limit", type=int, default=None, help="Process only first N approved items after manifest selection")
+    parser.add_argument("--wall-id", dest="wall_ids", action="append", default=None, help="Only render manifest items matching this wall_id. May be repeated.")
+    parser.add_argument("--candidate-id", dest="candidate_ids", action="append", default=None, help="Only render manifest items matching this candidate_id or asset_id. May be repeated.")
     parser.add_argument("--dual-ab-compare", action="store_true", help="For safe dual_erased_room_plus_target items, also render a single-input baseline for validation.")
     parser.add_argument("--dual-ab-compare-limit", type=int, default=1, help="Maximum safe dual-mode items to render with the extra single-input A/B baseline.")
     parser.add_argument("--qa-core-erode-px", type=int, default=int(os.getenv("MOLINK_FLUX_QA_CORE_ERODE_PX", "1")))

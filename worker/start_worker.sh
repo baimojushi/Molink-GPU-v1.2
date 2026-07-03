@@ -17,6 +17,8 @@ export MOLINK_WS_URL="${MOLINK_WS_URL:-wss://www.molink.art/api/gpu/worker-conne
 export GPU_MODEL="${GPU_MODEL:-TITAN Xp}"
 export GPU_COUNT="${GPU_COUNT:-1}"
 export PYTHONUNBUFFERED=1
+# Disable idle auto-shutdown for dev environment (set to 0 = never shutdown)
+export IDLE_TIMEOUT_S="${IDLE_TIMEOUT_S:-0}"
 
 mkdir -p "$APP/logs"
 

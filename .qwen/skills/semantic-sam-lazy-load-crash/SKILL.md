@@ -1,18 +1,57 @@
 ---
 name: semantic-sam-lazy-load-crash
-description: Semantic service crashes silently when SAM model loads during first request — OMP_NUM_THREADS=0 or uvicorn worker context conflict
+description: Semantic service startup and crash issues — auth 401/500, OMP_NUM_THREADS, SAM subprocess isolation, require_auth logic order
 source: auto-skill
 extracted_at: '2026-06-07T12:31:54.042Z'
-updated_at: '2026-06-07T21:00:00Z'
+updated_at: '2026-07-04T01:03:00Z'
 ---
 
 ## Symptom
 
-Semantic service (`:6011`) starts successfully, `/health` returns 200 with `sam.loaded: false`. On the first request that triggers SAM refinement (e.g., `sam_enable=1`), the uvicorn process exits silently — no error log, no OOM kill in dmesg.
+Semantic service (`:6011`) starts successfully, `/health` returns 200. On POST requests to `/parse_semantics_mvp`, returns 401 Unauthorized or 500 Internal Server Error, or the uvicorn process exits silently.
 
-## Root causes (two independent issues)
+## Issue 3: require_auth logic order causing 401 on all requests (FIXED 2026-07-04)
 
-### Issue 1: OMP_NUM_THREADS=0 (FIXED 2026-06-07)
+**Symptom**: All POST requests return `{"detail":"Unauthorized"}` (401) even though `ALLOW_UNAUTH_LOCAL=1` is set and `API_KEY` has a value.
+
+**Root cause**: `require_auth()` in `semantic_mvp/service.py` checked `API_KEY` emptiness BEFORE checking `ALLOW_UNAUTH_LOCAL`:
+
+```python
+# BROKEN: ALLOW_UNAUTH_LOCAL only effective when API_KEY is empty
+def require_auth(a):
+    if not API_KEY:
+        if ALLOW_UNAUTH_LOCAL:
+            return
+        raise HTTPException(500, "...")
+    if a != f"Bearer {API_KEY}":
+        raise HTTPException(401, "Unauthorized")  # ← hits this when API_KEY set but no auth header
+```
+
+Worker calls semantic without `Authorization` header. When `API_KEY` is set (from `VLM_API_KEY`), `require_auth` requires `Authorization: Bearer <key>` — which the worker never sends.
+
+**Fix applied** in `semantic_mvp/service.py`:
+```python
+# FIXED: ALLOW_UNAUTH_LOCAL checked first, bypasses all auth
+def require_auth(a):
+    if ALLOW_UNAUTH_LOCAL:
+        return
+    if not API_KEY:
+        raise HTTPException(500, "API_KEY is not configured; set ALLOW_UNAUTH_LOCAL=1 for local development")
+    if a != f"Bearer {API_KEY}":
+        raise HTTPException(401, "Unauthorized")
+```
+
+**Fix applied** in `scripts/start_semantic_v1_sam.sh`:
+```bash
+# Ensure ALLOW_UNAUTH_LOCAL and API_KEY are set for local dev
+[ -f .env ] && source .env
+export ALLOW_UNAUTH_LOCAL="${ALLOW_UNAUTH_LOCAL:-1}"
+if [ -z "${API_KEY:-}" ] && [ -n "${VLM_API_KEY:-}" ]; then
+    export API_KEY="$VLM_API_KEY"
+fi
+```
+
+## Issue 1: OMP_NUM_THREADS=0 (FIXED 2026-06-07)
 
 `OMP_NUM_THREADS=0` was set in the shell environment, causing OpenMP/PyTorch undefined behavior during SAM CUDA inference. This was the primary crash cause.
 

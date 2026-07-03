@@ -1161,17 +1161,7 @@ async def analyze_hanging_mvp(
     }
 
     try:
-        def _wall_mask_x_coverage(_walls):
-            intervals = []
-            max_right = 0
-            for _wobj in _walls:
-                ys, xs = np.where(_wobj["mask"] > 0)
-                if xs.size == 0:
-                    continue
-                x1 = int(xs.min())
-                x2 = int(xs.max()) + 1
-                intervals.append([x1, x2])
-                max_right = max(max_right, x2)
+        def _merge_x_intervals(intervals):
             if not intervals:
                 return 0.0, 0, []
             intervals.sort()
@@ -1182,21 +1172,59 @@ async def analyze_hanging_mvp(
                 else:
                     merged[-1][1] = max(merged[-1][1], x2)
             cov = float(sum(x2 - x1 for x1, x2 in merged)) / max(1.0, float(w))
-            return cov, max_right, merged
+            return cov, max((x2 for _, x2 in merged), default=0), merged
+
+        def _wall_mask_x_coverage(_walls):
+            intervals = []
+            for _wobj in _walls:
+                ys, xs = np.where(_wobj["mask"] > 0)
+                if xs.size == 0:
+                    continue
+                intervals.append([int(xs.min()), int(xs.max()) + 1])
+            return _merge_x_intervals(intervals)
+
+        def _wall_bbox_x_coverage(_walls):
+            intervals = []
+            for _wobj in _walls:
+                box = _wobj.get("bbox_xyxy_processed") or []
+                if not isinstance(box, (list, tuple)) or len(box) != 4:
+                    continue
+                try:
+                    x1 = int(max(0, min(w - 1, round(float(box[0])))))
+                    x2 = int(max(0, min(w, round(float(box[2])))))
+                except Exception:
+                    continue
+                if x2 > x1:
+                    intervals.append([x1, x2])
+            return _merge_x_intervals(intervals)
 
         semantic_wall_coverage, semantic_wall_max_right, semantic_wall_intervals = _wall_mask_x_coverage(walls)
+        semantic_wall_bbox_coverage, semantic_wall_bbox_max_right, semantic_wall_bbox_intervals = _wall_bbox_x_coverage(walls)
         auto_multiwall_debug["semantic_wall_coverage_ratio"] = semantic_wall_coverage
         auto_multiwall_debug["semantic_wall_max_right_x"] = semantic_wall_max_right
         auto_multiwall_debug["semantic_wall_x_intervals"] = semantic_wall_intervals
+        auto_multiwall_debug["semantic_wall_bbox_coverage_ratio"] = semantic_wall_bbox_coverage
+        auto_multiwall_debug["semantic_wall_bbox_max_right_x"] = semantic_wall_bbox_max_right
+        auto_multiwall_debug["semantic_wall_bbox_x_intervals"] = semantic_wall_bbox_intervals
         semantic_multiwall_adequate = (
             len(walls) >= 2
             and semantic_wall_coverage >= 0.70
             and semantic_wall_max_right >= int(w * 0.82)
         )
+        semantic_bbox_multiwall_adequate = (
+            len(walls) >= 2
+            and semantic_wall_bbox_coverage >= 0.70
+            and semantic_wall_bbox_max_right >= int(w * 0.82)
+        )
 
-        if len(walls) >= 2 and semantic_multiwall_adequate:
+        if len(walls) >= 2 and (semantic_multiwall_adequate or semantic_bbox_multiwall_adequate):
             auto_multiwall_debug["semantic_wall_count"] = len(walls)
-            auto_multiwall_debug["reason"] = "semantic_multiwall_preserved"
+            if semantic_multiwall_adequate:
+                auto_multiwall_debug["reason"] = "semantic_multiwall_preserved"
+            else:
+                auto_multiwall_debug["reason"] = "semantic_multiwall_preserved_bbox_mask_coordinate_mismatch_suspected"
+                auto_multiwall_debug["semantic_wall_reason"] = "mask_coverage_low_but_bbox_coverage_ok"
+                auto_multiwall_debug["used"] = False
         else:
             source_wall_mask = np.zeros((h, w), np.uint8)
             for _wobj in walls:

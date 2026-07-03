@@ -133,6 +133,8 @@ def _plan_to_candidate(plan: Dict[str, Any], rank: int, render_info: Dict[str, A
     return {
         "rank": rank,
         "wall_id": plan.get("wall_id"),
+        "candidate_id": plan.get("candidate_id"),
+        "asset_id": render_info.get("asset_id") or f"{plan.get('wall_id')}::{plan.get('candidate_id')}",
         "score": plan.get("score"),
         "risk_level": plan.get("risk_level"),
         "reason_tags": plan.get("reason_tags", []),
