@@ -26,4 +26,13 @@ if [ -f "$ROOT/.env.bfl" ]; then
   source "$ROOT/.env.bfl"
 fi
 
+# Local dev: allow unauthenticated requests and set API_KEY from VLM_API_KEY
+if [ -f "$ROOT/.env" ]; then
+  source "$ROOT/.env"
+fi
+export ALLOW_UNAUTH_LOCAL="${ALLOW_UNAUTH_LOCAL:-1}"
+if [ -z "${API_KEY:-}" ] && [ -n "${VLM_API_KEY:-}" ]; then
+  export API_KEY="$VLM_API_KEY"
+fi
+
 exec python -m uvicorn hanging_mvp.service:app --host 0.0.0.0 --port "$HANGING_MVP_PORT"

@@ -2,7 +2,7 @@
 name: hanging-service-restart-after-patch
 description: All MVP services (semantic, hanging, metric3d) and worker must restart after code patch deployment — each runs as a separate persistent process; patching one module requires restarting only its owning service, not the worker that calls it via HTTP
 source: auto-skill
-extracted_at: '2026-06-08T00:30:00.000Z'
+extracted_at: '2026-07-04T07:19:26.675Z'
 ---
 
 # Service Restart After Patch Deployment
@@ -17,6 +17,8 @@ After deploying code patches, services continue running old bytecode. Each servi
 - **worker** — `worker/main.py` (calls semantic/hanging via HTTP)
 
 **Critical:** The worker calls semantic/hanging services **via HTTP**, not via direct imports. Patching `semantic_mvp/*.py` requires restarting the **semantic service**, NOT the worker. Restarting only the worker after a semantic patch is a no-op.
+
+**Stale-process symptom (job_7fc575a0):** Hanging service returns HTTP 500 with no traceback in logs. Root cause: hanging process started before patch deployment, running old code incompatible with new request schema. Uvicorn access log shows `500 Internal Server Error` but uvicorn error log is silent — the crash happens inside the route handler before logging.
 
 ## Architecture
 
@@ -51,17 +53,22 @@ The worker is a GPU-bound orchestrator. Semantic/hanging/metric3d are independen
 
 ### Restart specific service
 ```bash
+# Preferred: pkill + direct script restart
+pkill -f 'hanging_mvp.service|start_hanging' 2>/dev/null; sleep 1
+cd /opt/molink/hanging && bash scripts/start_hanging_v1.sh > logs/hanging.log 2>&1 &
+
+pkill -f 'semantic_mvp.service|start_semantic' 2>/dev/null; sleep 1
+cd /opt/molink/hanging && bash scripts/start_semantic_v1_sam.sh > logs/semantic.log 2>&1 &
+
+pkill -f 'worker.main|worker/start_worker.sh' 2>/dev/null; sleep 1
+cd /opt/molink/hanging && bash worker/start_worker.sh > logs/worker.log 2>&1 &
+```
+
+Or use the manager script:
+```bash
 bash /opt/molink/hanging/manage_all_mvp_apis.sh restart semantic
 bash /opt/molink/hanging/manage_all_mvp_apis.sh restart hanging
 bash /opt/molink/hanging/manage_all_mvp_apis.sh restart metric3d
-```
-
-### Restart worker only
-```bash
-pkill -f 'worker.main|worker/start_worker.sh' || true
-: > /opt/molink/hanging/logs/worker.log
-cd /opt/molink/hanging
-bash /opt/molink/hanging/worker/start_worker.sh
 ```
 
 ### Restart all services
