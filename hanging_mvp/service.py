@@ -25,6 +25,7 @@ from .hardpaste import load_rgba, warp_artwork_mount_to_geometry, warp_artwork_t
 from .debug_assets import png_bytes as debug_png_bytes, mask_preview, build_wall_debug_overlay, draw_rejected_wall_overlay
 from .client_result import build_client_result
 from semantic_mvp.debug_assets import draw_semantic_wall_debug
+from semantic_mvp.vlm_client import parse_artwork_frame_with_vlm
 from .rules_access import parse_json, rule_value
 from .numeric_utils import _safe_percentile, _mask_bbox, _clamp01
 from .structural_clearance import _candidate_structural_clearance
@@ -93,6 +94,39 @@ def _union_masks_for_shape(items: List[Mapping[str, Any]], shape_hw: tuple[int, 
     return out if np.any(out) else None
 
 
+def _analyze_artwork_image_with_vlm(artwork_raw: bytes, art_rgba: np.ndarray, seed_analysis: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Inspect the artwork image itself for frame/surface/thickness policy.
+
+    The semantic room parser only sees the room photo.  Product artwork image
+    traits must be inferred from ``artwork_image`` here; otherwise every artwork
+    falls back to ``uncertain`` and the renderer always uses the default side
+    thickness.  Fail closed to the prior seed/default analysis so hanging never
+    depends on VLM availability.
+    """
+    base = dict(seed_analysis or {})
+    if not _truthy_env("ARTWORK_FRAME_VLM_ENABLED", "1"):
+        base.setdefault("enabled", False)
+        base.setdefault("status", "disabled")
+        base.setdefault("reason", "ARTWORK_FRAME_VLM_ENABLED is disabled")
+        return base
+    try:
+        h, w = art_rgba.shape[:2]
+        mode = os.getenv("ARTWORK_FRAME_VLM_MODE", os.getenv("VLM_MODE", "auto"))
+        result = parse_artwork_frame_with_vlm(artwork_raw, mode, int(w), int(h))
+        merged = {**base, **(result or {})}
+        merged.setdefault("enabled", True)
+        merged.setdefault("source", "artwork_image_vlm")
+        return merged
+    except Exception as exc:
+        base.update({
+            "enabled": True,
+            "source": base.get("source") or "artwork_image_vlm",
+            "status": "error",
+            "reason": f"artwork_frame_vlm_failed: {exc}",
+        })
+        return base
+
+
 def _semantic_light_fields(semantics: Mapping[str, Any]) -> dict[str, Any]:
     raw = semantics.get("light") if isinstance(semantics, Mapping) else None
     if not isinstance(raw, Mapping):
@@ -155,6 +189,46 @@ def _estimate_artwork_visual_complexity(art_rgba: np.ndarray) -> float | None:
     except Exception:
         return None
 
+
+
+def _artwork_analysis_needs_runtime_vlm(analysis: Mapping[str, Any] | None) -> bool:
+    if not isinstance(analysis, Mapping) or not analysis:
+        return True
+    status = str(analysis.get("status") or "").strip().lower()
+    source = str(analysis.get("source") or "").strip().lower()
+    if status in {"ok", "uncertain"} and source not in {"", "semantic_service"}:
+        return False
+    return status in {"", "not_requested", "disabled"}
+
+
+def _build_runtime_artwork_analysis_from_vlm(artwork_raw: bytes, vlm_mode: str = "auto") -> dict[str, Any]:
+    try:
+        art_img = ImageOps.exif_transpose(Image.open(io.BytesIO(artwork_raw))).convert("RGB")
+        art_w, art_h = art_img.size
+        analysis = parse_artwork_frame_with_vlm(artwork_raw, vlm_mode, int(art_w), int(art_h))
+        if isinstance(analysis, dict):
+            analysis.setdefault("source", "hanging_runtime_artwork_vlm")
+            analysis.setdefault("enabled", True)
+            analysis.setdefault("artwork_image_size", [int(art_w), int(art_h)])
+            return analysis
+        raise RuntimeError("parse_artwork_frame_with_vlm returned non-object")
+    except Exception as exc:
+        return {
+            "enabled": True,
+            "source": "hanging_runtime_artwork_vlm",
+            "status": "error",
+            "has_frame": None,
+            "confidence": 0.0,
+            "frame_style": "uncertain",
+            "artwork_surface_style": "uncertain",
+            "side_thickness_policy": "normal",
+            "frame_width_ratio": {"left": 0.0, "right": 0.0, "top": 0.0, "bottom": 0.0},
+            "dominant_edge_colors_rgb": {"left": [0, 0, 0], "right": [0, 0, 0], "top": [0, 0, 0], "bottom": [0, 0, 0]},
+            "should_precompose_frame_sides": False,
+            "mood_register": None,
+            "visual_complexity": None,
+            "reason": f"artwork_frame_vlm_failed_at_hanging: {exc}",
+        }
 
 def _augment_artwork_analysis_with_pix(artwork_analysis: Mapping[str, Any], art_rgba: np.ndarray) -> dict[str, Any]:
     out = dict(artwork_analysis or {})
@@ -1034,7 +1108,8 @@ async def analyze_hanging_mvp(
     ceiling_masks_for_causal = masks_by_label(objects, {"roof", "ceiling"})
     structural_forbidden_labels = set(rules.get("forbidden_classes", ["window", "door", "arch", "opening", "tv", "mirror", "lamp", "track_lighting"]))
     existing_content_labels = set(rules.get("existing_content_classes", ["existing_art", "painting", "poster", "framed_art", "wall_clutter", "wall_label", "hook", "nail", "small_shelf", "green_board", "notice_board"]))
-    artwork_analysis = semantics.get("artwork_analysis") if isinstance(semantics.get("artwork_analysis"), dict) else {}
+    seed_artwork_analysis = semantics.get("artwork_analysis") if isinstance(semantics.get("artwork_analysis"), dict) else {}
+    artwork_analysis = _analyze_artwork_image_with_vlm(artwork_raw, art_rgba, seed_artwork_analysis)
     artwork_analysis = _augment_artwork_analysis_with_pix(artwork_analysis, art_rgba)
     resolved_artwork_has_frame, artwork_has_frame_source = _resolve_artwork_has_frame(rules, artwork_analysis)
 

@@ -15,7 +15,7 @@ import numpy as np
 
 from .metric_meta import read_sizes_from_metric3d_zip
 from .polygonize import bbox_to_polygon, scale_bbox, scale_polygon
-from .vlm_client import parse_with_vlm
+from .vlm_client import parse_with_vlm, parse_artwork_frame_with_vlm
 from .debug_assets import draw_semantic_wall_debug, png_bytes
 from .sam_refiner import coerce_optional_bool, get_sam_runtime_status, refine_objects_with_sam
 
@@ -667,6 +667,57 @@ def _sanitize_wall_bboxes_against_edge_structures(objects, processed_w, processe
             out.append(obj)
     return out, trims
 
+
+def _build_artwork_analysis_not_requested(reason: str) -> dict[str, Any]:
+    return {
+        "enabled": False,
+        "status": "not_requested",
+        "source": "semantic_service",
+        "has_frame": None,
+        "confidence": 0.0,
+        "frame_style": "uncertain",
+        "artwork_surface_style": "uncertain",
+        "side_thickness_policy": "normal",
+        "frame_width_ratio": {"left": 0.0, "right": 0.0, "top": 0.0, "bottom": 0.0},
+        "dominant_edge_colors_rgb": {"left": [0, 0, 0], "right": [0, 0, 0], "top": [0, 0, 0], "bottom": [0, 0, 0]},
+        "should_precompose_frame_sides": False,
+        "mood_register": None,
+        "visual_complexity": None,
+        "reason": reason,
+    }
+
+
+def _parse_artwork_analysis_for_semantics(
+    artwork_image: Optional[UploadFile],
+    artwork_vlm_enable: Optional[bool],
+    vlm_mode: str,
+) -> dict[str, Any]:
+    enabled = coerce_optional_bool(artwork_vlm_enable, "ARTWORK_VLM_ENABLE", True)
+    if not enabled:
+        return _build_artwork_analysis_not_requested("artwork_vlm_disabled")
+    if artwork_image is None:
+        return _build_artwork_analysis_not_requested("artwork_image_not_supplied")
+    try:
+        artwork_bytes = artwork_image.file.read()
+        if not artwork_bytes:
+            return _build_artwork_analysis_not_requested("artwork_image_empty")
+        art_img = ImageOps.exif_transpose(Image.open(io.BytesIO(artwork_bytes))).convert("RGB")
+        art_w, art_h = art_img.size
+        analysis = parse_artwork_frame_with_vlm(artwork_bytes, vlm_mode, int(art_w), int(art_h))
+        if isinstance(analysis, dict):
+            analysis.setdefault("enabled", True)
+            analysis.setdefault("source", "semantic_artwork_vlm")
+            analysis.setdefault("artwork_image_size", [int(art_w), int(art_h)])
+            return analysis
+        return _build_artwork_analysis_not_requested("artwork_vlm_returned_non_object")
+    except Exception as exc:
+        return {
+            **_build_artwork_analysis_not_requested(f"artwork_frame_vlm_failed: {exc}"),
+            "enabled": True,
+            "status": "error",
+            "source": "semantic_artwork_vlm",
+        }
+
 def _make_wall_id_for_bbox(box, processed_w, index):
     x1, _, x2, _ = box
     cx = 0.5 * (x1 + x2)
@@ -1217,8 +1268,10 @@ def health():
 async def parse_semantics_mvp(
     room_image: UploadFile = File(...),
     metric3d_zip: Optional[UploadFile] = File(None),
+    artwork_image: Optional[UploadFile] = File(None),
     scene_profile: str = Form("gallery"),
     vlm_mode: str = Form("auto"),
+    artwork_vlm_enable: Optional[bool] = Form(None),
     sam_enable: Optional[bool] = Form(None),
     sam_refine_labels: str = Form(""),
     sam_max_side: Optional[int] = Form(None),
@@ -1261,6 +1314,8 @@ async def parse_semantics_mvp(
         "skip_sam": False,
     }
 
+    artwork_analysis = _build_artwork_analysis_not_requested("artwork_image_not_supplied_or_artwork_vlm_disabled")
+
     if semantic_seed_json and str(semantic_seed_json).strip():
         try:
             seed_payload = json.loads(semantic_seed_json)
@@ -1272,6 +1327,12 @@ async def parse_semantics_mvp(
         out = _remap_objects_to_processed_space(seed_objects, processed_w, processed_h, sx, sy)
         bbox_coordinate_debug = seed_payload.get("vlm_bbox_coordinate_debug") or bbox_coordinate_debug
         sam_debug = seed_payload.get("sam_debug") or sam_debug
+        seed_artwork = seed_payload.get("artwork_analysis")
+        if isinstance(seed_artwork, dict):
+            artwork_analysis = dict(seed_artwork)
+        else:
+            artwork_analysis = _build_artwork_analysis_not_requested("semantic_seed_json_without_artwork_analysis")
+
         seed_debug = {
             "used": True,
             "input_coordinate_space": seed_payload.get("coordinate_space"),
@@ -1289,6 +1350,8 @@ async def parse_semantics_mvp(
             },
         }
     else:
+        artwork_analysis = _parse_artwork_analysis_for_semantics(artwork_image, artwork_vlm_enable, vlm_mode)
+
         # VLM sees the original image. Some providers still return normalized
         # visual coordinates, so normalize before any SAM or Metric3D alignment.
         raw = parse_with_vlm(image_bytes, scene_profile, vlm_mode, original_w, original_h)
@@ -1369,6 +1432,7 @@ async def parse_semantics_mvp(
         "multiwall_split_debug": multiwall_split_debug,
         "sam_debug": sam_debug,
         "semantic_seed_debug": seed_debug,
+        "artwork_analysis": artwork_analysis,
         "warnings": warnings
     }
     if light_payload:

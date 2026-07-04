@@ -55,13 +55,18 @@ def call_metric3d(room: Path, work_dir: Path) -> Path:
     return metric_zip
 
 
-def call_semantic(room: Path, metric_zip: Path, scene_profile: str, work_dir: Path) -> Path:
-    with open(room, "rb") as fr, open(metric_zip, "rb") as fz:
+def call_semantic(room: Path, metric_zip: Path, artwork: Path, scene_profile: str, work_dir: Path) -> Path:
+    with open(room, "rb") as fr, open(metric_zip, "rb") as fz, open(artwork, "rb") as fa:
         files = {
             "room_image": (room.name, fr, "image/jpeg"),
             "metric3d_zip": (metric_zip.name, fz, "application/zip"),
+            "artwork_image": (artwork.name, fa, "image/png"),
         }
-        data = {"scene_profile": scene_profile or "home", "vlm_mode": os.getenv("VLM_MODE", "auto")}
+        data = {
+            "scene_profile": scene_profile or "home",
+            "vlm_mode": os.getenv("VLM_MODE", "auto"),
+            "artwork_vlm_enable": os.getenv("ARTWORK_VLM_ENABLE", "1"),
+        }
         r = httpx.post(f"{SEMANTIC_URL}/parse_semantics_mvp", files=files, data=data, timeout=HTTP_TIMEOUT)
     r.raise_for_status()
     semantics_path = work_dir / "semantics.json"

@@ -580,7 +580,7 @@ class Worker:
 
                 await self.progress(ws, job, "semantic", "running", 35, "正在识别墙面与结构信息…")
                 scene_profile = (job.get("rules_overrides") or {}).get("scene_profile", "home")
-                semantics = await asyncio.to_thread(pipeline.call_semantic, inputs["room"], metric_zip, scene_profile, work_dir)
+                semantics = await asyncio.to_thread(pipeline.call_semantic, inputs["room"], metric_zip, inputs["artwork"], scene_profile, work_dir)
                 diag_later(diag.copy_file, semantics, "03_semantic/semantics.json")
 
                 semantic_payload = _safe_json_load(semantics)
