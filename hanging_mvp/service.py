@@ -2107,13 +2107,16 @@ async def analyze_hanging_mvp(
             continue
 
         floor_height_abs_m = float(floor_wall_estimation["floor_height_abs_m"])
+        floor_source_trusted = floor_source_is_metric_trusted(floor_wall_estimation.get("source"))
         if wall_id in wall_debug_registry:
             wall_debug_registry[wall_id]["floor_wall_estimation"] = floor_wall_estimation
             wall_debug_registry[wall_id]["summary"]["floor_wall_estimation_source"] = floor_wall_estimation.get("source")
+        if bool((rules.get("room_corner_floor_fit", {}) or {}).get("require_trusted_floor_for_auto_candidate", True)) and not floor_source_trusted:
+            rejected.append({"wall_id": wall_id, "reason": "trusted_wall_floor_intersection_required", "wall_has_no_safe_candidate": True, "floor_wall_estimation": floor_wall_estimation})
+            continue
         for axis_item in axes:
             axis_s = float(axis_item["axis_s_m"])
             support_context = _estimate_axis_support_context(objects, xyz, basis, axis_s, artwork_w_m, artwork_h_m, rules, floor_height_abs_m)
-            floor_source_trusted = floor_source_is_metric_trusted(floor_wall_estimation.get("source"))
             if not floor_source_trusted:
                 support_context.update({
                     "height_mode": "provisional_visual_review_required",
@@ -3363,6 +3366,5 @@ async def analyze_hanging_mvp(
             files[f"{wall_prefix}/debug_overlay_error.txt"] = str(e).encode("utf-8")
 
     return _zip_response(files)
-
 
 

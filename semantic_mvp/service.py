@@ -367,16 +367,48 @@ def _infer_vlm_bbox_coordinate_space(objects, original_w, original_h, vlm_image_
         normalized_1000_like
         and max_coord < max(1.0, min(float(original_w), float(original_h)) * 0.5)
     )
+    # Some providers ignore requested pixel dimensions and emit a 0..1000
+    # visual grid. Compare scene-boundary coverage under both hypotheses;
+    # do not let the current object inventory decide the coordinate space.
+    extent_boxes = []
+    for obj in objects or []:
+        vals = _valid_vlm_bbox_values(obj.get("bbox_xyxy") or obj.get("bbox") or [])
+        if vals is None:
+            continue
+        label = str(obj.get("label") or "").lower()
+        role = str(obj.get("role") or "").lower()
+        if label in {"wall", "floor", "roof", "ceiling"} or role in {"wall", "support"}:
+            extent_boxes.append(vals)
+    extent_boxes = extent_boxes or boxes
+    extent_max_x = max(v[2] for v in extent_boxes)
+    extent_max_y = max(v[3] for v in extent_boxes)
+    original_right_gap = abs(float(original_w) - extent_max_x) / max(1.0, float(original_w))
+    grid_right_gap = abs(1000.0 - extent_max_x) / 1000.0
+    original_bottom_gap = abs(float(original_h) - extent_max_y) / max(1.0, float(original_h))
+    grid_bottom_gap = abs(1000.0 - extent_max_y) / 1000.0
+    coverage_prefers_1000_grid = bool(normalized_1000_like and (
+        abs(float(original_w) - 1000.0) >= 70.0 or abs(float(original_h) - 1000.0) >= 70.0
+    ) and (
+        (extent_max_x >= 850.0 and grid_right_gap + 0.035 < original_right_gap)
+        or (extent_max_y >= 850.0 and grid_bottom_gap + 0.035 < original_bottom_gap)
+    ))
+    debug["coordinate_hypothesis_scores"] = {
+        "extent_max_x": float(extent_max_x), "extent_max_y": float(extent_max_y),
+        "original_right_gap_ratio": float(original_right_gap), "grid_right_gap_ratio": float(grid_right_gap),
+        "original_bottom_gap_ratio": float(original_bottom_gap), "grid_bottom_gap_ratio": float(grid_bottom_gap),
+        "coverage_prefers_1000_grid": coverage_prefers_1000_grid,
+    }
 
     if normalized_1000_like and (
         y_exceeds_original
         or looks_1000_tall
         or high_res_image_1000_grid
         or compact_1000_grid_on_original
+        or coverage_prefers_1000_grid
     ):
         debug.update({
             'source_coordinate_space': 'normalized_0_1000',
-            'reason': 'vlm_boxes_match_0_1000_coordinate_grid_not_original_or_sent_pixels',
+            'reason': 'vlm_boxes_match_0_1000_coordinate_grid_by_range_or_scene_boundary_coverage',
             'scale_x_to_original': float(original_w) / 1000.0,
             'scale_y_to_original': float(original_h) / 1000.0,
         })

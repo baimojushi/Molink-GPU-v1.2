@@ -357,13 +357,19 @@
     "log_unreviewed_block_reason": true
   },
   "room_corner_floor_fit": {
-    "implementation_status": "spec_only_not_enabled_in_production",
-    "enabled": false,
+    "implementation_status": "production",
+    "enabled": true,
     "min_valid_wall_planes": 2,
     "min_wall_normal_angle_deg": 15.0,
     "min_wall_ransac_inlier_ratio": 0.6,
     "max_corner_gravity_angle_deg": 15.0,
     "floor_side_extent_percentile": 3.0,
+    "min_floor_points": 500,
+    "floor_ransac_iterations": 700,
+    "floor_ransac_threshold_m": 0.04,
+    "min_floor_ransac_inlier_ratio": 0.6,
+    "min_wall_floor_normal_angle_deg": 75.0,
+    "require_trusted_floor_for_auto_candidate": true,
     "floor_line_sampling": "wall RANSAC inlier points projected along g_hat_cam; use p3 floor-side extent; never treat visible safe-mask bottom as a finalized metric floor",
     "single_wall_degrade": "height_band_base=unknown; metric_height_finalized=false; requires_visual_height_selection=true",
     "visual_center_band_base": "estimated_full_wall_height_m_only_never_visible_safe_mask_height"

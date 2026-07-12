@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional
 import cv2
 import numpy as np
 
-from .geometry import points_from_mask
+from .geometry import fit_plane_ransac, points_from_mask
 from .numeric_utils import _safe_percentile
 from .rules_access import rule_value
 
@@ -52,6 +52,7 @@ def _estimate_floor_wall_intersection(
 
     debug: Dict[str, Any] = {
         "priority": [
+            "wall_floor_plane_intersection",
             "floor_mask_projected_to_current_wall_plane",
             "solid_wall_mask_bottom_percentile",
             "visible_wall_bottom_percentile_fallback",
@@ -82,6 +83,36 @@ def _estimate_floor_wall_intersection(
     if floor_mask is not None:
         floor_pts = points_from_mask(xyz, floor_mask, max_points=max_floor_points)
         floor_pts = floor_pts[np.isfinite(floor_pts).all(axis=1)] if floor_pts.size else floor_pts
+        fit_cfg = dict(rules.get("room_corner_floor_fit", {}) or {})
+        fit_attempt = {"source": "wall_floor_plane_intersection", "raw_floor_points": int(len(floor_pts))}
+        if bool(fit_cfg.get("enabled", True)) and len(floor_pts) >= int(fit_cfg.get("min_floor_points", 500)):
+            try:
+                threshold = float(fit_cfg.get("floor_ransac_threshold_m", 0.04))
+                floor_plane, inlier_ratio = fit_plane_ransac(floor_pts, iterations=int(fit_cfg.get("floor_ransac_iterations", 700)), threshold=threshold)
+                floor_n = np.array(floor_plane.n, np.float32); floor_d = float(floor_plane.d)
+                if float(np.dot(floor_n, g_hat)) < 0.0: floor_n, floor_d = -floor_n, -floor_d
+                gravity_angle = float(np.degrees(np.arccos(np.clip(abs(np.dot(floor_n, g_hat)), 0.0, 1.0))))
+                wall_floor_angle = float(np.degrees(np.arccos(np.clip(abs(np.dot(floor_n, n)), 0.0, 1.0))))
+                denom = float(np.dot(floor_n, v)); s_ref = float(0.5 * (s_min + s_max))
+                rejects = []
+                if inlier_ratio < float(fit_cfg.get("min_floor_ransac_inlier_ratio", 0.60)): rejects.append("floor_plane_inlier_ratio_below_threshold")
+                if gravity_angle > float(fit_cfg.get("max_corner_gravity_angle_deg", 15.0)): rejects.append("floor_plane_not_gravity_aligned")
+                if wall_floor_angle < float(fit_cfg.get("min_wall_floor_normal_angle_deg", 75.0)): rejects.append("wall_floor_planes_not_near_perpendicular")
+                if abs(denom) < 0.75: rejects.append("wall_vertical_axis_nearly_parallel_to_floor")
+                fit_attempt.update({"floor_ransac_inlier_ratio": float(inlier_ratio), "floor_normal_to_gravity_angle_deg": gravity_angle, "wall_floor_normal_angle_deg": wall_floor_angle, "reject_reasons": rejects})
+                if not rejects:
+                    t_floor = -float(np.dot(floor_n, origin + u * s_ref) + floor_d) / denom
+                    dt_ds = -float(np.dot(floor_n, u)) / denom
+                    debug["attempts"].append(dict(fit_attempt, status="accepted"))
+                    return _finish("wall_floor_plane_intersection", t_floor, int(len(floor_pts)), {
+                        "metric_trusted": True,
+                        "floor_plane": {"n": [float(x) for x in floor_n], "d": floor_d, "ransac_inlier_ratio": float(inlier_ratio)},
+                        "intersection_line_wall_coordinates": {"s_reference_m": s_ref, "t_at_reference_m": float(t_floor), "dt_ds": float(dt_ds)},
+                        "floor_normal_to_gravity_angle_deg": gravity_angle, "wall_floor_normal_angle_deg": wall_floor_angle,
+                    })
+            except Exception as exc:
+                fit_attempt.update({"status": "error", "error": str(exc)})
+        debug["attempts"].append(fit_attempt)
         attempt = {
             "source": "floor_mask_projected_to_current_wall_plane",
             "raw_floor_points": int(len(floor_pts)),
