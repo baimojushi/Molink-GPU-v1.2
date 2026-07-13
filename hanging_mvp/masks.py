@@ -25,20 +25,29 @@ _LABEL_ALIASES = {
     "notice board": "notice_board",
     "label": "wall_label",
     "sign": "wall_label",
+    "wall sign": "wall_label",
+    "small sign": "small_sign",
     "signage": "wall_label",
     "people": "person",
     "human": "person",
     "man": "person",
     "woman": "person",
     "visitor": "person",
+    "wall mounted shelf": "wall_mounted_shelf",
+    "wall-mounted shelf": "wall_mounted_shelf",
+    "built in shelf": "built_in_shelf",
+    "built-in shelf": "built_in_shelf",
+    "book shelf": "bookshelf",
+    "counter fixture": "counter_fixture",
 }
 
+
 _KNOWN_CANONICAL_LABELS = {
-    "wall", "floor", "roof", "sofa", "table", "cabinet", "window", "door", "tv", "mirror",
+    "wall", "floor", "roof", "sofa", "table", "cabinet", "shelf", "wall_mounted_shelf", "built_in_shelf", "storage", "counter_fixture", "counter", "appliance", "bookcase", "bookshelf", "rack", "window", "door", "tv", "mirror",
     "lamp", "track_lighting", "arch", "opening", "existing_art", "painting", "poster",
     "framed_art", "artwork", "green_board", "notice_board", "wall_clutter", "wall_label",
     "hook", "nail", "small_shelf", "pedestal", "plinth", "display_stand",
-    "foreground_object", "person", "plant", "chair",
+    "foreground_object", "person", "plant", "chair", "sideboard", "small_sign", "signage", "sticker",
 }
 
 

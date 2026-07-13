@@ -15,7 +15,7 @@ from fastapi.responses import Response
 from PIL import Image, ImageOps
 
 from .metric3d_io import load_metric3d_zip
-from .masks import load_semantic_masks, masks_by_label, masks_by_role, semantic_label_matches
+from .masks import load_semantic_masks, masks_by_label, masks_by_role, semantic_label_matches, canonical_semantic_label
 from .geometry import (
     backproject, estimate_g_hat_from_floor_normals, estimate_g_hat_from_global_floor_like_normals,
     estimate_g_hat_from_horizontal_reference_normals, fit_plane_ransac, make_wall_basis,
@@ -75,6 +75,53 @@ def _clamp01_local(value: float) -> float:
         return float(max(0.0, min(1.0, float(value))))
     except Exception:
         return 0.0
+
+
+
+DEFAULT_REMOVABLE_EXISTING_CONTENT_LABELS = {
+    "existing_art", "painting", "poster", "framed_art", "artwork",
+    "wall_clutter", "wall_label", "hook", "nail", "green_board", "notice_board",
+    "small_sign", "signage", "sticker", "label",
+}
+
+DEFAULT_BLOCKING_EXISTING_CONTENT_LABELS = {
+    "small_shelf", "shelf", "wall_mounted_shelf", "built_in_shelf",
+    "cabinet", "storage", "counter_fixture", "counter", "appliance",
+    "bookcase", "bookshelf", "rack", "tv_stand", "sideboard",
+}
+
+
+def _rule_label_set(rules: Mapping[str, Any], path: list[str], default: set[str]) -> set[str]:
+    raw = rule_value(dict(rules or {}), path, None)
+    if isinstance(raw, (list, tuple, set)):
+        values = {canonical_semantic_label(x) for x in raw if str(x or "").strip()}
+    else:
+        values = set()
+    return values or {canonical_semantic_label(x) for x in default}
+
+
+def _classify_existing_content_object(
+    obj: Mapping[str, Any],
+    *,
+    removable_labels: set[str],
+    blocking_labels: set[str],
+) -> str:
+    """Classify existing_content for hanging safety.
+
+    Only flat wall visual elements (old art, posters, labels, hooks, nails) may
+    be cleaned and counted as wall support. Physical fixtures such as shelves
+    and cabinets occupy volume and must block placement instead of becoming
+    synthetic support.
+    """
+    label = canonical_semantic_label(obj.get("label"))
+    if label in blocking_labels or semantic_label_matches(label, blocking_labels):
+        return "blocking"
+    if label in removable_labels or semantic_label_matches(label, removable_labels):
+        return "removable"
+    # Keep old behavior for unknown existing_content labels unless rules expand
+    # the blocking list. This avoids over-rejecting harmless wall clutter while
+    # still hard-blocking known physical fixtures.
+    return "removable"
 
 
 def _union_masks_for_shape(items: List[Mapping[str, Any]], shape_hw: tuple[int, int]) -> np.ndarray | None:
@@ -1458,6 +1505,11 @@ async def analyze_hanging_mvp(
         ["existing_content_overlap_policy", "allow_cleanup_existing_content_as_wall_support"],
         True,
     ))
+    max_blocking_existing_overlap = float(rule_value(
+        rules,
+        ["existing_content_overlap_policy", "max_blocking_existing_content_overlap_ratio"],
+        0.02,
+    ))
     cleanup_trigger_overlap_ratio = float(rule_value(
         rules,
         ["cleanup_policy", "cleanup_required_overlap_ratio"],
@@ -1541,6 +1593,29 @@ async def analyze_hanging_mvp(
         o for o in objects.values()
         if o.get("role") == "existing_content" or semantic_label_matches(o.get("label"), existing_content_labels)
     ]
+    removable_existing_labels = _rule_label_set(
+        rules,
+        ["existing_content_overlap_policy", "removable_labels"],
+        DEFAULT_REMOVABLE_EXISTING_CONTENT_LABELS,
+    )
+    blocking_existing_labels = _rule_label_set(
+        rules,
+        ["existing_content_overlap_policy", "blocking_labels"],
+        DEFAULT_BLOCKING_EXISTING_CONTENT_LABELS,
+    )
+    removable_existing_masks = []
+    blocking_existing_masks = []
+    for _existing_obj in existing_masks:
+        _existing_kind = _classify_existing_content_object(
+            _existing_obj,
+            removable_labels=removable_existing_labels,
+            blocking_labels=blocking_existing_labels,
+        )
+        _existing_obj["existing_content_safety_class"] = _existing_kind
+        if _existing_kind == "blocking":
+            blocking_existing_masks.append(_existing_obj)
+        else:
+            removable_existing_masks.append(_existing_obj)
     # HANGING_POLICY_PATCH_V6_BEGIN_FOREGROUND_MASKS
     foreground_masks = [
         o for o in objects.values()
@@ -1553,6 +1628,9 @@ async def analyze_hanging_mvp(
         "source": "semantic_mvp.object_inventory",
         "per_wall_high_res_crop_used": bool(semantics.get("object_inventory", {}).get("per_wall_high_res_crop_used", False)),
         "existing_content_count": int(len(existing_masks)),
+        "removable_existing_content_count": int(len(removable_existing_masks)),
+        "blocking_existing_content_count": int(len(blocking_existing_masks)),
+        "blocking_existing_content_labels": sorted(blocking_existing_labels),
         "foreground_count": int(len(foreground_masks)),
         "counts_by_role": (semantics.get("object_inventory", {}) or {}).get("counts_by_role", {}),
         "counts_by_label": (semantics.get("object_inventory", {}) or {}).get("counts_by_label", {}),
@@ -2190,9 +2268,14 @@ async def analyze_hanging_mvp(
 
             existing_overlap_all_walls_raw = 0.0
             existing_overlap_on_candidate_wall = 0.0
+            removable_existing_overlap_on_candidate_wall = 0.0
+            blocking_existing_overlap_on_candidate_wall = 0.0
             existing_ids_on_candidate_wall = []
+            removable_existing_ids_on_candidate_wall = []
+            blocking_existing_ids_on_candidate_wall = []
             existing_ids_off_candidate_wall_ignored = []
             removable_existing_on_candidate_wall_mask = np.zeros_like(art_mask_poly, dtype=np.uint8)
+            blocking_existing_on_candidate_wall_mask = np.zeros_like(art_mask_poly, dtype=np.uint8)
             existing_content_wall_plane_max_dist_m = float(rule_value(rules, ["existing_content_overlap_policy", "wall_plane_max_distance_m"], 0.20))
             for em in existing_masks:
                 em_mask_bool = em["mask"] > 0
@@ -2202,6 +2285,11 @@ async def analyze_hanging_mvp(
                     continue
                 ov_all = float(overlap_count) / art_area
                 existing_overlap_all_walls_raw += ov_all
+                safety_class = str(em.get("existing_content_safety_class") or _classify_existing_content_object(
+                    em,
+                    removable_labels=removable_existing_labels,
+                    blocking_labels=blocking_existing_labels,
+                ))
 
                 # Candidate-wall scope: count only overlap that belongs to the current
                 # wall. Prefer direct wall-mask intersection; if the semantic wall mask
@@ -2220,18 +2308,35 @@ async def analyze_hanging_mvp(
                             classified_by = "near_current_wall_plane"
                 if candidate_wall_count > 0:
                     candidate_existing_bool = overlap_bool & ((wall_mask > 0) | (candidate_wall_count == overlap_count))
-                    removable_existing_on_candidate_wall_mask[candidate_existing_bool] = 255
-                    existing_overlap_on_candidate_wall += float(candidate_wall_count) / art_area
-                    existing_ids_on_candidate_wall.append({
+                    candidate_overlap_ratio = float(candidate_wall_count) / art_area
+                    existing_overlap_on_candidate_wall += candidate_overlap_ratio
+                    existing_info = {
                         "object_id": em.get("object_id"),
                         "label": em.get("label"),
-                        "overlap_ratio": float(candidate_wall_count) / art_area,
+                        "safety_class": safety_class,
+                        "overlap_ratio": candidate_overlap_ratio,
                         "classified_by": classified_by,
-                    })
+                    }
+                    existing_ids_on_candidate_wall.append(existing_info)
+                    if safety_class == "blocking":
+                        blocking_existing_on_candidate_wall_mask[candidate_existing_bool] = 255
+                        blocking_existing_overlap_on_candidate_wall += candidate_overlap_ratio
+                        blocking_existing_ids_on_candidate_wall.append({
+                            **existing_info,
+                            "action": "hard_reject_if_above_threshold",
+                        })
+                    else:
+                        removable_existing_on_candidate_wall_mask[candidate_existing_bool] = 255
+                        removable_existing_overlap_on_candidate_wall += candidate_overlap_ratio
+                        removable_existing_ids_on_candidate_wall.append({
+                            **existing_info,
+                            "action": "cleanup_only_can_count_as_wall_support",
+                        })
                 else:
                     existing_ids_off_candidate_wall_ignored.append({
                         "object_id": em.get("object_id"),
                         "label": em.get("label"),
+                        "safety_class": safety_class,
                         "overlap_ratio_raw": ov_all,
                         "ignored_reason": "not_on_current_candidate_wall",
                     })
@@ -2239,6 +2344,8 @@ async def analyze_hanging_mvp(
 
             removable_existing_in_art = (art_mask_poly > 0) & (removable_existing_on_candidate_wall_mask > 0)
             removable_existing_ratio = float(np.count_nonzero(removable_existing_in_art)) / art_area
+            blocking_existing_in_art = (art_mask_poly > 0) & (blocking_existing_on_candidate_wall_mask > 0)
+            blocking_existing_ratio = float(np.count_nonzero(blocking_existing_in_art)) / art_area
             effective_wall_inside_mask = (solid_wall_mask_u8 > 0)
             if allow_cleanup_existing_as_wall_support:
                 effective_wall_inside_mask = effective_wall_inside_mask | (removable_existing_on_candidate_wall_mask > 0)
@@ -2250,10 +2357,11 @@ async def analyze_hanging_mvp(
             valid = (art_mask_poly > 0) & np.isfinite(art_depth)
             valid_count = max(1, int(np.count_nonzero(valid)))
             # HANGING_POLICY_PATCH_V6_BEGIN_REMOVABLE_VISUAL_SUPPORT
-            # Existing content on the target wall and foreground people that are
-            # not within 15cm of the wall plane are visual cleanup/inpaint scope,
-            # not negative evidence against placement. They are removed from the
-            # depth/normal denominator and counted as effective wall support.
+            # Only removable flat wall content (old art/posters/labels/hooks) on
+            # the target wall can be visual cleanup/inpaint scope. Physical
+            # fixtures such as shelves/cabinets are handled by the independent
+            # blocking_existing_content_overlap hard gate below and must never
+            # be removed from support denominators or counted as wall support.
             _hpv6_wall_proximity_threshold_m = float(rule_value(rules, ["foreground_occlusion_policy", "wall_proximity_threshold_m"], 0.15))
             removable_existing_bool = np.zeros_like(valid, dtype=bool)
             removable_foreground_bool = np.zeros_like(valid, dtype=bool)
@@ -2262,7 +2370,7 @@ async def analyze_hanging_mvp(
             _hpv6_removable_foreground_ids = []
             _hpv6_close_wall_foreground_ids = []
             try:
-                for _hpv6_em in existing_masks:
+                for _hpv6_em in removable_existing_masks:
                     _hpv6_mask = _hpv6_em.get("mask")
                     if _hpv6_mask is None:
                         continue
@@ -2376,7 +2484,7 @@ async def analyze_hanging_mvp(
             if allow_cleanup_existing_as_wall_support:
                 effective_wall_support = effective_wall_support | (removable_existing_on_candidate_wall_mask > 0)
             effective_wall_support_ratio = float(np.count_nonzero((art_mask_poly > 0) & effective_wall_support)) / valid_count
-            cleanup_required = bool(existing_overlap_on_candidate_wall > cleanup_trigger_overlap_ratio)
+            cleanup_required = bool(removable_existing_overlap_on_candidate_wall > cleanup_trigger_overlap_ratio)
             safe_wall_support_mask = solid_wall_mask_u8.copy()
             if allow_cleanup_existing_as_wall_support:
                 safe_wall_support_mask[removable_existing_on_candidate_wall_mask > 0] = 255
@@ -2427,6 +2535,8 @@ async def analyze_hanging_mvp(
                 if struct_overlap > max_struct_forbidden:
                     reasons.append("structural_forbidden_overlap")
 
+            if blocking_existing_ratio > max_blocking_existing_overlap:
+                reasons.append("blocking_existing_content_overlap")
             if wall_support_gate.get("status") == "hard_reject":
                 reasons.append("insufficient_safe_wall_support")
             elif wall_support_gate.get("status") == "review":
@@ -2442,9 +2552,9 @@ async def analyze_hanging_mvp(
                     reasons.append("artwork_corner_support_below_hard_reject_threshold")
                 elif corner_support_min < min_corner_support_ratio:
                     soft_risk_reasons.append("artwork_corner_support_below_auto_pass_threshold")
-            # existing_content is metadata-only for filtering. It is intentionally
-            # not a reject reason here; future cleanup/inpaint will be scoped to the
-            # current target wall only.
+            # Existing_content is split by safety class: flat visual wall content
+            # may be cleaned on the current wall, but blocking physical fixtures
+            # (shelves/cabinets/storage) are hard placement blockers.
             if foreground_occlusion > max_occ:
                 soft_risk_reasons.append("foreground_occlusion_ratio_too_high")
             if plane_consistency_ratio < min_plane_consistency_ratio:
@@ -2493,7 +2603,11 @@ async def analyze_hanging_mvp(
                 "solid_wall_inside_ratio": solid_wall_inside,
                 "safe_wall_support_gate_ratio": wall_support_gate.get("safe_wall_support_gate_ratio"),
                 "wall_support_gate": wall_support_gate,
-                "candidate_reject_stage": "solid_wall_support_gate" if "insufficient_safe_wall_support" in reasons else ("edge_corner_support_gate" if any(r in reasons for r in ["artwork_edge_support_below_hard_reject_threshold", "artwork_corner_support_below_hard_reject_threshold"]) else None),
+                "candidate_reject_stage": (
+                    "blocking_existing_content_gate" if "blocking_existing_content_overlap" in reasons
+                    else ("solid_wall_support_gate" if "insufficient_safe_wall_support" in reasons
+                    else ("edge_corner_support_gate" if any(r in reasons for r in ["artwork_edge_support_below_hard_reject_threshold", "artwork_corner_support_below_hard_reject_threshold"]) else None))
+                ),
                 "candidate_reject_reason": reasons[0] if reasons else None,
                 "hard_gate_reasons": list(dict.fromkeys(wall_support_gate.get("hard_gate_reasons", []) + reasons)),
                 "non_solid_reason_breakdown": list(dict.fromkeys(wall_support_gate.get("non_solid_reason_breakdown", []))),
@@ -2508,7 +2622,7 @@ async def analyze_hanging_mvp(
                     "auto_pass_corner_support_ratio": float(min_corner_support_ratio),
                     "policy": "below_hard_reject_is_blocked_between_hard_and_auto_pass_is_review",
                 },
-                "wall_inside_ratio_policy": "solid_wall_plus_current_wall_removable_existing_content" if allow_cleanup_existing_as_wall_support else "solid_wall_only",
+                "wall_inside_ratio_policy": "solid_wall_plus_current_wall_removable_flat_existing_content_only" if allow_cleanup_existing_as_wall_support else "solid_wall_only",
                 "solid_component_debug": solid_component_debug,
                 "visible_wall_s_range_m": visible_wall_s_range_m,
                 "visible_wall_t_range_m": [float(visible_t_min), float(visible_t_max)],
@@ -2533,20 +2647,33 @@ async def analyze_hanging_mvp(
                 "max_existing_content_overlap_ratio_deprecated_not_used": float(max_existing),
                 "existing_content_ids_on_candidate_wall": existing_ids_on_candidate_wall,
                 "existing_content_ids_off_candidate_wall_ignored": existing_ids_off_candidate_wall_ignored,
-                "existing_content_policy": "candidate_wall_cleanup_then_render",
-                "existing_content_overlap_ignored_for_filtering": True,
-                "existing_content_as_effective_wall_support": bool(allow_cleanup_existing_as_wall_support),
+                "existing_content_policy": "removable_flat_wall_content_cleanup;blocking_physical_fixture_hard_reject",
+                "existing_content_overlap_ignored_for_filtering": False,
+                "existing_content_as_effective_wall_support": bool(allow_cleanup_existing_as_wall_support and removable_existing_ratio > 0.0),
                 "removable_existing_content_overlap_ratio": float(removable_existing_ratio),
+                "removable_existing_content_overlap_ratio_candidate_wall_raw": float(removable_existing_overlap_on_candidate_wall),
+                "removable_existing_content_ids_on_candidate_wall": removable_existing_ids_on_candidate_wall,
+                "blocking_existing_content_overlap_ratio": float(blocking_existing_ratio),
+                "blocking_existing_content_overlap_ratio_candidate_wall_raw": float(blocking_existing_overlap_on_candidate_wall),
+                "blocking_existing_content_ids_on_candidate_wall": blocking_existing_ids_on_candidate_wall,
+                "blocking_existing_content_gate": {
+                    "enabled": True,
+                    "max_overlap_ratio": float(max_blocking_existing_overlap),
+                    "overlap_ratio": float(blocking_existing_ratio),
+                    "passed": bool(blocking_existing_ratio <= max_blocking_existing_overlap),
+                    "policy": "shelf/cabinet/storage-like physical fixtures are not removable wall clutter and never count as wall support",
+                },
                 "cleanup": {
                     "enabled": cleanup_required,
                     "cleanup_required": cleanup_required,
                     "stage": "candidate_wall_cleanup_then_render",
                     "candidate_wall_scope_only": True,
-                    "cleanup_mask_definition": "art_region_mask ∩ current_wall_mask ∩ existing_content_mask",
-                    "protected_scope": "all pixels outside current candidate wall mask",
+                    "cleanup_mask_definition": "art_region_mask ∩ current_wall_mask ∩ removable_existing_content_mask",
+                    "protected_scope": "all pixels outside current candidate wall mask plus all blocking existing fixtures",
                     "off_wall_existing_content_protected": True,
+                    "blocking_existing_content_protected": True,
                     "mask_bbox_processed": _mask_bbox(removable_existing_on_candidate_wall_mask),
-                    "notes": "Existing artworks or wall clutter on the selected wall are removable visual content. Count them as effective wall support for placement, but pass their mask to cleanup/inpaint before hard paste. Never clear existing content on non-target walls.",
+                    "notes": "Only flat wall visual content such as old artwork, posters, labels, hooks or nails may be cleaned and counted as effective wall support. Shelves, cabinets and storage-like fixtures are protected and trigger a hard gate when overlapped.",
                 },
                 "foreground_occlusion_ratio": foreground_occlusion,
                 "foreground_excludes_plane_consistent": True,
@@ -2868,6 +2995,7 @@ async def analyze_hanging_mvp(
             "structural_forbidden_overlap_without_clearance_evidence",
             "projected_artwork_too_close_to_image_boundary",
             "component_edge_margin_below_threshold",
+            "blocking_existing_content_overlap",
         })
         projection_size_reasons = {
             "projected_artwork_width_too_small",
@@ -2990,7 +3118,7 @@ async def analyze_hanging_mvp(
             remove_mask = build_remove_mask_for_hardpaste(
                 art_region_mask=remove_scope_region,
                 current_wall_mask=wall_mask_for_cleanup,
-                existing_masks=existing_masks,
+                existing_masks=removable_existing_masks,
                 foreground_masks=foreground_masks,
                 original_size_wh=original_size_wh,
                 remove_foreground_global=remove_foreground_global,
@@ -3009,7 +3137,7 @@ async def analyze_hanging_mvp(
             mount_bbox_px = _binary_mask_bbox_xyxy(mount_mask) or front_bbox_px
             cleanup_semantic_types = _cleanup_semantic_types_from_remove_mask(
                 remove_mask=remove_mask,
-                existing_masks=existing_masks,
+                existing_masks=removable_existing_masks,
                 foreground_masks=foreground_masks,
                 original_size_wh=original_size_wh,
             )
@@ -3219,7 +3347,7 @@ async def analyze_hanging_mvp(
                 "enabled": True,
                 "stage": "original_room_cleanup_then_hardpaste_then_render",
                 "candidate_wall_scope_only": True,
-                "cleanup_mask_definition": "(current_wall_mask ∩ existing_content_mask) ∪ global foreground/person mask; art_region is not subtracted because erase runs before hard-paste",
+                "cleanup_mask_definition": "(current_wall_mask ∩ removable_existing_content_mask) ∪ global foreground/person mask; blocking shelves/cabinets are protected",
                 "foreground_person_global_cleanup_allowed": bool(remove_foreground_global),
                 "flux2_edit_mask_definition": "dilate(mount_mask, flux_render.edit_mask_dilate_px) and send to FLUX.2 as edit mask",
                 "flux2_edit_mask_dilate_px": int(flux2_edit_mask_dilate_px),

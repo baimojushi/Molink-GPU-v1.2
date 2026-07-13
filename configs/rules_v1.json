@@ -190,7 +190,19 @@
     "framed_art",
     "artwork",
     "green_board",
-    "notice_board"
+    "notice_board",
+    "shelf",
+    "wall_mounted_shelf",
+    "built_in_shelf",
+    "cabinet",
+    "storage",
+    "counter_fixture",
+    "counter",
+    "appliance",
+    "bookcase",
+    "bookshelf",
+    "rack",
+    "sideboard"
   ],
   "non_support_classes": [
     "pedestal",
@@ -248,8 +260,45 @@
       "value": 0.2
     },
     "off_wall_existing_content_protected": true,
-    "notes": "Existing artwork/wall clutter on the selected candidate wall is removable visual content: it can count as effective wall support and must be passed to cleanup/inpaint. Existing content outside the target wall remains protected.",
-    "allow_cleanup_existing_content_as_wall_support": true
+    "notes": "Only flat removable wall visuals can count as effective wall support. Physical fixtures such as shelves/cabinets/storage are blocking_existing_content and hard-reject if overlapped.",
+    "allow_cleanup_existing_content_as_wall_support": true,
+    "removable_labels": [
+      "existing_art",
+      "painting",
+      "poster",
+      "framed_art",
+      "artwork",
+      "wall_clutter",
+      "wall_label",
+      "hook",
+      "nail",
+      "green_board",
+      "notice_board",
+      "small_sign",
+      "signage",
+      "sticker",
+      "label"
+    ],
+    "blocking_labels": [
+      "small_shelf",
+      "shelf",
+      "wall_mounted_shelf",
+      "built_in_shelf",
+      "cabinet",
+      "storage",
+      "counter_fixture",
+      "counter",
+      "appliance",
+      "bookcase",
+      "bookshelf",
+      "rack",
+      "tv_stand",
+      "sideboard"
+    ],
+    "max_blocking_existing_content_overlap_ratio": {
+      "value": 0.02
+    },
+    "blocking_content_policy": "physical fixtures are hard placement blockers and must not be counted as wall support or included in cleanup masks"
   },
   "cleanup_policy": {
     "enabled": true,

@@ -19,6 +19,11 @@ SEMANTIC_URL = os.getenv("SEMANTIC_URL", "http://127.0.0.1:6011")
 HANGING_URL = os.getenv("HANGING_URL", "http://127.0.0.1:6010")
 
 HTTP_TIMEOUT = float(os.getenv("PIPELINE_HTTP_TIMEOUT_S", "600"))
+API_KEY = os.getenv("API_KEY", "")
+
+
+def _auth_headers() -> dict:
+    return {"Authorization": f"Bearer {API_KEY}"} if API_KEY else {}
 
 
 def _download(url: str, dest: Path) -> Path:
@@ -47,7 +52,7 @@ def call_metric3d(room: Path, work_dir: Path) -> Path:
     with open(room, "rb") as f:
         files = {"file": (room.name, f, "image/jpeg")}
         data = {"camera_json": "{}", "include_candidates": "true"}
-        r = httpx.post(f"{METRIC3D_URL}/analyze_geometry", files=files, data=data, timeout=HTTP_TIMEOUT)
+        r = httpx.post(f"{METRIC3D_URL}/analyze_geometry", files=files, data=data, timeout=HTTP_TIMEOUT, headers=_auth_headers())
     if r.status_code >= 400:
         raise RuntimeError(f"Metric3D HTTP {r.status_code}: {r.text[:1000]}")
     metric_zip = work_dir / "metric3d.zip"
@@ -67,7 +72,7 @@ def call_semantic(room: Path, metric_zip: Path, artwork: Path, scene_profile: st
             "vlm_mode": os.getenv("VLM_MODE", "auto"),
             "artwork_vlm_enable": os.getenv("ARTWORK_VLM_ENABLE", "1"),
         }
-        r = httpx.post(f"{SEMANTIC_URL}/parse_semantics_mvp", files=files, data=data, timeout=HTTP_TIMEOUT)
+        r = httpx.post(f"{SEMANTIC_URL}/parse_semantics_mvp", files=files, data=data, timeout=HTTP_TIMEOUT, headers=_auth_headers())
     r.raise_for_status()
     semantics_path = work_dir / "semantics.json"
     semantics_path.write_text(r.text, encoding="utf-8")
@@ -91,7 +96,7 @@ def call_hanging(
         data = {"semantics_json": semantics_path.read_text(encoding="utf-8")}
         if rules_json:
             data["rules_json"] = rules_json
-        r = httpx.post(f"{HANGING_URL}/analyze_hanging_mvp", files=files, data=data, timeout=HTTP_TIMEOUT)
+        r = httpx.post(f"{HANGING_URL}/analyze_hanging_mvp", files=files, data=data, timeout=HTTP_TIMEOUT, headers=_auth_headers())
     r.raise_for_status()
     hanging_zip = work_dir / "hanging_result.zip"
     hanging_zip.write_bytes(r.content)
