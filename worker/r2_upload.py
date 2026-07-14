@@ -7,7 +7,7 @@ from __future__ import annotations
 import mimetypes
 import os
 from pathlib import Path
-from typing import Dict, List
+from typing import Any, Dict, List
 
 import boto3
 from botocore.config import Config
@@ -77,10 +77,12 @@ def upload_file(local_path: Path, key: str) -> str:
     return _public_url(key)
 
 
-def upload_all(output_dir: Path, prefix: str) -> Dict[str, List[dict]]:
-    """上传 final_hd 与 partial_review，返回按 asset_id 索引的 URL 映射。"""
+def upload_all(output_dir: Path, prefix: str) -> Dict[str, Any]:
+    """上传 final_hd、Stage A 留档与 partial_review。"""
     output_dir = Path(output_dir)
     final_map: Dict[str, str] = {}
+    pre_styling_map: Dict[str, str] = {}
+    pre_styling_upload_errors: List[dict] = []
     partials: List[dict] = []
 
     final_dir = output_dir / "final_hd"
@@ -89,6 +91,18 @@ def upload_all(output_dir: Path, prefix: str) -> Dict[str, List[dict]]:
             asset_id = png.stem
             key = f"{prefix}/final_hd/{png.name}"
             final_map[asset_id] = upload_file(png, key)
+
+    pre_styling_dir = output_dir / "pre_styling_hd"
+    if pre_styling_dir.is_dir():
+        for png in sorted(pre_styling_dir.glob("*.png")):
+            asset_id = png.stem
+            key = f"{prefix}/pre_styling_hd/{png.name}"
+            try:
+                pre_styling_map[asset_id] = upload_file(png, key)
+            except Exception as exc:
+                # The Stage A archive is useful for comparison/future re-render,
+                # but its upload must never block delivery of the final image.
+                pre_styling_upload_errors.append({"asset_id": asset_id, "error": str(exc)})
 
     partial_dir = output_dir / "partial_review"
     if partial_dir.is_dir():
@@ -107,4 +121,9 @@ def upload_all(output_dir: Path, prefix: str) -> Dict[str, List[dict]]:
                 "delivery_role": "hardpaste_preview_fallback",
             })
 
-    return {"final_by_asset_id": final_map, "partial_review_images": partials}
+    return {
+        "final_by_asset_id": final_map,
+        "pre_styling_by_asset_id": pre_styling_map,
+        "pre_styling_upload_errors": pre_styling_upload_errors,
+        "partial_review_images": partials,
+    }

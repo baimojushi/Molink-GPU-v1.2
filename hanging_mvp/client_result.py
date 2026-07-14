@@ -292,8 +292,49 @@ def _reason_tags(candidate: Dict[str, Any]) -> List[str]:
     return base_tags[:5] or ["候选位置可用"]
 
 
+def _normalized_artwork_bbox(candidate: Dict[str, Any], original_size: Any) -> tuple[Any, str | None]:
+    """Return an original-image normalized artwork bbox for delivery presentation.
+
+    The hard-paste front mask is the most accurate source.  Candidates that did
+    not reach that export step fall back to their projected quadrilateral.
+    """
+    try:
+        width, height = float(original_size[0]), float(original_size[1])
+    except (TypeError, ValueError, IndexError):
+        return None, None
+    if width <= 0 or height <= 0:
+        return None, None
+
+    export = candidate.get("bfl_v7_export") if isinstance(candidate.get("bfl_v7_export"), dict) else {}
+    bbox = export.get("front_bbox_px") or export.get("bbox_px")
+    source = "front_bbox_px"
+    if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
+        projection = candidate.get("projection") if isinstance(candidate.get("projection"), dict) else {}
+        quad = projection.get("projected_quad_px_original")
+        if not isinstance(quad, (list, tuple)) or len(quad) < 3:
+            return None, None
+        try:
+            xs = [float(point[0]) for point in quad]
+            ys = [float(point[1]) for point in quad]
+        except (TypeError, ValueError, IndexError):
+            return None, None
+        bbox = [min(xs), min(ys), max(xs), max(ys)]
+        source = "projected_quad_px_original"
+
+    try:
+        x1, y1, x2, y2 = [float(value) for value in bbox[:4]]
+    except (TypeError, ValueError):
+        return None, None
+    x1, x2 = sorted((max(0.0, min(width, x1)), max(0.0, min(width, x2))))
+    y1, y2 = sorted((max(0.0, min(height, y1)), max(0.0, min(height, y2))))
+    if x2 - x1 < 1.0 or y2 - y1 < 1.0:
+        return None, None
+    return [round(x1 / width, 6), round(y1 / height, 6), round(x2 / width, 6), round(y2 / height, 6)], source
+
+
 def _candidate_to_plan(candidate: Dict[str, Any], rank: int, base_asset_prefix: str = "",
-                       artwork_w_m: float = 0.0, artwork_h_m: float = 0.0) -> Dict[str, Any]:
+                       artwork_w_m: float = 0.0, artwork_h_m: float = 0.0,
+                       original_size: Any = None) -> Dict[str, Any]:
     wall_id = candidate.get("wall_id", "")
     cand_id = candidate.get("candidate_id", "")
     height = candidate.get("height_solution", {})
@@ -314,6 +355,7 @@ def _candidate_to_plan(candidate: Dict[str, Any], rank: int, base_asset_prefix: 
     top_edge_cm = composition.get("top_edge_cm")
     nail_height_cm = (center_height_cm + NAIL_OFFSET_CM) if center_height_cm is not None else None
 
+    artwork_bbox_norm, artwork_bbox_source = _normalized_artwork_bbox(candidate, original_size)
     plan = {
         "plan_id": f"{wall_id}_{cand_id}",
         "rank": rank,
@@ -336,6 +378,11 @@ def _candidate_to_plan(candidate: Dict[str, Any], rank: int, base_asset_prefix: 
             "height_mode": height.get("height_mode"),
             "center_px_original": projection.get("center_px_original"),
             "projected_quad_px_original": projection.get("projected_quad_px_original"),
+            "artwork_bbox_norm": artwork_bbox_norm,
+            "artwork_bbox_source": artwork_bbox_source,
+            "wall_mean_luminance": candidate.get("wall_mean_luminance"),
+            "suggest_dark_wallpaper": bool(candidate.get("suggest_dark_wallpaper")),
+            "suggested_wall_tone_rgb": candidate.get("suggested_wall_tone_rgb"),
             "requires_manual_height_adjustment": bool(height.get("requires_frontend_visual_height_selection", False)),
             "requires_flux_visual_height_refinement": bool(height.get("requires_flux_visual_height_refinement", False)),
             "metric_height_finalized": metric_height_finalized,
@@ -400,9 +447,12 @@ def build_client_result(
     artwork_h_m: float = 0.0,
 ) -> Dict[str, Any]:
     selected = ranked_candidates[0] if ranked_candidates else None
+    image_space = plan.get("image_space") if isinstance(plan.get("image_space"), dict) else {}
+    original_size = image_space.get("original_size")
     plans = [
         _candidate_to_plan(c, i + 1, base_asset_prefix=base_asset_prefix,
-                           artwork_w_m=artwork_w_m, artwork_h_m=artwork_h_m)
+                           artwork_w_m=artwork_w_m, artwork_h_m=artwork_h_m,
+                           original_size=original_size)
         for i, c in enumerate(ranked_candidates)
     ]
 

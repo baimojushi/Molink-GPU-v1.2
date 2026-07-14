@@ -93,12 +93,19 @@ def _index_partials(partial_images: List[Dict[str, Any]]) -> Dict[str, Dict[str,
 def _index_renders(
     render_aggregate: Dict[str, Any],
     final_by_asset_id: Dict[str, str],
+    pre_styling_by_asset_id: Dict[str, str],
     partial_by_asset_id: Dict[str, Dict[str, Any]],
     *,
     promote_partial_review: bool,
 ) -> Dict[str, Dict[str, Any]]:
     """按 (wall_id, candidate_id) 索引渲染结果与可交付图 URL。"""
     index: Dict[str, Dict[str, Any]] = {}
+    stage_b = render_aggregate.get("stage_b") if isinstance(render_aggregate.get("stage_b"), dict) else {}
+    stage_b_index = {
+        str(item.get("asset_id")): item
+        for item in (stage_b.get("outputs") or [])
+        if isinstance(item, dict) and item.get("asset_id")
+    }
     for out in render_aggregate.get("outputs", []) or []:
         asset_id = str(out.get("asset_id", ""))
         key = f"{out.get('wall_id')}::{out.get('candidate_id')}"
@@ -113,9 +120,20 @@ def _index_renders(
             final_source = "partial_review_hardpaste_preview"
             promoted_partial = True
 
+        stage_b_item = stage_b_index.get(asset_id, {})
+        styling_status = str(
+            stage_b_item.get("styling_status")
+            or stage_b.get("default_styling_status")
+            or "not_requested"
+        )
+
         index[key] = {
             "asset_id": asset_id,
             "final_image_url": final_url,
+            "pre_styling_image_url": pre_styling_by_asset_id.get(asset_id),
+            "styling_status": styling_status,
+            "styling_zone_source": stage_b_item.get("styling_zone_source"),
+            "styling_qa": stage_b_item.get("qa"),
             "final_image_source": final_source,
             "exit_code": out.get("exit_code"),
             "production_usable": bool(out.get("production_usable")),
@@ -148,6 +166,12 @@ def _plan_to_candidate(plan: Dict[str, Any], rank: int, render_info: Dict[str, A
             "bottom_gap_to_furniture_cm": install.get("bottom_gap_to_furniture_cm"),
             "center_px": install.get("center_px_original"),
             "quad_px": install.get("projected_quad_px_original"),
+            # 交付端只消费原图坐标系的归一化框；历史结果没有此字段时展示全景。
+            "artwork_bbox_norm": install.get("artwork_bbox_norm"),
+            "artwork_bbox_source": install.get("artwork_bbox_source"),
+            "wall_mean_luminance": install.get("wall_mean_luminance"),
+            "suggest_dark_wallpaper": bool(install.get("suggest_dark_wallpaper")),
+            "suggested_wall_tone_rgb": install.get("suggested_wall_tone_rgb"),
         },
         "composition_context": plan.get("composition_context"),
         "cleanup_info": plan.get("cleanup_info"),
@@ -163,6 +187,10 @@ def _plan_to_candidate(plan: Dict[str, Any], rank: int, render_info: Dict[str, A
         # 有 final_image_url 就视作本轮 worker 可交付；若是 partial 提升，会通过下方字段保留来源。
         "needs_review": not bool(final_url),
         "final_image_url": final_url,
+        "pre_styling_image_url": render_info.get("pre_styling_image_url"),
+        "styling_status": render_info.get("styling_status") or "not_requested",
+        "styling_zone_source": render_info.get("styling_zone_source"),
+        "styling_qa": render_info.get("styling_qa"),
         "final_image_source": render_info.get("final_image_source"),
         "render_exit_code": render_info.get("exit_code"),
         "production_usable": bool(render_info.get("production_usable")),
@@ -179,12 +207,14 @@ def build(
     job: Dict[str, Any],
 ) -> Dict[str, Any]:
     final_by_asset_id = r2_result.get("final_by_asset_id", {}) or {}
+    pre_styling_by_asset_id = r2_result.get("pre_styling_by_asset_id", {}) or {}
     partial_images = r2_result.get("partial_review_images", []) or []
     partial_by_asset_id = _index_partials(partial_images)
     promote_partial_review = _truthy_env("MOLINK_PROMOTE_PARTIAL_REVIEW_AS_FINAL", "0")
     render_index = _index_renders(
         render_aggregate,
         final_by_asset_id,
+        pre_styling_by_asset_id,
         partial_by_asset_id,
         promote_partial_review=promote_partial_review,
     )
@@ -234,6 +264,10 @@ def build(
             "partial_review_image_count": len(partial_images),
             "promoted_partial_review_count": promoted_partial_count,
             "promote_partial_review_as_final": promote_partial_review,
+            "stage_b_requested": bool((render_aggregate.get("stage_b") or {}).get("requested")),
+            "stage_b_call_count": int((render_aggregate.get("stage_b") or {}).get("call_count", 0) or 0),
+            "stage_b_qa_rejected_count": int((render_aggregate.get("stage_b") or {}).get("qa_rejected_count", 0) or 0),
+            "styling_analysis_source": str(((render_aggregate.get("stage_b") or {}).get("styling_analysis") or {}).get("source") or ""),
         },
     }
 

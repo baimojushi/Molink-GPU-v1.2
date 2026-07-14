@@ -220,3 +220,60 @@ Rules:
 - mood_register describes the artwork's visible emotional register only when there is clear visual evidence; otherwise null.
 - visual_complexity estimates line/texture/color density from 0.0 (minimal) to 1.0 (dense/complex); use null when uncertain.
 """
+
+
+def styling_analysis_system_prompt() -> str:
+    return """
+You are an interior-art styling analyst. Inspect only the supplied artwork image
+and return JSON only, without markdown. Your task is to derive restrained styling
+signals for a room image editor; do not design or render the room itself.
+
+Abstract individual color relationships from the artwork instead of copying
+literal color blocks, recognizable motifs, figures, patterns, or composition.
+Suggested accessory colors must support the artwork rather than reproduce it.
+The suggested wall tone must be dark enough to contrast with the artwork while
+remaining plausible as a real interior wall base color.
+"""
+
+
+def styling_analysis_user_prompt(
+    width: int,
+    height: int,
+    *,
+    soft_furnishing_requested: bool,
+    wallpaper_tone_rgb: list[int] | None,
+) -> str:
+    target = (
+        f"The wall will be recolored to rgb({wallpaper_tone_rgb[0]}, {wallpaper_tone_rgb[1]}, {wallpaper_tone_rgb[2]}). "
+        "Choose accessory accents and neutrals as if this target wall color already exists."
+        if wallpaper_tone_rgb
+        else "No fixed wall recolor target is supplied; propose one restrained dark wall tone from the artwork relationship."
+    )
+    soft_rule = (
+        "Compute all furnishing-related fields."
+        if soft_furnishing_requested
+        else "Soft furnishing is not requested. Keep furnishing-related fields conservative, but still return valid enum values; color arrays may be empty."
+    )
+    return f"""
+Artwork image size: {int(width)}x{int(height)}.
+{target}
+{soft_rule}
+
+Return exactly this JSON object:
+{{
+  "is_abstract": true|false,
+  "style_register": "minimalist_modern|mid_century|classical_ornate|industrial|coastal_natural|eclectic_mixed|uncertain",
+  "texture_character": "smooth_flat|heavy_impasto|graphic_hard_edge|soft_atmospheric|metallic_industrial|uncertain",
+  "accent_colors_abstracted_rgb": [[r,g,b], [r,g,b]],
+  "neutral_pairing_rgb": [r,g,b],
+  "visual_tension_level": "low|medium|high",
+  "dominant_line_direction": "horizontal|vertical|diagonal|radial|none",
+  "suggested_wall_tone_rgb": [r,g,b]
+}}
+
+Rules:
+- accent colors are abstracted relationships, not direct sampled patches.
+- never encode a recognizable artwork motif or layout in the output.
+- when a fixed wall target is supplied, return that same target in suggested_wall_tone_rgb and coordinate other colors against it.
+- use uncertain/none when visual evidence is insufficient; do not invent cultural provenance.
+"""

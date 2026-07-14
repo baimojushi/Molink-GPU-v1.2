@@ -1,16 +1,24 @@
 from __future__ import annotations
 
 import base64
+import colorsys
 import io
 import json
 import os
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Mapping
 
 import requests
 from PIL import Image, ImageOps
 
-from .prompts import artwork_frame_system_prompt, artwork_frame_user_prompt, system_prompt, user_prompt
+from .prompts import (
+    artwork_frame_system_prompt,
+    artwork_frame_user_prompt,
+    styling_analysis_system_prompt,
+    styling_analysis_user_prompt,
+    system_prompt,
+    user_prompt,
+)
 
 _MIME_MAP = {"jpeg": "image/jpeg", "jpg": "image/jpeg", "png": "image/png", "webp": "image/webp", "gif": "image/gif"}
 _VLM_MAX_IMAGE_SIDE = int(os.getenv("VLM_MAX_IMAGE_SIDE", "2048"))
@@ -143,7 +151,7 @@ def call_openai_compatible(image_bytes: bytes, scene_profile: str, width: int, h
 
 
 def _coerce_rgb_triplet(value: Any) -> list[int]:
-    if not isinstance(value, list) or len(value) < 3:
+    if not isinstance(value, (list, tuple)) or len(value) < 3:
         return [0, 0, 0]
     out = []
     for v in value[:3]:
@@ -152,6 +160,169 @@ def _coerce_rgb_triplet(value: Any) -> list[int]:
         except Exception:
             out.append(0)
     return out
+
+
+_STYLING_STYLE_REGISTERS = {
+    "minimalist_modern", "mid_century", "classical_ornate", "industrial",
+    "coastal_natural", "eclectic_mixed", "uncertain",
+}
+_STYLING_TEXTURES = {
+    "smooth_flat", "heavy_impasto", "graphic_hard_edge",
+    "soft_atmospheric", "metallic_industrial", "uncertain",
+}
+_STYLING_TENSION_LEVELS = {"low", "medium", "high"}
+_STYLING_LINE_DIRECTIONS = {"horizontal", "vertical", "diagonal", "radial", "none"}
+
+
+def _styling_enum(value: Any, allowed: set[str], fallback: str) -> str:
+    normalized = str(value or "").strip().lower()
+    return normalized if normalized in allowed else fallback
+
+
+def _styling_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _normalize_styling_analysis(
+    raw: Mapping[str, Any],
+    *,
+    source: str,
+    soft_furnishing_requested: bool,
+    wallpaper_tone_rgb: list[int] | None,
+) -> Dict[str, Any]:
+    accents: list[list[int]] = []
+    if soft_furnishing_requested:
+        for value in raw.get("accent_colors_abstracted_rgb", []) or []:
+            if isinstance(value, (list, tuple)) and len(value) >= 3:
+                accents.append(_coerce_rgb_triplet(value))
+            if len(accents) >= 2:
+                break
+    neutral = _coerce_rgb_triplet(raw.get("neutral_pairing_rgb") or [132, 128, 120])
+    suggested = wallpaper_tone_rgb or _coerce_rgb_triplet(raw.get("suggested_wall_tone_rgb") or [58, 62, 71])
+    return {
+        "enabled": True,
+        "status": "ok",
+        "source": source,
+        "is_abstract": _styling_bool(raw.get("is_abstract")),
+        "style_register": _styling_enum(raw.get("style_register"), _STYLING_STYLE_REGISTERS, "uncertain"),
+        "texture_character": _styling_enum(raw.get("texture_character"), _STYLING_TEXTURES, "uncertain"),
+        "accent_colors_abstracted_rgb": accents,
+        "neutral_pairing_rgb": neutral,
+        "visual_tension_level": _styling_enum(raw.get("visual_tension_level"), _STYLING_TENSION_LEVELS, "medium"),
+        "dominant_line_direction": _styling_enum(raw.get("dominant_line_direction"), _STYLING_LINE_DIRECTIONS, "none"),
+        "suggested_wall_tone_rgb": suggested,
+        "soft_furnishing_fields_skipped": not bool(soft_furnishing_requested),
+        "wallpaper_target_was_fixed_input": bool(wallpaper_tone_rgb),
+    }
+
+
+def _abstract_rgb(rgb: list[int], *, lightness_delta: float = 0.0, saturation_scale: float = 0.78) -> list[int]:
+    r, g, b = [max(0.0, min(1.0, float(v) / 255.0)) for v in rgb[:3]]
+    h, lightness, saturation = colorsys.rgb_to_hls(r, g, b)
+    lightness = max(0.0, min(1.0, lightness + lightness_delta))
+    saturation = max(0.0, min(1.0, saturation * saturation_scale))
+    rr, gg, bb = colorsys.hls_to_rgb(h, lightness, saturation)
+    return [int(round(rr * 255)), int(round(gg * 255)), int(round(bb * 255))]
+
+
+def _algorithmic_styling_analysis(
+    image_bytes: bytes,
+    *,
+    soft_furnishing_requested: bool,
+    wallpaper_tone_rgb: list[int] | None,
+    reason: str,
+) -> Dict[str, Any]:
+    image = ImageOps.exif_transpose(Image.open(io.BytesIO(image_bytes))).convert("RGB")
+    image.thumbnail((192, 192), Image.Resampling.LANCZOS)
+    quantized = image.quantize(colors=8, method=Image.Quantize.MEDIANCUT).convert("RGB")
+    counts = sorted((quantized.getcolors(maxcolors=256) or []), key=lambda item: item[0], reverse=True)
+    palette = [list(color) for _, color in counts[:8]] or [[128, 128, 128]]
+
+    def luma(rgb: list[int]) -> float:
+        return (0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]) / 255.0
+
+    def saturation(rgb: list[int]) -> float:
+        return colorsys.rgb_to_hls(*(float(v) / 255.0 for v in rgb[:3]))[2]
+
+    contrast_base = luma(wallpaper_tone_rgb) if wallpaper_tone_rgb else 0.5
+    ranked_accents = sorted(palette, key=lambda c: (saturation(c), abs(luma(c) - contrast_base)), reverse=True)
+    accents = [
+        _abstract_rgb(ranked_accents[0], lightness_delta=0.04),
+        _abstract_rgb(ranked_accents[min(1, len(ranked_accents) - 1)], lightness_delta=-0.02),
+    ] if soft_furnishing_requested else []
+    avg = [int(round(sum(c[i] for c in palette) / len(palette))) for i in range(3)]
+    neutral = _abstract_rgb(avg, saturation_scale=0.18)
+    darkest = min(palette, key=luma)
+    suggested = wallpaper_tone_rgb or _abstract_rgb(darkest, lightness_delta=min(0.0, 0.24 - luma(darkest)), saturation_scale=0.52)
+    max_sat = max(saturation(c) for c in palette)
+    contrast = max(luma(c) for c in palette) - min(luma(c) for c in palette)
+    tension = "high" if max_sat > 0.62 or contrast > 0.62 else ("medium" if max_sat > 0.30 or contrast > 0.35 else "low")
+    return {
+        "enabled": True,
+        "status": "fallback_algorithmic",
+        "source": "algorithmic_palette_fallback",
+        "is_abstract": False,
+        "style_register": "uncertain",
+        "texture_character": "uncertain",
+        "accent_colors_abstracted_rgb": accents,
+        "neutral_pairing_rgb": neutral,
+        "visual_tension_level": tension,
+        "dominant_line_direction": "none",
+        "suggested_wall_tone_rgb": suggested,
+        "soft_furnishing_fields_skipped": not bool(soft_furnishing_requested),
+        "wallpaper_target_was_fixed_input": bool(wallpaper_tone_rgb),
+        "fallback_reason": reason,
+    }
+
+
+def parse_styling_analysis_with_vlm(
+    image_bytes: bytes,
+    mode: str,
+    *,
+    soft_furnishing_requested: bool,
+    wallpaper_recolor: Mapping[str, Any] | None = None,
+) -> Dict[str, Any]:
+    """Run one optional artwork VLM request, with a deterministic palette fallback."""
+    wallpaper_recolor = wallpaper_recolor if isinstance(wallpaper_recolor, Mapping) else {}
+    wallpaper_tone = None
+    if wallpaper_recolor.get("enabled"):
+        wallpaper_tone = _coerce_rgb_triplet(wallpaper_recolor.get("tone_rgb") or [58, 62, 71])
+    fallback = lambda reason: _algorithmic_styling_analysis(
+        image_bytes,
+        soft_furnishing_requested=soft_furnishing_requested,
+        wallpaper_tone_rgb=wallpaper_tone,
+        reason=reason,
+    )
+    mode_norm = str(mode or "auto").strip().lower()
+    use_remote = mode_norm == "openai_compatible" or (
+        mode_norm == "auto" and os.getenv("VLM_PROVIDER", "").strip() == "openai_compatible"
+    )
+    if not use_remote:
+        return fallback("styling_vlm_not_configured_or_mock_mode")
+    try:
+        image = ImageOps.exif_transpose(Image.open(io.BytesIO(image_bytes))).convert("RGB")
+        width, height = image.size
+        raw = call_openai_compatible_with_prompts(
+            image_bytes,
+            styling_analysis_system_prompt(),
+            styling_analysis_user_prompt(
+                int(width),
+                int(height),
+                soft_furnishing_requested=bool(soft_furnishing_requested),
+                wallpaper_tone_rgb=wallpaper_tone,
+            ),
+            timeout=int(os.getenv("STYLING_VLM_TIMEOUT_S", "120")),
+        )
+        return _normalize_styling_analysis(
+            raw,
+            source="openai_compatible_styling_vlm",
+            soft_furnishing_requested=bool(soft_furnishing_requested),
+            wallpaper_tone_rgb=wallpaper_tone,
+        )
+    except Exception as exc:
+        return fallback(f"styling_vlm_failed: {exc}")
 
 
 def normalize_artwork_frame_result(raw: Dict[str, Any], *, source: str = "vlm") -> Dict[str, Any]:

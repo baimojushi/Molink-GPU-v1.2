@@ -43,7 +43,7 @@ def _chroma_delta(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return np.mean(np.abs(cb - ca), axis=2)
 
 
-def _masked_global_ssim(a: np.ndarray, b: np.ndarray, mask: np.ndarray) -> float:
+def masked_global_ssim(a: np.ndarray, b: np.ndarray, mask: np.ndarray) -> float:
     """Small dependency-free masked SSIM-style score over RGB pixels."""
     idx = mask > 0
     if int(np.count_nonzero(idx)) < 16:
@@ -279,7 +279,7 @@ def evaluate_mask_anchored_render_qa(
     forbidden_guard = guard_outer & (~allowed)
 
     delta = np.mean(np.abs(render - target), axis=2)
-    core_ssim = _masked_global_ssim(target, render, core)
+    core_ssim = masked_global_ssim(target, render, core)
     core_delta = float(np.mean(delta[core])) if np.any(core) else 0.0
     adaptive = _adaptive_relight_metrics(
         target=target,

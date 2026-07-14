@@ -295,6 +295,122 @@ def build_render_prompt(
     return f"{base} {metadata}"
 
 
+def build_stage_b_prompt(
+    soft_furnishing: bool,
+    wallpaper: Mapping[str, Any] | None = None,
+    styling_analysis: Mapping[str, Any] | None = None,
+    artwork_analysis: Mapping[str, Any] | None = None,
+) -> str:
+    """Build one Stage B prompt from structured styling and request switches."""
+    styling_analysis = styling_analysis if isinstance(styling_analysis, Mapping) else {}
+    artwork_analysis = artwork_analysis if isinstance(artwork_analysis, Mapping) else {}
+    wallpaper = wallpaper if isinstance(wallpaper, Mapping) else {}
+    wallpaper_enabled = bool(wallpaper.get("enabled"))
+    if not soft_furnishing and not wallpaper_enabled:
+        return ""
+
+    parts = [
+        "Stage B spatial styling edit. HARD CONSTRAINTS:",
+        "1. Edit only inside the supplied edit_mask. Keep every pixel outside the mask unchanged, including the protected artwork and frame region.",
+        "2. Do not change the geometry of doors, windows, ceiling, floor, walls, furniture, architectural lines, camera viewpoint, or perspective.",
+        "3. Preserve existing light-source positions, shadow directions, and material structure; any lighting adjustment must be low-frequency and subtle.",
+    ]
+    next_number = 4
+    if soft_furnishing:
+        tension = str(styling_analysis.get("visual_tension_level") or "medium")
+        try:
+            max_artwork_m = max(float(artwork_analysis.get("physical_width_m") or 0.0), float(artwork_analysis.get("physical_height_m") or 0.0))
+        except Exception:
+            max_artwork_m = 0.0
+        if tension == "high" or max_artwork_m >= 1.20:
+            count_text = "two or three"
+        elif tension == "low" and (max_artwork_m <= 0.60 or max_artwork_m == 0.0):
+            count_text = "one"
+        else:
+            count_text = "one or two"
+        accents = styling_analysis.get("accent_colors_abstracted_rgb") or []
+        neutral = styling_analysis.get("neutral_pairing_rgb") or [132, 128, 120]
+        texture = str(styling_analysis.get("texture_character") or "uncertain")
+        style = str(styling_analysis.get("style_register") or "uncertain")
+        line = str(styling_analysis.get("dominant_line_direction") or "none")
+        material_words = {
+            "smooth_flat": "matte ceramic, smooth linen, or restrained lacquer",
+            "heavy_impasto": "textured linen, tactile ceramic, or woven fibers",
+            "graphic_hard_edge": "clean geometric forms with crisp but non-identical line relationships",
+            "soft_atmospheric": "soft linen, translucent glass, or gentle natural fibers",
+            "metallic_industrial": "brushed metal, dark ceramic, or restrained industrial textiles",
+            "uncertain": "quiet natural materials with low visual noise",
+        }.get(texture, "quiet natural materials with low visual noise")
+        style_words = {
+            "minimalist_modern": "minimalist modern",
+            "mid_century": "restrained mid-century",
+            "classical_ornate": "warm classical",
+            "industrial": "refined industrial",
+            "coastal_natural": "coastal natural",
+            "eclectic_mixed": "controlled eclectic",
+            "uncertain": "stylistically neutral",
+        }.get(style, "stylistically neutral")
+        palette_text = f"abstracted accent RGB values {accents[:2]} and neutral RGB {neutral}"
+        parts.extend([
+            f"{next_number}. Add only {count_text} restrained small accessories on the supplied editable floor/furniture support regions. Keep the artwork as the dominant focal point.",
+            f"{next_number + 1}. Allowed categories are cushions, a small plant or floral arrangement, a small object, a table runner, or a small rug. Do not add or replace large furniture.",
+            f"{next_number + 2}. Use a {style_words} vocabulary and materials such as {material_words}. Coordinate through {palette_text}.",
+            f"{next_number + 3}. Do not copy the artwork's image, recognizable pattern, composition, figures, symbols, or color-block layout onto any accessory. Only use abstracted color, texture, shape, and line relationships.",
+        ])
+        next_number += 4
+        if line in {"horizontal", "vertical", "diagonal", "radial"}:
+            parts.append(
+                f"{next_number}. Where an existing textile support surface makes it natural, use only a subtle {line} texture direction; never reproduce the artwork's actual lines or layout."
+            )
+            next_number += 1
+        if bool(styling_analysis.get("is_abstract")):
+            parts.append(f"{next_number}. Because the artwork is abstract, avoid decorative accumulation; use only the minimum pieces needed for support.")
+            next_number += 1
+    if wallpaper_enabled:
+        tone = wallpaper.get("tone_rgb")
+        if not (isinstance(tone, Sequence) and len(tone) >= 3):
+            tone = [58, 62, 71]
+        try:
+            rgb = [max(0, min(255, int(round(float(v))))) for v in list(tone)[:3]]
+        except (TypeError, ValueError):
+            rgb = [58, 62, 71]
+        parts.extend([
+            f"{next_number}. Recolor only the editable wall zone to rgb({rgb[0]}, {rgb[1]}, {rgb[2]}), preserving the original wall's illumination gradients, shadows, and texture instead of applying a flat fill.",
+            f"{next_number + 1}. Keep baseboards, corners, switches, outlets, seams, and material grain unchanged. Add no wallpaper pattern, molding, graphic, or wall decoration.",
+        ])
+        next_number += 2
+        if soft_furnishing:
+            parts.append(
+                f"{next_number}. Keep the new accessories harmonious with rgb({rgb[0]}, {rgb[1]}, {rgb[2]}) without reducing the artwork's visual priority."
+            )
+    if artwork_analysis.get("has_frame") is True:
+        parts.append("Final artwork lock: preserve the complete visible physical frame, its opening, thickness, color, and all artwork pixels exactly.")
+    else:
+        parts.append("Final artwork lock: preserve the complete artwork footprint and all artwork pixels exactly; do not invent a frame or mat.")
+    return "\n".join(parts)
+
+
+def build_stage_b_mask(
+    soft_furnishing: bool,
+    wallpaper_enabled: bool,
+    decor_zone: np.ndarray,
+    wall_zone: np.ndarray,
+    protect_zone: np.ndarray,
+) -> np.ndarray:
+    """Combine Stage B zones once, then subtract the protected artwork region."""
+    arrays = [np.asarray(decor_zone), np.asarray(wall_zone), np.asarray(protect_zone)]
+    shape = arrays[0].shape[:2]
+    if any(arr.shape[:2] != shape for arr in arrays[1:]):
+        raise ValueError("Stage B mask zones must share the same height and width")
+    selected = np.zeros(shape, dtype=bool)
+    if soft_furnishing:
+        selected |= arrays[0] > 0
+    if wallpaper_enabled:
+        selected |= arrays[1] > 0
+    selected &= ~(arrays[2] > 0)
+    return np.where(selected, 255, 0).astype(np.uint8)
+
+
 def _entry_center_and_width(entry: Mapping[str, Any]) -> tuple[float, float, float]:
     bbox = entry.get("bbox_px")
     if isinstance(bbox, Sequence) and len(bbox) >= 4:

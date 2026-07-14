@@ -193,6 +193,13 @@ def resolve_render_provider(job: dict) -> tuple[str, str]:
     return DEFAULT_RENDER_PROVIDER, "default"
 
 
+def _stage_b_request(job: dict) -> tuple[bool, dict | None]:
+    """Read the two independent Stage B switches from a job payload."""
+    soft = bool(job.get("soft_furnishing_requested"))
+    wallpaper = render_api.normalize_wallpaper_recolor(job.get("wallpaper_recolor"))
+    return soft, wallpaper
+
+
 def _round_cm(value) -> int | None:
     try:
         return round(float(value))
@@ -436,11 +443,13 @@ class Worker:
         await autodl_api.stop_self()
 
     async def run_supplement_job(self, ws, job) -> None:
-        """Render user-selected non-primary walls from a persisted hanging_result.zip.
+        """Render selected walls from a persisted hanging_result.zip.
 
         This job intentionally skips Metric3D/Semantic/Hanging and only reuses the
         existing render path with manifest filters. It is triggered by waiting-page
         wall preferences and does not block the main recommendation delivery.
+        A primary-wall wallpaper rerender seeds the pipeline from the archived
+        pre-styling Stage A image instead of repainting the already styled final.
         """
         job_id = job.get("job_id")
         print(f"[worker-debug] supplement_job_received job_id={job_id} order_id={job.get('order_id')} targets={job.get('target_wall_ids')}", flush=True)
@@ -481,11 +490,35 @@ class Worker:
                 target_wall_ids = [str(x) for x in (job.get("target_wall_ids") or []) if str(x).strip()]
                 target_candidate_ids = [str(x) for x in (job.get("target_candidate_ids") or []) if str(x).strip()]
                 limit = (job.get("render") or {}).get("global_limit") if isinstance(job.get("render"), dict) else None
-                render_aggregate = await asyncio.to_thread(
-                    render_api.run_pipeline,
-                    str(hanging_zip), str(flux_out), provider=render_provider, limit=limit,
-                    target_wall_ids=target_wall_ids, target_candidate_ids=target_candidate_ids,
+                stage_a_base_by_asset_id = job.get("stage_a_base_by_asset_id") if isinstance(job.get("stage_a_base_by_asset_id"), dict) else {}
+                stage_a_base_by_wall_id = job.get("stage_a_base_by_wall_id") if isinstance(job.get("stage_a_base_by_wall_id"), dict) else {}
+                if stage_a_base_by_asset_id or stage_a_base_by_wall_id:
+                    render_aggregate = await asyncio.to_thread(
+                        pipeline.prepare_pre_styling_render_aggregate,
+                        hanging_zip, flux_out,
+                        stage_a_base_by_asset_id=stage_a_base_by_asset_id,
+                        stage_a_base_by_wall_id=stage_a_base_by_wall_id,
+                        target_wall_ids=target_wall_ids,
+                        target_candidate_ids=target_candidate_ids,
+                        provider=render_provider,
+                    )
+                else:
+                    render_aggregate = await asyncio.to_thread(
+                        render_api.run_pipeline,
+                        str(hanging_zip), str(flux_out), provider=render_provider, limit=limit,
+                        target_wall_ids=target_wall_ids, target_candidate_ids=target_candidate_ids,
+                    )
+                soft_furnishing, wallpaper_recolor = _stage_b_request(job)
+                if soft_furnishing or wallpaper_recolor:
+                    await self.progress(ws, job, "styling", "running", 84, "正在优化空间风格与色彩…")
+                stage_b_aggregate = await asyncio.to_thread(
+                    render_api.run_stage_b_pipeline,
+                    str(hanging_zip), str(flux_out),
+                    provider=render_provider,
+                    soft_furnishing_requested=soft_furnishing,
+                    wallpaper_recolor=wallpaper_recolor,
                 )
+                render_aggregate["stage_b"] = stage_b_aggregate
                 diag_later(diag.write_json, "05_render/render_aggregate.json", render_aggregate)
                 diag_later(diag.copy_tree, flux_out, "05_render/flux_out")
                 await self.progress(ws, job, "r2_upload", "running", 92, "正在上传您点选墙面的补充效果图…")
@@ -496,6 +529,10 @@ class Worker:
                 payload_for_diag["supplement"] = True
                 payload_for_diag["selected_wall_ids"] = target_wall_ids
                 payload_for_diag["target_candidate_ids"] = target_candidate_ids
+                payload_for_diag["primary_wall_rerender"] = bool(job.get("primary_wall_rerender"))
+                payload_for_diag["primary_wall_id"] = job.get("primary_wall_id")
+                payload_for_diag["wallpaper_recolor_requested"] = bool(job.get("wallpaper_recolor_requested"))
+                payload_for_diag["stage_a_base_source"] = render_aggregate.get("stage_a_base_source") or job.get("stage_a_base_source")
                 diag_later(diag.write_json, "99_result/result_payload_pre_send.json", payload_for_diag)
                 await self.send_result(ws, job, payload_for_diag)
                 await flush_diag_tasks()
@@ -507,6 +544,10 @@ class Worker:
                     "job_id": job["job_id"], "order_id": job.get("order_id"),
                     "job_kind": "hanging_supplement_render", "supplement": True,
                     "selected_wall_ids": job.get("target_wall_ids") or [],
+                    "primary_wall_rerender": bool(job.get("primary_wall_rerender")),
+                    "primary_wall_id": job.get("primary_wall_id"),
+                    "wallpaper_recolor_requested": bool(job.get("wallpaper_recolor_requested")),
+                    "stage_a_base_source": job.get("stage_a_base_source"),
                     "status": "failed", "exit_code": "FAILED_SUPPLEMENT_RENDER",
                     "candidates": [], "not_recommended": [], "partial_review_images": [],
                     "error": str(exc), "metrics": {"render_provider": render_provider},
@@ -536,6 +577,7 @@ class Worker:
 
         diag = diagnostics.DiagnosticsRun.create(job)
         render_provider, render_provider_source = resolve_render_provider(job)
+        soft_furnishing, wallpaper_recolor = _stage_b_request(job)
         print(
             f"[worker-debug] render_provider={render_provider} source={render_provider_source} "
             f"raw_render={(job.get('render') or {}).get('provider') if isinstance(job.get('render'), dict) else None}",
@@ -580,7 +622,11 @@ class Worker:
 
                 await self.progress(ws, job, "semantic", "running", 35, "正在识别墙面与结构信息…")
                 scene_profile = (job.get("rules_overrides") or {}).get("scene_profile", "home")
-                semantics = await asyncio.to_thread(pipeline.call_semantic, inputs["room"], metric_zip, inputs["artwork"], scene_profile, work_dir)
+                semantics = await asyncio.to_thread(
+                    pipeline.call_semantic,
+                    inputs["room"], metric_zip, inputs["artwork"], scene_profile, work_dir,
+                    styling_masks_requested=bool(soft_furnishing or wallpaper_recolor),
+                )
                 diag_later(diag.copy_file, semantics, "03_semantic/semantics.json")
 
                 semantic_payload = _safe_json_load(semantics)
@@ -630,6 +676,16 @@ class Worker:
                     render_api.run_pipeline,
                     str(hanging_zip), str(flux_out), provider=render_provider, limit=limit
                 )
+                if soft_furnishing or wallpaper_recolor:
+                    await self.progress(ws, job, "styling", "running", 82, "正在优化空间风格与色彩…")
+                stage_b_aggregate = await asyncio.to_thread(
+                    render_api.run_stage_b_pipeline,
+                    str(hanging_zip), str(flux_out),
+                    provider=render_provider,
+                    soft_furnishing_requested=soft_furnishing,
+                    wallpaper_recolor=wallpaper_recolor,
+                )
+                render_aggregate["stage_b"] = stage_b_aggregate
                 diag_later(diag.write_json, "05_render/render_aggregate.json", render_aggregate)
                 diag_later(diag.copy_tree, flux_out, "05_render/flux_out")
 

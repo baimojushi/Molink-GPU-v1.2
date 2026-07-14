@@ -282,6 +282,8 @@ def load_semantic_masks(semantics: Dict[str, Any], size_hw: Tuple[int, int]) -> 
             "bbox_xyxy_original": obj.get("bbox_xyxy_original"),
             "mask_source": mask_source,
             "mask_debug": mask_debug,
+            "semantic_source": obj.get("source"),
+            "sam": obj.get("sam") if isinstance(obj.get("sam"), dict) else None,
         }
         if mask_debug.get("warnings"):
             record["warnings"] = list(mask_debug.get("warnings") or [])

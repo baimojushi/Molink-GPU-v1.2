@@ -44,6 +44,7 @@ from .candidate_safety import (
     evaluate_wall_support_gate, semantic_axis_policy,
 )
 from .height_fit_contract import floor_source_is_metric_trusted, room_corner_floor_fit_contract
+from .styling_metrics import analyze_artwork_luminance, measure_candidate_wall_luminance, should_suggest_dark_wallpaper
 
 try:
     from molink_causal import imaging as causal_imaging
@@ -139,6 +140,137 @@ def _union_masks_for_shape(items: List[Mapping[str, Any]], shape_hw: tuple[int, 
         except Exception:
             continue
     return out if np.any(out) else None
+
+
+_STAGE_B_DECOR_SUPPORT_LABELS = {"floor", "sofa", "table", "cabinet", "sideboard", "chair"}
+
+
+def _resize_binary_mask(mask: np.ndarray, size_wh: tuple[int, int]) -> np.ndarray:
+    width, height = [int(v) for v in size_wh]
+    arr = np.asarray(mask, dtype=np.uint8)
+    if arr.shape[:2] != (height, width):
+        arr = cv2.resize(arr, (width, height), interpolation=cv2.INTER_NEAREST)
+    return np.where(arr > 0, 255, 0).astype(np.uint8)
+
+
+def _build_stage_b_decor_zone(
+    objects: Mapping[str, Mapping[str, Any]],
+    *,
+    processed_shape_hw: tuple[int, int],
+    original_size_wh: tuple[int, int],
+    wall_items: List[Mapping[str, Any]],
+) -> tuple[np.ndarray, dict[str, Any]]:
+    support_items: list[Mapping[str, Any]] = []
+    for item in (objects or {}).values():
+        label = str(item.get("label") or "").strip().lower()
+        role = str(item.get("role") or "").strip().lower()
+        mask = item.get("mask")
+        if role != "support" or label not in _STAGE_B_DECOR_SUPPORT_LABELS:
+            continue
+        if isinstance(mask, np.ndarray) and mask.shape[:2] == processed_shape_hw and np.any(mask):
+            support_items.append(item)
+
+    if support_items:
+        processed = np.zeros(processed_shape_hw, np.uint8)
+        sources: list[str] = []
+        for item in support_items:
+            processed[item["mask"] > 0] = 255
+            semantic_source = str(item.get("semantic_source") or item.get("mask_source") or "bbox")
+            sources.append("sam" if "sam" in semantic_source else "bbox")
+        zone = _resize_binary_mask(processed, original_size_wh)
+        source_set = set(sources)
+        source = "sam_support_union" if source_set == {"sam"} else ("sam_bbox_support_union" if "sam" in source_set else "bbox_support_union")
+        return zone, {
+            "styling_zone_source": source,
+            "support_object_ids": [str(item.get("object_id") or "") for item in support_items],
+            "support_labels": [str(item.get("label") or "") for item in support_items],
+            "support_mask_area_px_original": int(np.count_nonzero(zone)),
+        }
+
+    width, height = [int(v) for v in original_size_wh]
+    fallback = np.zeros((height, width), np.uint8)
+    fallback[int(round(height * 0.52)):, :] = 255
+    wall_union = _union_masks_for_shape(wall_items, processed_shape_hw)
+    if wall_union is not None:
+        fallback[_resize_binary_mask(wall_union, original_size_wh) > 0] = 0
+    return fallback, {
+        "styling_zone_source": "fallback_lower_region",
+        "support_object_ids": [],
+        "support_labels": [],
+        "support_mask_area_px_original": int(np.count_nonzero(fallback)),
+    }
+
+
+def _scope_stage_b_decor_zone_to_candidate(
+    decor_zone: np.ndarray,
+    wall_zone: np.ndarray,
+    *,
+    front_bbox_px: list[int] | None,
+    base_debug: Mapping[str, Any],
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Keep support edits near the candidate artwork instead of opening the room."""
+    decor = np.where(np.asarray(decor_zone) > 0, 255, 0).astype(np.uint8)
+    wall = np.asarray(wall_zone) > 0
+    height, width = decor.shape[:2]
+    if front_bbox_px and len(front_bbox_px) >= 4:
+        art_x0, art_y0, art_x1, _art_y1 = [int(v) for v in front_bbox_px[:4]]
+        art_width = max(1, art_x1 - art_x0)
+        center_x = 0.5 * (art_x0 + art_x1)
+        corridor_width = min(float(width) * 0.78, max(float(width) * 0.40, float(art_width) * 3.0))
+        x0 = max(0, int(round(center_x - 0.5 * corridor_width)))
+        x1 = min(width, int(round(center_x + 0.5 * corridor_width)))
+        y0 = max(0, int(round(float(art_y0) - float(height) * 0.12)))
+    else:
+        x0 = int(round(width * 0.20))
+        x1 = int(round(width * 0.80))
+        y0 = int(round(height * 0.30))
+
+    scope = np.zeros((height, width), dtype=bool)
+    scope[y0:, x0:x1] = True
+    scoped = np.where((decor > 0) & scope & (~wall), 255, 0).astype(np.uint8)
+    source = str(base_debug.get("styling_zone_source") or "bbox_support_union")
+    fallback_used = False
+    if not np.any(scoped):
+        fallback_used = True
+        fallback = np.zeros((height, width), np.uint8)
+        fallback[int(round(height * 0.52)):, x0:x1] = 255
+        fallback[wall] = 0
+        scoped = fallback
+        source = "fallback_lower_region"
+    return scoped, {
+        **dict(base_debug),
+        "styling_zone_source": source,
+        "candidate_spatial_scope": "artwork_centered_near_wall_corridor",
+        "candidate_scope_bbox_px": [int(x0), int(y0), int(x1), int(height)],
+        "support_mask_area_px_before_scope": int(np.count_nonzero(decor)),
+        "support_mask_area_px_original": int(np.count_nonzero(scoped)),
+        "candidate_scope_fallback_used": bool(fallback_used),
+        "wall_overlap_removed_px": int(np.count_nonzero((decor > 0) & scope & wall)),
+    }
+
+
+def _build_stage_b_protect_zone(
+    mount_mask: np.ndarray,
+    *,
+    front_bbox_px: list[int] | None,
+    candidate: Mapping[str, Any],
+) -> tuple[np.ndarray, int]:
+    height, width = mount_mask.shape[:2]
+    margin_px = max(8, int(round(min(width, height) * 0.012)))
+    hard = candidate.get("hard_constraints", {}) if isinstance(candidate, Mapping) else {}
+    try:
+        art_w_m = float(hard.get("artwork_width_m") or 0.0)
+        art_h_m = float(hard.get("artwork_height_m") or 0.0)
+        if front_bbox_px and art_w_m > 0 and art_h_m > 0:
+            bbox_w = max(1.0, float(front_bbox_px[2]) - float(front_bbox_px[0]))
+            bbox_h = max(1.0, float(front_bbox_px[3]) - float(front_bbox_px[1]))
+            px_per_m = 0.5 * (bbox_w / art_w_m + bbox_h / art_h_m)
+            margin_px = int(round(max(8.0, min(96.0, px_per_m * 0.10))))
+    except Exception:
+        pass
+    kernel_size = margin_px * 2 + 1
+    protected = cv2.dilate((mount_mask > 0).astype(np.uint8) * 255, np.ones((kernel_size, kernel_size), np.uint8), iterations=1)
+    return protected, int(margin_px)
 
 
 def _analyze_artwork_image_with_vlm(artwork_raw: bytes, art_rgba: np.ndarray, seed_analysis: Mapping[str, Any] | None = None) -> dict[str, Any]:
@@ -279,6 +411,7 @@ def _build_runtime_artwork_analysis_from_vlm(artwork_raw: bytes, vlm_mode: str =
 
 def _augment_artwork_analysis_with_pix(artwork_analysis: Mapping[str, Any], art_rgba: np.ndarray) -> dict[str, Any]:
     out = dict(artwork_analysis or {})
+    out.update(analyze_artwork_luminance(art_rgba))
     if out.get("visual_complexity") is None and out.get("complexity_score") is None:
         complexity = _estimate_artwork_visual_complexity(art_rgba)
         if complexity is not None:
@@ -2841,6 +2974,30 @@ async def analyze_hanging_mvp(
                 "artwork_has_frame_source": artwork_has_frame_source,
                 "artwork_mount_policy": artwork_mount_policy,
             }
+            wall_luminance_mask = wall_mask.copy()
+            for semantic_object in objects.values():
+                if str(semantic_object.get("role") or "").strip().lower() == "wall":
+                    continue
+                semantic_mask = semantic_object.get("mask")
+                if isinstance(semantic_mask, np.ndarray) and semantic_mask.shape[:2] == wall_luminance_mask.shape[:2]:
+                    wall_luminance_mask[semantic_mask > 0] = 0
+            wall_styling_metrics = measure_candidate_wall_luminance(
+                room_rgb,
+                wall_luminance_mask,
+                quad,
+            )
+            cand["wall_mean_luminance"] = wall_styling_metrics.get("wall_mean_luminance")
+            cand["is_light_wall"] = bool(wall_styling_metrics.get("is_light_wall"))
+            cand["suggest_dark_wallpaper"] = should_suggest_dark_wallpaper(artwork_analysis, wall_styling_metrics)
+            cand["suggested_wall_tone_rgb"] = list(artwork_analysis.get("suggested_wall_tone_rgb") or [58, 62, 71])
+            cand["wallpaper_suggestion_debug"] = {
+                **wall_styling_metrics,
+                "artwork_mean_luminance": artwork_analysis.get("artwork_mean_luminance"),
+                "artwork_contrast": artwork_analysis.get("artwork_contrast"),
+                "is_dark_or_high_contrast": bool(artwork_analysis.get("is_dark_or_high_contrast")),
+                "decision_rule": "is_dark_or_high_contrast AND wall_mean_luminance > 0.62",
+                "render_requested": False,
+            }
             cand["window_edge_clearance_cm"] = _candidate_window_clearance_cm(cand)
             if reasons:
                 rejected.append({"candidate_id": candidate_id, "wall_id": wall_id, "reject_reasons": reasons, "soft_risk_reasons": soft_risk_reasons, "hard_constraints": hard})
@@ -3034,6 +3191,12 @@ async def analyze_hanging_mvp(
     # then select a capped subset for official BFL rendering. v7 order is:
     # original_room -> erase -> hard_paste_after_erase -> flux2.
     original_size_wh = (int(bundle.original_size[0]), int(bundle.original_size[1]))
+    stage_b_decor_zone, stage_b_decor_debug = _build_stage_b_decor_zone(
+        objects,
+        processed_shape_hw=(h, w),
+        original_size_wh=original_size_wh,
+        wall_items=walls,
+    )
     flux_input_files: Dict[str, bytes] = {
         "flux_inputs/original_room.png": _png_bytes(room_rgb),
         "flux_inputs/artwork.png": _png_bytes(art_rgba),
@@ -3135,6 +3298,32 @@ async def analyze_hanging_mvp(
             target_polygon_px = _quad_to_int_polygon(target_quad_original) or quad_int
             front_bbox_px = _binary_mask_bbox_xyxy(front_region) or bbox_px
             mount_bbox_px = _binary_mask_bbox_xyxy(mount_mask) or front_bbox_px
+            stage_b_wall_source = wall_mask_for_cleanup
+            if stage_b_wall_source is None and wall_id in objects:
+                stage_b_wall_source = objects[wall_id].get("mask")
+            if isinstance(stage_b_wall_source, np.ndarray) and np.any(stage_b_wall_source):
+                stage_b_wall_zone = _resize_binary_mask(stage_b_wall_source, original_size_wh)
+            else:
+                stage_b_wall_zone = np.zeros((original_size_wh[1], original_size_wh[0]), np.uint8)
+            candidate_stage_b_decor_zone, candidate_stage_b_decor_debug = _scope_stage_b_decor_zone_to_candidate(
+                stage_b_decor_zone,
+                stage_b_wall_zone,
+                front_bbox_px=front_bbox_px,
+                base_debug=stage_b_decor_debug,
+            )
+            stage_b_protect_zone, stage_b_protect_margin_px = _build_stage_b_protect_zone(
+                mount_mask,
+                front_bbox_px=front_bbox_px,
+                candidate=cand,
+            )
+            stage_b_zone_debug = {
+                **candidate_stage_b_decor_debug,
+                "wall_id": wall_id,
+                "wall_mask_area_px_original": int(np.count_nonzero(stage_b_wall_zone)),
+                "protect_mask_area_px_original": int(np.count_nonzero(stage_b_protect_zone)),
+                "protect_margin_px": int(stage_b_protect_margin_px),
+                "protect_margin_target_m": 0.10,
+            }
             cleanup_semantic_types = _cleanup_semantic_types_from_remove_mask(
                 remove_mask=remove_mask,
                 existing_masks=removable_existing_masks,
@@ -3179,6 +3368,11 @@ async def analyze_hanging_mvp(
                 "frame_side_mask_path": f"{prefix}/frame_side_mask.png",
                 "mount_mask_path": f"{prefix}/mount_mask.png",
                 "mount_debug_path": f"{prefix}/mount_debug.json",
+                "stage_b_decor_zone_mask_path": f"{prefix}/stage_b_decor_zone_mask.png",
+                "stage_b_wall_zone_mask_path": f"{prefix}/stage_b_wall_zone_mask.png",
+                "stage_b_protect_zone_mask_path": f"{prefix}/stage_b_protect_zone_mask.png",
+                "stage_b_zone_debug_path": f"{prefix}/stage_b_zone_debug.json",
+                "styling_zone_source": candidate_stage_b_decor_debug.get("styling_zone_source"),
                 "artwork_mount_policy": mount_policy,
                 "flux2_input_mode": flux2_input_mode,
                 "cleanup_semantic_types": cleanup_semantic_types,
@@ -3211,6 +3405,10 @@ async def analyze_hanging_mvp(
             flux_input_files[f"{prefix}/frame_side_mask.png"] = _png_bytes(frame_side_mask)
             flux_input_files[f"{prefix}/mount_mask.png"] = _png_bytes(mount_mask)
             flux_input_files[f"{prefix}/flux2_edit_mask.png"] = _png_bytes(flux2_edit_mask)
+            flux_input_files[f"{prefix}/stage_b_decor_zone_mask.png"] = _png_bytes(candidate_stage_b_decor_zone)
+            flux_input_files[f"{prefix}/stage_b_wall_zone_mask.png"] = _png_bytes(stage_b_wall_zone)
+            flux_input_files[f"{prefix}/stage_b_protect_zone_mask.png"] = _png_bytes(stage_b_protect_zone)
+            flux_input_files[f"{prefix}/stage_b_zone_debug.json"] = json.dumps(stage_b_zone_debug, ensure_ascii=False, indent=2).encode("utf-8")
             flux_input_files[f"{prefix}/mount_debug.json"] = json.dumps(mount_debug, ensure_ascii=False, indent=2).encode("utf-8")
             flux_input_files[f"{prefix}/remove_mask.png"] = _png_bytes(remove_mask)
             flux_input_files[f"{prefix}/debug_overlay.png"] = _png_bytes(overlay)
@@ -3231,6 +3429,11 @@ async def analyze_hanging_mvp(
                     "front_region_mask_path": f"{prefix}/front_region_mask.png",
                     "frame_side_mask_path": f"{prefix}/frame_side_mask.png",
                     "mount_mask_path": f"{prefix}/mount_mask.png",
+                    "stage_b_decor_zone_mask_path": f"{prefix}/stage_b_decor_zone_mask.png",
+                    "stage_b_wall_zone_mask_path": f"{prefix}/stage_b_wall_zone_mask.png",
+                    "stage_b_protect_zone_mask_path": f"{prefix}/stage_b_protect_zone_mask.png",
+                    "stage_b_zone_debug_path": f"{prefix}/stage_b_zone_debug.json",
+                    "styling_zone_source": candidate_stage_b_decor_debug.get("styling_zone_source"),
                     "flux2_edit_mask_path": f"{prefix}/flux2_edit_mask.png",
                     "flux2_edit_mask_dilate_px": int(flux2_edit_mask_dilate_px),
                     "flux2_mask_required": True,
@@ -3247,6 +3450,8 @@ async def analyze_hanging_mvp(
                     "artwork_has_frame": artwork_has_frame,
                     "artwork_has_frame_source": artwork_has_frame_source,
                     "artwork_analysis": artwork_analysis,
+                    "artwork_physical_width_m": hard.get("artwork_width_m"),
+                    "artwork_physical_height_m": hard.get("artwork_height_m"),
                     "artwork_mount_policy": mount_policy,
                     "cleanup_provider": "bfl_erase_v1",
                     "render_provider": "bfl_flux2_edit",
@@ -3494,5 +3699,3 @@ async def analyze_hanging_mvp(
             files[f"{wall_prefix}/debug_overlay_error.txt"] = str(e).encode("utf-8")
 
     return _zip_response(files)
-
-

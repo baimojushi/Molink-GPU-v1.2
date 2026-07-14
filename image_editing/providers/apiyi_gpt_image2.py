@@ -1030,7 +1030,11 @@ class ApiyiGptImage2Client:
         )
         core_mask_path = _coerce_optional_path(core_mask_source)
 
-        normalized_mask_edit_mode = self.mask_edit_mode.replace("-", "_")
+        # Stage B needs a generative masked composite for furnishings/wall color,
+        # while Stage A keeps the provider's conservative photometric default.
+        # A request-scoped override avoids mutating global provider behavior.
+        requested_mask_edit_mode = str(request.metadata.get("mask_edit_mode") or self.mask_edit_mode)
+        normalized_mask_edit_mode = requested_mask_edit_mode.replace("-", "_").strip().lower()
         full_space_coordinate_prompt_requested = bool(request.metadata.get("full_space_coordinate_prompt_requested"))
         if request.mask and full_space_coordinate_prompt_requested:
             target_for_api = image
