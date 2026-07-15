@@ -524,9 +524,9 @@ def _causal_light_for_candidate(
 app = FastAPI(title="hanging-art-mvp-geometry-api")
 
 def require_auth(a):
+    if ALLOW_UNAUTH_LOCAL:
+        return
     if not API_KEY:
-        if ALLOW_UNAUTH_LOCAL:
-            return
         raise HTTPException(500, "API_KEY is not configured; set ALLOW_UNAUTH_LOCAL=1 for local development")
     if a != f"Bearer {API_KEY}":
         raise HTTPException(401, "Unauthorized")

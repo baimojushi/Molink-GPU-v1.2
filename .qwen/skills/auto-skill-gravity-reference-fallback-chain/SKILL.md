@@ -23,6 +23,7 @@ A fallback chain now tries multiple horizontal reference surfaces in priority or
 ## Key details
 
 - **Normal sign resolution**: Roof/ceiling normals may point in either direction. The horizontal reference function flips normals toward camera-up (negative camera-y) before averaging.
+- **Floor normals need explicit flip too**: `estimate_g_hat_from_floor_normals()` does NOT enforce g_hat direction — floor normals can point either way. If g_hat[1] > 0 (points down), floor_height_abs_m becomes negative, causing artwork to hang too high. Fix: `if g_hat[1] > 0: g_hat = -g_hat`.
 - **Label canonicalization**: `ceiling`, `ceilings`, `roof ceiling` → `roof` (in both `hanging_mvp/masks.py` and `semantic_mvp/service.py`)
 - **VLM prompt**: System prompt now requires `label=roof, role=support` for every visible ceiling region
 - **Height anchor unchanged**: Floor mask is still the height anchor; roof/table are gravity references only, never replace floor for height estimation
