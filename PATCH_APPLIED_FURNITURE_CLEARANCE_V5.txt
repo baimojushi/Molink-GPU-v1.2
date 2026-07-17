@@ -1,0 +1,45 @@
+PATCH APPLIED: furniture-clearance-height-v5
+============================================
+
+Build ID
+--------
+2026-07-16-furniture-clearance-height-v5
+
+Observed V4 production evidence
+-------------------------------
+The service did recognize the bar:
+
+  label:                         geometry_support
+  source:                        geometry_wall_adjacent_support_probe
+  support height above floor:    1.168230652809143m
+  V4 minimum bottom clearance:   0.15m
+  artwork height:                0.40m
+  V4 clearance center:           1.518230652809143m
+  floor default minimum:         1.52m
+  V4 result:                     1.52m
+
+Therefore the unchanged 1.52m result was not a recognition failure. The 0.15m
+clearance target landed 1.77mm below the floor default and was correctly
+clamped back to 1.52m.
+
+V5 behavior
+-----------
+- table bottom clearance: 0.20m
+- counter/cabinet/sideboard/generic geometry-support clearance: 0.25m
+- furniture placement still cannot be lower than the trusted floor default
+- the same job evidence now resolves to 1.618230652809143m
+- distant foreground furniture and the wall plane remain excluded
+
+Quick verification
+------------------
+Open hanging_mvp/service.py and search for:
+
+  2026-07-16-furniture-clearance-height-v5
+
+Open hanging_mvp/support_context.py and search for:
+
+  _resolve_furniture_height
+  min_bottom_gap_to_support_m
+
+Exact SHA-256 values are recorded in
+PATCH_MANIFEST_FURNITURE_CLEARANCE_V5.sha256.

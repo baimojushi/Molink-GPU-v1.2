@@ -1,0 +1,44 @@
+PATCH APPLIED: furniture-support-height-v4
+==========================================
+
+Build ID
+--------
+2026-07-16-furniture-support-height-v4
+
+Regression
+----------
+job_5b71f65a
+
+Observed runtime evidence
+-------------------------
+- table_07 had 11,714 sampled points; it was not maskless at hanging runtime.
+- table_07 wall_distance_p20_m was about 6.55m, so rejecting it as distant
+  foreground was correct.
+- The furniture/counter directly below the selected front-wall placement was
+  not represented as a wall-associated semantic support.
+
+V4 behavior
+-----------
+1. SAM-mask furniture keeps the strict current-wall association gate.
+2. Bbox-only semantic furniture uses an inner-box sample plus metric wall-depth
+   association; distant foreground remains rejected.
+3. If no semantic furniture survives, a dense unlabeled geometry height band
+   0.12m..0.90m in front of the current wall may recover a counter/cabinet top.
+4. The wall plane itself and furniture more than 0.90m from that wall are not
+   eligible for this fallback.
+5. Furniture context never lowers the trusted floor default. It may raise the
+   artwork so its bottom keeps at least 0.15m clearance above support.
+
+Quick verification
+------------------
+Open hanging_mvp/service.py and search for:
+
+  2026-07-16-furniture-support-height-v4
+
+Open hanging_mvp/support_context.py and search for:
+
+  _infer_wall_adjacent_geometry_support
+  processed_bbox_inner_fallback
+  furniture_never_below_floor_default
+
+Exact SHA-256 values are recorded in PATCH_MANIFEST_FURNITURE_HEIGHT_V4.sha256.

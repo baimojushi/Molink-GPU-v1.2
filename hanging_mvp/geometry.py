@@ -10,12 +10,24 @@ import numpy as np
 from .schemas import Intrinsics, WallPlane, WallBasis
 
 EPS = 1e-8
+CAMERA_UP = np.array([0.0, -1.0, 0.0], np.float32)
 
 def normalize(v: np.ndarray) -> np.ndarray:
     n = float(np.linalg.norm(v))
     if n < EPS:
         return v
     return v / n
+
+
+def orient_vector_to_camera_up(v: np.ndarray) -> np.ndarray:
+    """Resolve arbitrary normal sign to OpenCV camera-up (negative y)."""
+    value = np.asarray(v, dtype=np.float32).reshape(3)
+    if not np.isfinite(value).all() or float(np.linalg.norm(value)) < EPS:
+        return CAMERA_UP.copy()
+    value = normalize(value)
+    if float(np.dot(value, CAMERA_UP)) < 0.0:
+        value = -value
+    return value.astype(np.float32)
 
 def backproject(depth: np.ndarray, intr: Intrinsics) -> np.ndarray:
     h, w = depth.shape
@@ -79,23 +91,32 @@ def estimate_g_hat_from_floor_normals(
     full_confidence_pixels: int = 5000,
 ) -> Tuple[np.ndarray, float, Dict[str, Any]]:
     if floor_mask is None or floor_mask.shape[:2] != normal_xyz.shape[:2]:
-        return np.array([0, -1, 0], np.float32), 0.0, {"reason": "no_floor_mask"}
+        return CAMERA_UP.copy(), 0.0, {"reason": "no_floor_mask"}
     n = normal_xyz[floor_mask > 0].reshape(-1, 3)
     if len(n) == 0:
-        return np.array([0, -1, 0], np.float32), 0.0, {"reason": "empty_floor_mask"}
-    # Metric3D/OpenCV convention in current dataset: floor-like normals often
-    # have negative camera-y and limited camera-z. Keep thresholds configurable
-    # because different depth backends may expose a different normal convention.
-    sel = n[(n[:, 1] < float(normal_y_max)) & (np.abs(n[:, 2]) < float(abs_z_max))]
+        return CAMERA_UP.copy(), 0.0, {"reason": "empty_floor_mask"}
+    n = n.astype(np.float32)
+    finite = np.isfinite(n).all(axis=1)
+    lengths = np.linalg.norm(n, axis=1)
+    n = n[finite & (lengths > EPS)]
+    if len(n) == 0:
+        return CAMERA_UP.copy(), 0.0, {"reason": "no_finite_floor_normals"}
+    n = n / np.maximum(np.linalg.norm(n, axis=1, keepdims=True), EPS)
+    abs_y_min = abs(float(normal_y_max))
+    sel = n[(np.abs(n[:, 1]) > abs_y_min) & (np.abs(n[:, 2]) < float(abs_z_max))]
     if len(sel) < int(min_pixels):
-        return np.array([0, -1, 0], np.float32), 0.0, {
+        return CAMERA_UP.copy(), 0.0, {
             "reason": "not_enough_floor_normal_pixels",
             "count": int(len(sel)),
             "min_pixels": int(min_pixels),
             "normal_y_max": float(normal_y_max),
+            "abs_y_min": float(abs_y_min),
             "abs_z_max": float(abs_z_max),
         }
-    mean = normalize(np.mean(sel, axis=0).astype(np.float32))
+    flip = (sel @ CAMERA_UP) < 0.0
+    sel = sel.copy()
+    sel[flip] *= -1.0
+    mean = orient_vector_to_camera_up(np.mean(sel, axis=0).astype(np.float32))
     # Angular variance around mean.
     dots = np.clip(sel @ mean, -1, 1)
     ang = np.arccos(dots)
@@ -105,12 +126,13 @@ def estimate_g_hat_from_floor_normals(
     if var > soft_limit:
         conf *= max(0.0, soft_limit / var)
     conf *= min(1.0, len(sel) / float(full_confidence_pixels))
-    # Use +up direction. If floor normals point upward in camera y negative, keep it as g_hat "up".
-    g_hat = mean
-    return g_hat.astype(np.float32), float(conf), {
+    return mean.astype(np.float32), float(conf), {
         "count": int(len(sel)),
+        "flipped_normal_count": int(np.count_nonzero(flip)),
+        "direction_dot_camera_up": float(np.dot(mean, CAMERA_UP)),
         "angular_variance_rad": var,
         "normal_y_max": float(normal_y_max),
+        "abs_y_min": float(abs_y_min),
         "abs_z_max": float(abs_z_max),
         "min_pixels": int(min_pixels),
         "angular_variance_soft_limit_rad": soft_limit,
@@ -137,7 +159,7 @@ def estimate_g_hat_from_horizontal_reference_normals(
     convention) before averaging.
     """
     label = str(reference_label or "horizontal_reference").strip().lower()
-    default_up = np.array([0.0, -1.0, 0.0], np.float32)
+    default_up = CAMERA_UP
     if reference_mask is None or reference_mask.shape[:2] != normal_xyz.shape[:2]:
         return default_up, 0.0, {"reason": f"no_{label}_mask", "reference_label": label}
 
@@ -168,7 +190,7 @@ def estimate_g_hat_from_horizontal_reference_normals(
     flip = (sel @ default_up) < 0.0
     sel = sel.copy()
     sel[flip] *= -1.0
-    mean = normalize(np.mean(sel, axis=0).astype(np.float32))
+    mean = orient_vector_to_camera_up(np.mean(sel, axis=0).astype(np.float32))
     dots = np.clip(sel @ mean, -1.0, 1.0)
     ang = np.arccos(dots)
     var = float(np.var(ang))
@@ -201,13 +223,18 @@ def estimate_g_hat_from_global_floor_like_normals(
     lower_image_start_ratio: float = 0.55,
 ) -> Tuple[np.ndarray, float, Dict[str, Any]]:
     """Global Metric3D floor-like fallback used when semantic references fail."""
-    default_up = np.array([0.0, -1.0, 0.0], np.float32)
+    default_up = CAMERA_UP
     if normal_xyz is None or normal_xyz.ndim != 3 or normal_xyz.shape[-1] != 3:
         return default_up, 0.0, {"reason": "normal_missing_or_invalid"}
 
     h, w, _ = normal_xyz.shape
     finite = np.isfinite(normal_xyz).all(axis=-1)
-    floor_like = finite & (normal_xyz[..., 1] < float(normal_y_max)) & (np.abs(normal_xyz[..., 2]) < float(abs_z_max))
+    lengths = np.linalg.norm(normal_xyz, axis=-1)
+    normalized = np.zeros_like(normal_xyz, dtype=np.float32)
+    valid = finite & (lengths > EPS)
+    normalized[valid] = normal_xyz[valid] / lengths[valid].reshape(-1, 1)
+    abs_y_min = abs(float(normal_y_max))
+    floor_like = valid & (np.abs(normalized[..., 1]) > abs_y_min) & (np.abs(normalized[..., 2]) < float(abs_z_max))
     lower = np.zeros((h, w), dtype=bool)
     lower[int(round(h * float(lower_image_start_ratio))):, :] = True
 
@@ -223,13 +250,16 @@ def estimate_g_hat_from_global_floor_like_normals(
             "count": count,
             "min_pixels": int(min_pixels),
             "normal_y_max": float(normal_y_max),
+            "abs_y_min": float(abs_y_min),
             "abs_z_max": float(abs_z_max),
             "lower_image_start_ratio": float(lower_image_start_ratio),
         }
 
-    sel = normal_xyz[cand].reshape(-1, 3).astype(np.float32)
-    sel = sel / np.maximum(np.linalg.norm(sel, axis=1, keepdims=True), EPS)
-    mean = normalize(np.mean(sel, axis=0).astype(np.float32))
+    sel = normalized[cand].reshape(-1, 3).astype(np.float32)
+    flip = (sel @ default_up) < 0.0
+    sel = sel.copy()
+    sel[flip] *= -1.0
+    mean = orient_vector_to_camera_up(np.mean(sel, axis=0).astype(np.float32))
     dots = np.clip(sel @ mean, -1.0, 1.0)
     ang = np.arccos(dots)
     var = float(np.var(ang))
@@ -240,9 +270,12 @@ def estimate_g_hat_from_global_floor_like_normals(
     conf *= min(1.0, len(sel) / float(full_confidence_pixels))
     return mean.astype(np.float32), float(conf), {
         "count": int(len(sel)),
+        "flipped_normal_count": int(np.count_nonzero(flip)),
+        "direction_dot_camera_up": float(np.dot(mean, default_up)),
         "selected_region": selected_region,
         "angular_variance_rad": var,
         "normal_y_max": float(normal_y_max),
+        "abs_y_min": float(abs_y_min),
         "abs_z_max": float(abs_z_max),
         "min_pixels": int(min_pixels),
         "angular_variance_soft_limit_rad": soft_limit,

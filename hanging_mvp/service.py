@@ -19,6 +19,7 @@ from .masks import load_semantic_masks, masks_by_label, masks_by_role, semantic_
 from .geometry import (
     backproject, estimate_g_hat_from_floor_normals, estimate_g_hat_from_global_floor_like_normals,
     estimate_g_hat_from_horizontal_reference_normals, fit_plane_ransac, make_wall_basis,
+    orient_vector_to_camera_up,
     points_from_mask, project_points, project_quad, polygon_mask, ray_plane_depth_for_mask, scale_points_to_original
 )
 from .hardpaste import load_rgba, warp_artwork_mount_to_geometry, warp_artwork_to_quad
@@ -43,7 +44,13 @@ from .candidate_safety import (
     choose_flux2_input_policy, compute_edge_corner_support_debug,
     evaluate_wall_support_gate, semantic_axis_policy,
 )
-from .height_fit_contract import floor_source_is_metric_trusted, room_corner_floor_fit_contract
+from .height_fit_contract import (
+    evaluate_semantic_clear_rect_vertical_fit,
+    floor_source_is_metric_trusted,
+    height_contract_gate_reasons,
+    resolve_candidate_center_t,
+    room_corner_floor_fit_contract,
+)
 from .styling_metrics import analyze_artwork_luminance, measure_candidate_wall_luminance, should_suggest_dark_wallpaper
 
 try:
@@ -56,6 +63,7 @@ except Exception:  # pragma: no cover - causal layer is optional at runtime
 API_KEY = os.getenv("API_KEY", "")
 ALLOW_UNAUTH_LOCAL = os.getenv("ALLOW_UNAUTH_LOCAL", "").strip().lower() in {"1", "true", "yes", "on"}
 PORT = int(os.getenv("HANGING_MVP_PORT", "6010"))
+HANGING_PIPELINE_BUILD_ID = "2026-07-16-furniture-clearance-height-v5"
 
 
 def _truthy_env(name: str, default: str = "0") -> bool:
@@ -837,8 +845,8 @@ def _semantic_solid_max_empty_rect_axes(
 
     This path is only for low safe-coverage walls: a wall can have poor full-mask
     coverage while still containing a contiguous solid rectangle large enough for
-    the artwork.  It adds candidate positions only; final filtering and scoring
-    remain unchanged.
+    the artwork.  The rectangle may propose a horizontal axis and a safe vertical
+    interval, but it must never replace a trusted metric installation height.
     """
     safe_clear = ((semantic_clear_wall_mask > 0) & (solid_wall_mask > 0)).astype(np.uint8)
     safe_clear = cv2.morphologyEx(safe_clear, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
@@ -929,18 +937,17 @@ def _semantic_solid_max_empty_rect_axes(
             continue
 
         axis_s = float(0.5 * (s_min + s_max))
-        center_t = float(0.5 * (t_min + t_max))
         axes.append({
             "axis_s_m": axis_s,
-            "center_t_m_override": center_t,
             "component_id": int(comp_id),
             "component_area_px": int(area_px),
             "component_s_range_m": [float(s_min), float(s_max)],
             "component_t_range_m": [float(t_min), float(t_max)],
             "component_width_m": float(width_m),
             "component_height_m": float(height_m),
-            "source": "semantic_clear_subregion_max_empty_rect_center",
-            "candidate_generation_policy": "low_safe_coverage_semantic_clear_wall_intersect_solid_wall_max_empty_rect",
+            "source": "semantic_clear_subregion_max_empty_rect_horizontal_axis",
+            "candidate_generation_policy": "horizontal_axis_only_metric_height_remains_authoritative",
+            "vertical_policy": "diagnostic_only_exact_projected_footprint_is_authoritative",
             "max_empty_rect_bbox_processed": [int(gx1), int(gy1), int(gx2), int(gy2)],
         })
         debug["added_count"] += 1
@@ -1394,8 +1401,14 @@ async def analyze_hanging_mvp(
             "debug": candidate_debug,
         })
 
+    g_hat_before_canonicalization = np.asarray(g_hat, dtype=np.float32).reshape(3)
+    g_hat = orient_vector_to_camera_up(g_hat_before_canonicalization)
     g_debug.update({
         "source": gravity_source,
+        "g_hat_cam": [float(x) for x in g_hat],
+        "camera_up_direction": [0.0, -1.0, 0.0],
+        "direction_dot_camera_up": float(np.dot(g_hat, np.array([0.0, -1.0, 0.0], np.float32))),
+        "direction_flip_applied_at_service_boundary": bool(float(np.dot(g_hat_before_canonicalization, g_hat)) < 0.0),
         "reference_priority": ["floor", "roof", "table", "metric3d_global_floor_like_normals"],
         "semantic_reference_counts": {
             "floor": len(floors),
@@ -2322,12 +2335,32 @@ async def analyze_hanging_mvp(
         if wall_id in wall_debug_registry:
             wall_debug_registry[wall_id]["floor_wall_estimation"] = floor_wall_estimation
             wall_debug_registry[wall_id]["summary"]["floor_wall_estimation_source"] = floor_wall_estimation.get("source")
+        if floor_source_trusted and not bool(floor_wall_estimation.get("floor_below_camera", floor_height_abs_m < 0.0)):
+            rejected.append({
+                "wall_id": wall_id,
+                "reason": "trusted_floor_direction_invalid_not_below_camera",
+                "wall_has_no_safe_candidate": True,
+                "floor_wall_estimation": floor_wall_estimation,
+                "g_hat_debug": g_debug,
+            })
+            continue
         if bool((rules.get("room_corner_floor_fit", {}) or {}).get("require_trusted_floor_for_auto_candidate", True)) and not floor_source_trusted:
             rejected.append({"wall_id": wall_id, "reason": "trusted_wall_floor_intersection_required", "wall_has_no_safe_candidate": True, "floor_wall_estimation": floor_wall_estimation})
             continue
         for axis_item in axes:
             axis_s = float(axis_item["axis_s_m"])
-            support_context = _estimate_axis_support_context(objects, xyz, basis, axis_s, artwork_w_m, artwork_h_m, rules, floor_height_abs_m)
+            support_context = _estimate_axis_support_context(
+                objects,
+                xyz,
+                basis,
+                axis_s,
+                artwork_w_m,
+                artwork_h_m,
+                rules,
+                floor_height_abs_m,
+                plane=plane,
+                floor_source_trusted=floor_source_trusted,
+            )
             if not floor_source_trusted:
                 support_context.update({
                     "height_mode": "provisional_visual_review_required",
@@ -2341,23 +2374,38 @@ async def analyze_hanging_mvp(
                 })
             else:
                 support_context.setdefault("height_band_base", "estimated_full_wall_or_trusted_floor")
-            center_height_abs_m = float(support_context["center_height_abs_m"])
-            center_height_above_floor_m = float(support_context["center_height_above_floor_m"])
-            center_t_override = axis_item.get("center_t_m_override")
-            if center_t_override is not None and np.isfinite(float(center_t_override)):
-                center_t = float(center_t_override)
-                center_point = wall_origin_np + wall_v_np * center_t
-                center_height_abs_m = float(np.dot(center_point, g_hat_np))
-                center_height_above_floor_m = float(center_height_abs_m - floor_height_abs_m)
-                support_context["center_height_abs_m"] = center_height_abs_m
-                support_context["center_height_above_floor_m"] = center_height_above_floor_m
-                support_context["center_t_override_m"] = center_t
-                support_context["center_t_override_source"] = axis_item.get("source")
-            else:
-                center_t = float((center_height_abs_m - float(np.dot(wall_origin_np, g_hat_np))) / dot_v_g)
+            rule_center_height_abs_m = float(support_context["center_height_abs_m"])
+            max_height_rule_deviation_m = float(rule_value(
+                rules,
+                ["height_rule_consistency", "max_metric_rule_deviation_m"],
+                0.10,
+            ))
+            height_contract = resolve_candidate_center_t(
+                rule_center_height_abs_m=rule_center_height_abs_m,
+                floor_height_abs_m=floor_height_abs_m,
+                wall_origin_dot_g=float(np.dot(wall_origin_np, g_hat_np)),
+                dot_v_g=dot_v_g,
+                height_mode=str(support_context.get("height_mode", "metric_rule")),
+                axis_item=axis_item,
+                max_metric_rule_deviation_m=max_height_rule_deviation_m,
+            )
+            center_t = float(height_contract["resolved_center_t_m"])
+            center_height_abs_m = float(height_contract["resolved_center_height_abs_m"])
+            center_height_above_floor_m = float(height_contract["resolved_center_height_above_floor_m"])
+            support_context["center_height_abs_m"] = center_height_abs_m
+            support_context["center_height_above_floor_m"] = center_height_above_floor_m
+            support_context["height_contract"] = height_contract
             visible_t_min = float(np.percentile(t_vals, 5))
             visible_t_max = float(np.percentile(t_vals, 95))
             center_t_normalized = float((center_t - visible_t_min) / max(1e-6, visible_t_max - visible_t_min))
+
+            vertical_fit_debug = evaluate_semantic_clear_rect_vertical_fit(
+                center_t_m=center_t,
+                artwork_height_m=artwork_h_m,
+                min_edge_margin_m=min_edge_margin_m,
+                component_t_range_m=axis_item.get("component_t_range_m"),
+                axis_source=axis_item.get("source"),
+            )
 
             candidate_id = f"cand_{candidate_idx:03d}"
             candidate_idx += 1
@@ -2652,7 +2700,10 @@ async def analyze_hanging_mvp(
                 rules=rules,
             )
 
-            reasons = []
+            reasons = height_contract_gate_reasons(
+                height_contract=height_contract,
+                semantic_clear_rect_relation=vertical_fit_debug,
+            )
             soft_risk_reasons = []
             if fine_grained_front_policy_enabled:
                 clearance_has_metric_evidence = structural_clearance_debug.get("min_clearance_m") is not None
@@ -2737,9 +2788,10 @@ async def analyze_hanging_mvp(
                 "safe_wall_support_gate_ratio": wall_support_gate.get("safe_wall_support_gate_ratio"),
                 "wall_support_gate": wall_support_gate,
                 "candidate_reject_stage": (
-                    "blocking_existing_content_gate" if "blocking_existing_content_overlap" in reasons
+                    "height_contract_gate" if "metric_height_rule_deviation_exceeds_threshold" in reasons
+                    else ("blocking_existing_content_gate" if "blocking_existing_content_overlap" in reasons
                     else ("solid_wall_support_gate" if "insufficient_safe_wall_support" in reasons
-                    else ("edge_corner_support_gate" if any(r in reasons for r in ["artwork_edge_support_below_hard_reject_threshold", "artwork_corner_support_below_hard_reject_threshold"]) else None))
+                    else ("edge_corner_support_gate" if any(r in reasons for r in ["artwork_edge_support_below_hard_reject_threshold", "artwork_corner_support_below_hard_reject_threshold"]) else None)))
                 ),
                 "candidate_reject_reason": reasons[0] if reasons else None,
                 "hard_gate_reasons": list(dict.fromkeys(wall_support_gate.get("hard_gate_reasons", []) + reasons)),
@@ -2761,6 +2813,8 @@ async def analyze_hanging_mvp(
                 "visible_wall_t_range_m": [float(visible_t_min), float(visible_t_max)],
                 "artwork_width_m": float(artwork_w_m),
                 "artwork_height_m": float(artwork_h_m),
+                "height_rule_consistency": height_contract,
+                "semantic_clear_rect_vertical_fit": vertical_fit_debug,
                 "structural_forbidden_overlap_ratio": float(struct_overlap),
                 "structural_clearance_policy": structural_clearance_debug,
                 "soft_risk_reasons": soft_risk_reasons,
@@ -2917,7 +2971,11 @@ async def analyze_hanging_mvp(
                     "solid_component_area_px": int(axis_item.get("component_area_px", 0)),
                     "axis_source": axis_item.get("source", "unknown"),
                     "component_s_range_m": axis_item.get("component_s_range_m"),
+                    "component_t_range_m": axis_item.get("component_t_range_m"),
                     "component_width_m": axis_item.get("component_width_m"),
+                    "component_height_m": axis_item.get("component_height_m"),
+                    "candidate_generation_policy": axis_item.get("candidate_generation_policy"),
+                    "vertical_policy": axis_item.get("vertical_policy"),
                     "edge_margin_debug": edge_margin_debug,
                 },
                 "support_context": support_context,
@@ -2941,6 +2999,8 @@ async def analyze_hanging_mvp(
                     "room_corner_floor_fit": room_corner_floor_fit_contract(rules),
                     "center_t_m": float(center_t),
                     "center_t_normalized": float(center_t_normalized),
+                    "height_rule_consistency": height_contract,
+                    "semantic_clear_rect_vertical_fit": vertical_fit_debug,
                     "height_projection": {
                         "formula": "center_t_m=(center_height_abs_m-dot(wall_origin,g_hat_cam))/dot(wall_v,g_hat_cam)",
                         "dot_v_g": float(dot_v_g),
@@ -3506,6 +3566,12 @@ async def analyze_hanging_mvp(
     plan = {
         "status": "ok" if selected else "partial",
         "exit_code": selected_exit_code if selected else ("PARTIAL_REVIEW_CANDIDATES_ONLY" if near_miss_candidates else "PARTIAL_ALL_REJECTED_WITH_REASONS"),
+        "pipeline_build": {
+            "build_id": HANGING_PIPELINE_BUILD_ID,
+            "height_contract": "metric_height_authoritative_exact_footprint_v3",
+            "support_contract": "recognized_support_label_specific_clearance_v5",
+            "gravity_contract": "camera_up_canonicalized_v2",
+        },
         "requires_hardpaste_vlm_review": selected_requires_hardpaste_vlm_review,
         "image_space": {
             "processed_size": [w, h],
@@ -3536,6 +3602,12 @@ async def analyze_hanging_mvp(
             "reviews": all_hardpaste_reviews,
         },
         "debug": {
+            "gravity_reference": {
+                "g_hat_cam": [float(x) for x in g_hat],
+                "confidence": float(g_conf),
+                "source": gravity_source,
+                "details": g_debug,
+            },
             "rejected_candidates": rejected,
             "near_miss_candidates": near_miss_candidates,
             "auto_multiwall_debug": auto_multiwall_debug,

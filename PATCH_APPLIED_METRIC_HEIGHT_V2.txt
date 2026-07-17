@@ -1,0 +1,33 @@
+PATCH APPLIED: metric-height-authoritative-v2
+================================================
+
+Build ID
+--------
+2026-07-15-metric-height-authoritative-v2
+
+Purpose
+-------
+This archive contains the fix for the repeated "hanging too high" result.
+It is not the untouched Molink-GPU-v1.1 baseline.
+
+Key guarantees
+--------------
+1. A metric hanging rule remains the authoritative vertical target.
+2. The max-empty-rectangle heuristic may search horizontally, but may not
+   silently replace the vertical target selected by the metric rule.
+3. A semantic rectangle is rejected for vertical fitting when it does not
+   contain the requested target height.
+4. Support context is associated with the current wall; counter support and
+   a trusted floor fallback are handled explicitly.
+5. Floor refinement, wall projection, and gravity-reference diagnostics have
+   regression coverage.
+
+Quick verification
+------------------
+Open hanging_mvp/service.py and search for either string:
+
+  2026-07-15-metric-height-authoritative-v2
+  semantic_clear_subregion_max_empty_rect_horizontal_axis
+
+The exact SHA-256 values of every changed or added implementation/test file
+are recorded in PATCH_MANIFEST_METRIC_HEIGHT_V2.sha256.

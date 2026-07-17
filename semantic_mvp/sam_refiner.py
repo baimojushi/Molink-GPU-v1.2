@@ -166,6 +166,11 @@ def default_refine_label_set() -> set[str]:
         "pedestal,plinth,display_stand",
     )
     out = {x.strip() for x in labels.split(",") if x.strip()}
+    # Floor is a metric geometry anchor. Keep it in the refinement set even if
+    # a deployment narrows SAM_REFINE_LABELS; an explicit empty force variable
+    # remains available as an operator opt-out.
+    forced = os.getenv("SAM_FORCE_REFINE_LABELS", "floor")
+    out.update({x.strip() for x in forced.split(",") if x.strip()})
     if env_bool("SAM_REFINE_WALL", False):
         out.add("wall")
     return out
@@ -192,7 +197,12 @@ def refine_objects_with_sam(
         debug["reason"] = "sam_disabled"
         return objects, debug
     refine_labels = {x.strip() for x in refine_labels_csv.split(",") if x.strip()} if refine_labels_csv.strip() else default_refine_label_set()
+    forced_refine_labels = {
+        x.strip() for x in os.getenv("SAM_FORCE_REFINE_LABELS", "floor").split(",") if x.strip()
+    }
+    refine_labels.update(forced_refine_labels)
     debug["refine_labels"] = sorted(refine_labels)
+    debug["forced_refine_labels"] = sorted(forced_refine_labels)
     try:
         predictor = _load_sam1_predictor()
     except Exception as e:

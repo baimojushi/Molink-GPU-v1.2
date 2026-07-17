@@ -75,6 +75,43 @@
     "min_floor_valid_points": {
       "value": 50,
       "notes": "Floor support-context probe minimum, separated from generic support min_valid_points."
+    },
+    "bbox_fallback_max_distance_to_wall_m": {
+      "value": 0.9,
+      "notes": "Conservative inner processed bbox fallback when a semantic support has no SAM mask; distant foreground remains rejected."
+    },
+    "geometry_fallback_enabled": {
+      "value": true,
+      "notes": "Infer an unlabeled wall-adjacent counter/cabinet height band only when no semantic furniture is associated with the current wall."
+    },
+    "geometry_min_front_distance_m": {
+      "value": 0.12
+    },
+    "geometry_max_front_distance_m": {
+      "value": 0.9
+    },
+    "geometry_min_support_height_above_floor_m": {
+      "value": 0.55
+    },
+    "geometry_max_support_height_above_floor_m": {
+      "value": 1.45
+    },
+    "geometry_height_bin_m": {
+      "value": 0.04
+    },
+    "geometry_min_height_bin_points": {
+      "value": 200
+    },
+    "geometry_min_support_span_m": {
+      "value": 0.25
+    },
+    "furniture_min_bottom_gap_m": {
+      "value": 0.15,
+      "notes": "Fallback only. Table uses 0.20m; counter/cabinet/sideboard and generic geometry support use 0.25m."
+    },
+    "furniture_never_below_floor_default": {
+      "value": true,
+      "notes": "Furniture context may raise the artwork for clearance, but must not make it lower than the trusted floor default."
     }
   },
   "height_rules": {
@@ -90,10 +127,16 @@
       }
     },
     "table": {
-      "center_height_m": 1.35
+      "center_height_m": 1.35,
+      "min_bottom_gap_to_support_m": 0.2
     },
     "cabinet": {
-      "center_height_m": 1.35
+      "center_height_m": 1.35,
+      "min_bottom_gap_to_support_m": 0.25
+    },
+    "counter": {
+      "center_height_m": 1.35,
+      "min_bottom_gap_to_support_m": 0.25
     },
     "unknown": {
       "height_mode": "provisional_visual_review_required",
@@ -102,7 +145,16 @@
       "requires_frontend_visual_height_selection": true,
       "requires_flux_visual_height_refinement": false,
       "preserve_artwork_scale": true,
-      "notes": "P2 room-corner floor fit is not enabled. Unknown/web-image scale remains a provisional preview and must not be presented as finalized installation height."
+      "notes": "Unknown support remains provisional unless a trusted metric floor source is available. Provisional previews must not be presented as finalized installation height."
+    }
+  },
+  "height_rule_consistency": {
+    "max_metric_rule_deviation_m": {
+      "value": 0.1,
+      "notes": "Automatic geometry may choose a horizontal axis but must not move a finalized metric center height by more than this amount."
+    },
+    "semantic_clear_rect_vertical_policy": {
+      "value": "diagnostic_only_exact_projected_footprint_is_authoritative"
     }
   },
   "hard_constraints": {

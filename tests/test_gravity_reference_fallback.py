@@ -1,6 +1,7 @@
 import numpy as np
 
 from hanging_mvp.geometry import (
+    estimate_g_hat_from_floor_normals,
     estimate_g_hat_from_global_floor_like_normals,
     estimate_g_hat_from_horizontal_reference_normals,
 )
@@ -68,3 +69,33 @@ def test_global_metric3d_floor_like_fallback_uses_lower_region_first():
     assert conf > 0.99
     assert g_hat[1] < -0.98
     assert debug["selected_region"] == "lower_image"
+
+
+def test_floor_normal_sign_is_canonicalized_to_camera_up():
+    normal = np.zeros((24, 24, 3), np.float32)
+    normal[:, :, 1] = 1.0
+    mask = np.full((24, 24), 255, np.uint8)
+
+    g_hat, conf, debug = estimate_g_hat_from_floor_normals(
+        normal, mask, min_pixels=100, full_confidence_pixels=100
+    )
+
+    assert conf > 0.0
+    assert np.allclose(g_hat, [0.0, -1.0, 0.0], atol=1e-5)
+    assert debug["flipped_normal_count"] == 24 * 24
+
+
+def test_global_floor_like_fallback_accepts_opposite_normal_sign():
+    normal = np.zeros((30, 20, 3), np.float32)
+    normal[:, :, 1] = 1.0
+
+    g_hat, conf, debug = estimate_g_hat_from_global_floor_like_normals(
+        normal,
+        min_pixels=100,
+        full_confidence_pixels=100,
+        lower_image_start_ratio=0.5,
+    )
+
+    assert conf > 0.0
+    assert np.allclose(g_hat, [0.0, -1.0, 0.0], atol=1e-5)
+    assert debug["flipped_normal_count"] == 15 * 20

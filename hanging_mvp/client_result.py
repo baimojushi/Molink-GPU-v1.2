@@ -9,6 +9,9 @@ RULE_LABELS = {
     "sofa_bottom_gap_15": "沙发上方留15cm下边距",
     "table_center_135": "边柜/茶几上方居中",
     "cabinet_center_135": "柜体上方居中",
+    "counter_center_135": "吧台/操作台上方居中",
+    "counter_fixture_center_135": "吧台/操作台上方居中",
+    "sideboard_center_135": "边柜上方居中",
     "floor_center_152": "悬空墙面标准高度（画心离地约152cm）",
     "unknown_provisional_visual_review_required": "临时预览高度，建议现场确认",
 }
@@ -16,6 +19,7 @@ RULE_LABELS = {
 LABEL_ZH = {
     "door": "门", "window": "窗", "arch": "拱", "opening": "开口",
     "sofa": "沙发", "table": "边柜/茶几", "cabinet": "柜体",
+    "counter": "吧台/操作台", "counter_fixture": "吧台/操作台", "sideboard": "边柜",
     "floor": "悬空", "unknown": "未知支撑",
 }
 
@@ -151,7 +155,7 @@ def _composition_context(candidate: Dict[str, Any], artwork_h_m: float) -> Dict[
     above_zh = LABEL_ZH.get(lbl, lbl)
     return {
         "above_furniture_label": lbl,
-        "above_furniture_label_zh": "悬空墙面" if lbl == "floor" else (f"{above_zh}上方" if lbl in ("sofa", "table", "cabinet") else above_zh),
+        "above_furniture_label_zh": "悬空墙面" if lbl == "floor" else (f"{above_zh}上方" if lbl in ("sofa", "table", "cabinet", "counter", "counter_fixture", "sideboard") else above_zh),
         "height_rule_label": RULE_LABELS.get(rule_id, rule_id),
         "bottom_gap_to_furniture_cm": _to_cm(bottom_gap),
         "center_t_label": t_label,
@@ -256,8 +260,12 @@ def _reason_tags(candidate: Dict[str, Any]) -> List[str]:
     if isinstance(cleanup, dict) and cleanup.get("existing_content_cleanup_required"):
         tags.append("需先清除候选墙已有挂画")
     height = candidate.get("height_solution", {})
-    if height.get("height_mode") == "metric_rule":
+    height_consistency = height.get("height_rule_consistency", {}) if isinstance(height, dict) else {}
+    height_rule_consistent = bool(height_consistency.get("metric_height_rule_consistent", True))
+    if height.get("height_mode") == "metric_rule" and height_rule_consistent:
         tags.append("高度符合规则")
+    elif height.get("height_mode") == "metric_rule":
+        tags.append("高度偏离规则，需人工确认")
     elif height.get("requires_frontend_visual_height_selection") or height.get("requires_visual_height_selection"):
         tags.append("高度为临时预览，需确认")
     risk = hard.get("risk_assessment", {}) if isinstance(hard.get("risk_assessment", {}), dict) else {}
@@ -342,7 +350,12 @@ def _candidate_to_plan(candidate: Dict[str, Any], rank: int, base_asset_prefix: 
     hard = candidate.get("hard_constraints", {}) if isinstance(candidate.get("hard_constraints"), dict) else {}
     center_height_m = height.get("center_height_above_floor_m")
     provisional_center_height_cm = round(float(center_height_m) * 100) if center_height_m is not None else None
-    metric_height_finalized = bool(height.get("metric_height_finalized", height.get("height_mode") == "metric_rule"))
+    height_consistency = height.get("height_rule_consistency", {}) if isinstance(height.get("height_rule_consistency"), dict) else {}
+    height_rule_consistent = bool(height_consistency.get("metric_height_rule_consistent", True))
+    metric_height_finalized = bool(
+        height.get("metric_height_finalized", height.get("height_mode") == "metric_rule")
+        and height_rule_consistent
+    )
     center_height_cm = provisional_center_height_cm if metric_height_finalized else None
 
     risk_level = _risk_level(candidate)
@@ -383,11 +396,15 @@ def _candidate_to_plan(candidate: Dict[str, Any], rank: int, base_asset_prefix: 
             "wall_mean_luminance": candidate.get("wall_mean_luminance"),
             "suggest_dark_wallpaper": bool(candidate.get("suggest_dark_wallpaper")),
             "suggested_wall_tone_rgb": candidate.get("suggested_wall_tone_rgb"),
-            "requires_manual_height_adjustment": bool(height.get("requires_frontend_visual_height_selection", False)),
+            "requires_manual_height_adjustment": bool(
+                height.get("requires_frontend_visual_height_selection", False)
+                or not height_rule_consistent
+            ),
             "requires_flux_visual_height_refinement": bool(height.get("requires_flux_visual_height_refinement", False)),
             "metric_height_finalized": metric_height_finalized,
             "height_band_base": height.get("height_band_base", "unknown"),
             "height_warning": height.get("height_warning"),
+            "height_rule_consistency": height_consistency,
             "center_t_normalized": height.get("center_t_normalized"),
             "flux_visual_refinement": height.get("flux_visual_refinement"),
             # —— §7.3.7 增强字段 ——
@@ -506,6 +523,7 @@ def build_client_result(
     return {
         "status": plan.get("status"),
         "exit_code": plan.get("exit_code"),
+        "pipeline_build": plan.get("pipeline_build"),
         "best_plan": plans[0] if plans else None,
         "alternative_plans": plans[1:],
         "not_recommended": not_recommended,

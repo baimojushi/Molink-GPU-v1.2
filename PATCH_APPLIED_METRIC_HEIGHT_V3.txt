@@ -1,0 +1,42 @@
+PATCH APPLIED: metric-height-exact-footprint-v3
+================================================
+
+Build ID
+--------
+2026-07-16-metric-height-exact-footprint-v3
+
+Regression
+----------
+job_461299b7 / cand_004
+
+  authoritative center height above floor: 1.52 m
+  resolved center_t_m:                     0.129624654020198
+  max-empty-rect t range:                  [0.2526162639260292,
+                                             1.2188170552253723]
+
+V3 behavior
+-----------
+The max-empty rectangle is a horizontal candidate seed only. Its vertical
+interval is diagnostic: it cannot move the metric target and cannot reject the
+candidate. Acceptance is decided from the artwork footprint projected at the
+1.52 m target using wall, edge, corner, structural, blocker and occlusion gates.
+
+Expected cand_004 contract
+--------------------------
+  geometric_fit: false
+  blocking:      false
+  passed:        true
+  height:        unchanged at 1.52 m
+
+Quick verification
+------------------
+Open hanging_mvp/service.py and search for:
+
+  2026-07-16-metric-height-exact-footprint-v3
+  diagnostic_only_exact_projected_footprint_is_authoritative
+
+The obsolete hard-reject string below must not exist in hanging_mvp or tests:
+
+  metric_height_outside_semantic_clear_rectangle
+
+Exact SHA-256 values are recorded in PATCH_MANIFEST_METRIC_HEIGHT_V3.sha256.
