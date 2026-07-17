@@ -1,0 +1,58 @@
+PATCH APPLIED: render-identity-review-state-v6
+==============================================
+
+Build ID
+--------
+2026-07-17-render-identity-review-state-v6
+
+Incident
+--------
+job_453ca7c7 completed candidate generation but the textured-wall full-space
+render repainted and relocated the artwork:
+
+  raw core_masked_ssim: 0.087719
+  raw core_color_delta:  66.5031
+  render exit:           PARTIAL_HARDPASTE_REVIEW
+
+The render provider endpoint does not accept a native edit mask. The textured
+wall gate used a full-room request with prompt-side coordinates, which cannot
+guarantee artwork identity or planned geometry.
+
+V6 render behavior
+------------------
+- full-space output is always locally bounded before delivery QA
+- artwork front and mount stay at the exact candidate geometry
+- pixels outside flux2_edit_mask stay byte-identical to the cleaned hard-paste
+- provider shadow is accepted only when raw artwork identity passed QA
+- failed raw identity uses a bounded mask-projected soft contact shadow and
+  admits no provider pixels
+- raw-provider QA and post-lock delivery QA are both recorded
+- QA thresholds are unchanged
+
+V6 worker behavior
+------------------
+- render_review emits r2_upload/done at 92% with delivery counts
+- fatal outcomes alone emit failed/failed
+- reconnect/resend uses the same terminal-state mapping
+
+Retained earlier fixes
+----------------------
+The archive still contains the metric-height V3 and furniture-clearance V5
+changes. The service build exposes all active contracts in pipeline_build.
+
+Quick verification
+------------------
+Search hanging_mvp/service.py for:
+
+  2026-07-17-render-identity-review-state-v6
+
+Search hanging_mvp/render_qa.py for:
+
+  identity_locked_shadow_composite_v2
+
+Search worker/result_builder.py for:
+
+  terminal_progress_contract
+
+Exact SHA-256 values are recorded in
+PATCH_MANIFEST_RENDER_IDENTITY_REVIEW_V6.sha256.

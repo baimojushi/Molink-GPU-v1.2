@@ -10,7 +10,7 @@ from hanging_mvp.candidate_safety import (
     evaluate_wall_support_gate,
     semantic_axis_policy,
 )
-from hanging_mvp.render_qa import evaluate_mask_anchored_render_qa
+from hanging_mvp.render_qa import enforce_identity_locked_shadow_composite, evaluate_mask_anchored_render_qa
 from hanging_mvp.hardpaste import warp_artwork_to_quad
 
 
@@ -90,6 +90,59 @@ def test_mask_anchored_render_qa_passes_noop_and_rejects_core_rewrite(tmp_path: 
     qa_bad = evaluate_mask_anchored_render_qa(hard_paste_path=target_path, render_path=rewritten_path, art_region_mask_path=mask_path)
     assert qa_bad["passed"] is False
     assert "core_masked_ssim_below_threshold" in qa_bad["failures"] or "core_color_delta_above_threshold" in qa_bad["failures"]
+
+
+def test_full_space_identity_lock_restores_core_and_scope_but_keeps_neutral_shadow(tmp_path: Path):
+    hard = np.zeros((80, 96, 3), np.uint8) + 180
+    hard[28:52, 36:60] = [220, 35, 45]
+    front = np.zeros((80, 96), np.uint8)
+    front[28:52, 36:60] = 255
+    mount = front.copy()
+    edit = np.zeros((80, 96), np.uint8)
+    edit[20:60, 28:68] = 255
+
+    provider = np.clip(hard.astype(np.int16) + 12, 0, 255).astype(np.uint8)
+    # Repainted core and a displaced colored ghost must not enter production.
+    provider[28:52, 36:60] = [30, 50, 235]
+    provider[24:28, 32:56] = [15, 180, 30]
+    # Connected neutral darkening outside the mount is a valid contact shadow.
+    provider[54:58, 36:60] = np.clip(hard[54:58, 36:60].astype(np.int16) - 18, 0, 255)
+
+    hard_path = _save(tmp_path / "hard.png", hard)
+    provider_path = _save(tmp_path / "provider.png", provider)
+    front_path = _save(tmp_path / "front.png", front)
+    mount_path = _save(tmp_path / "mount.png", mount)
+    edit_path = _save(tmp_path / "edit.png", edit)
+    output_path = tmp_path / "identity_locked.png"
+    trace = enforce_identity_locked_shadow_composite(
+        hard_paste_path=hard_path,
+        provider_render_path=provider_path,
+        artwork_front_mask_path=front_path,
+        mount_mask_path=mount_path,
+        edit_mask_path=edit_path,
+        output_path=output_path,
+        protect_dilate_px=1,
+        shadow_blur_px=0,
+        provider_identity_trusted=False,
+    )
+
+    output = np.asarray(Image.open(output_path).convert("RGB"), dtype=np.uint8)
+    assert np.array_equal(output[front > 0], hard[front > 0])
+    assert np.array_equal(output[edit == 0], hard[edit == 0])
+    assert np.array_equal(output[25, 40], hard[25, 40])
+    assert int(output[53, 40, 0]) < int(hard[53, 40, 0])
+    assert trace["scope_enforced_locally"] is True
+    assert trace["provider_contribution_present"] is False
+    assert trace["shadow_source"] == "mask_projected_contact_shadow"
+
+    qa = evaluate_mask_anchored_render_qa(
+        hard_paste_path=hard_path,
+        render_path=output_path,
+        art_region_mask_path=front_path,
+    )
+    assert qa["passed"] is True
+    assert qa["core_masked_ssim"] == 1.0
+    assert qa["core_color_delta"] == 0.0
 
 
 def test_supersampled_hardpaste_supports_tiny_artwork_without_empty_mask():

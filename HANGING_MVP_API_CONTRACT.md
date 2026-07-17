@@ -60,6 +60,23 @@ Render drift QA is mask-anchored: `art_region_mask` defines the deterministic ge
 
 Failed Flux QA must never be silently published as `OK_SELECTED`. Failed items return `PARTIAL_HARDPASTE_REVIEW` and are written under `partial_review/`, not `final_hd/`.
 
+For `gpt-image-2-vip` textured-wall requests, the remote endpoint cannot accept
+a native edit mask and receives a full-space coordinate prompt. The production
+output must therefore pass a deterministic local identity/scope lock before QA:
+
+- candidate artwork-front and mount pixels are restored at the planned geometry;
+- all pixels outside `flux2_edit_mask` are restored from the cleaned hard-paste;
+- provider shadow pixels are admitted only when raw artwork identity passed QA;
+  otherwise a soft bounded contact shadow is projected from the exact mount mask
+  and no provider pixel is admitted;
+- QA runs on this composite, while `raw_provider_render_size_qa` retains the raw
+  model result for audit. Thresholds are not relaxed.
+
+`result.status=render_review` is a completed review state, not a worker failure.
+The terminal progress event is `stage=r2_upload`, `stage_state=done`, `pct=92`
+with partial/final counts attached; only actual fatal result statuses emit
+`stage=failed`, `stage_state=failed`.
+
 ## P2 contract-only additions
 
 `room_corner_floor_fit` is specification-only and remains disabled in production until validated. Its minimum contract requires:

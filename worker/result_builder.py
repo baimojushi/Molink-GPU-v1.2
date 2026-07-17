@@ -18,6 +18,19 @@ PARTIAL_REVIEW_SUFFIXES = (
 )
 
 
+def terminal_progress_contract(status: str | None) -> tuple[str, str, int, str]:
+    """Map result status without conflating render review with pipeline failure."""
+    normalized = str(status or "").strip().lower()
+    if normalized in {"succeeded", "succeeded_partial"}:
+        return "done", "done", 100, "完成"
+    if normalized == "render_review":
+        # REVIEW is derived from a completed upload event with partial images
+        # and no final URL. Sending failed here incorrectly creates
+        # hanging_failed even though every pipeline stage completed.
+        return "r2_upload", "done", 92, "效果图已生成，正在复核"
+    return "failed", "failed", 92, "本次自动生成遇到异常，团队会继续为您处理…"
+
+
 def _truthy_env(name: str, default: str = "1") -> bool:
     value = os.getenv(name, default)
     return str(value).strip().lower() not in {"", "0", "false", "no", "off"}

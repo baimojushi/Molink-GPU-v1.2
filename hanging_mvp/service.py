@@ -63,7 +63,7 @@ except Exception:  # pragma: no cover - causal layer is optional at runtime
 API_KEY = os.getenv("API_KEY", "")
 ALLOW_UNAUTH_LOCAL = os.getenv("ALLOW_UNAUTH_LOCAL", "").strip().lower() in {"1", "true", "yes", "on"}
 PORT = int(os.getenv("HANGING_MVP_PORT", "6010"))
-HANGING_PIPELINE_BUILD_ID = "2026-07-16-furniture-clearance-height-v5"
+HANGING_PIPELINE_BUILD_ID = "2026-07-17-render-identity-review-state-v6"
 
 
 def _truthy_env(name: str, default: str = "0") -> bool:
@@ -3571,6 +3571,8 @@ async def analyze_hanging_mvp(
             "height_contract": "metric_height_authoritative_exact_footprint_v3",
             "support_contract": "recognized_support_label_specific_clearance_v5",
             "gravity_contract": "camera_up_canonicalized_v2",
+            "render_contract": "fullspace_identity_locked_shadow_v2",
+            "worker_result_contract": "render_review_is_completed_review_v1",
         },
         "requires_hardpaste_vlm_review": selected_requires_hardpaste_vlm_review,
         "image_space": {

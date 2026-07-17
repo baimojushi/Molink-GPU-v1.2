@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +42,221 @@ def _chroma_delta(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     ca = a.astype(np.float32) - la
     cb = b.astype(np.float32) - lb
     return np.mean(np.abs(cb - ca), axis=2)
+
+
+def enforce_identity_locked_shadow_composite(
+    *,
+    hard_paste_path: Path,
+    provider_render_path: Path,
+    artwork_front_mask_path: Path,
+    mount_mask_path: Path,
+    edit_mask_path: Path,
+    output_path: Path,
+    protect_dilate_px: int = 4,
+    shadow_min_darkening_delta: float = 4.0,
+    shadow_max_brighten_delta: float = 3.0,
+    shadow_max_chroma_delta: float = 6.0,
+    shadow_max_darkening_delta: float = 24.0,
+    shadow_blur_px: float = 1.25,
+    shadow_min_component_area_px: int = 4,
+    provider_identity_trusted: bool = True,
+    fallback_shadow_max_darkening_delta: float = 14.0,
+) -> dict[str, Any]:
+    """Lock artwork identity/geometry and retain only explainable contact shadow.
+
+    Some image-edit endpoints cannot accept a real mask. For textured walls the
+    provider therefore sees the full room and may repaint or relocate the tiny
+    artwork even when the prompt contains exact coordinates. This compositor
+    makes the local contract deterministic:
+
+    * the cleaned hard-paste is the base image;
+    * artwork-front and precomposed mount pixels stay byte-identical;
+    * pixels outside the edit mask stay byte-identical;
+    * provider shadow is admitted only when raw artwork identity passed QA;
+    * otherwise a bounded soft contact shadow is projected from the known mount
+      mask, so displaced provider content cannot survive as a rectangular ghost.
+
+    QA must still run on the returned image; this function does not bypass any
+    delivery threshold.
+    """
+    # Keep full-resolution rooms in uint8 and promote only the working delta.
+    # A 3648x2736 frame is common here; loading both inputs as float32 and then
+    # allocating another RGB delta needlessly adds hundreds of MB of peak RAM.
+    with Image.open(hard_paste_path) as hard_image:
+        hard = np.asarray(hard_image.convert("RGB"), dtype=np.uint8)
+    with Image.open(provider_render_path) as render_image:
+        render = np.asarray(render_image.convert("RGB"), dtype=np.uint8)
+    height, width = hard.shape[:2]
+    if render.shape[:2] != (height, width):
+        render = cv2.resize(render, (width, height), interpolation=cv2.INTER_LANCZOS4)
+
+    front = _load_mask(Path(artwork_front_mask_path), (height, width))
+    mount = _load_mask(Path(mount_mask_path), (height, width))
+    edit = _load_mask(Path(edit_mask_path), (height, width))
+    if not np.any(front):
+        raise ValueError("identity lock requires a non-empty artwork front mask")
+    if not np.any(mount):
+        raise ValueError("identity lock requires a non-empty mount mask")
+    if not np.any(edit):
+        raise ValueError("identity lock requires a non-empty edit mask")
+    if np.any(front & ~mount):
+        raise ValueError("artwork front mask must be contained by the mount mask")
+    if np.any(mount & ~edit):
+        raise ValueError("mount mask must be contained by the edit mask")
+
+    protect_radius = max(0, int(protect_dilate_px))
+    protected = mount.copy()
+    if protect_radius > 0:
+        protected = cv2.dilate(mount.astype(np.uint8), _kernel(protect_radius), iterations=1) > 0
+
+    delta = render.astype(np.int16) - hard.astype(np.int16)
+    luma_delta = (
+        delta[:, :, 0].astype(np.float32) * 0.2126
+        + delta[:, :, 1].astype(np.float32) * 0.7152
+        + delta[:, :, 2].astype(np.float32) * 0.0722
+    )
+    chroma_delta = (
+        np.abs(delta[:, :, 0].astype(np.float32) - luma_delta)
+        + np.abs(delta[:, :, 1].astype(np.float32) - luma_delta)
+        + np.abs(delta[:, :, 2].astype(np.float32) - luma_delta)
+    ) / 3.0
+    max_channel_delta = np.max(delta, axis=2)
+    if provider_identity_trusted:
+        shadow_like = (
+            edit
+            & ~protected
+            & (luma_delta <= -abs(float(shadow_min_darkening_delta)))
+            & (max_channel_delta <= float(shadow_max_brighten_delta))
+            & (chroma_delta <= float(shadow_max_chroma_delta))
+        )
+    else:
+        shadow_like = np.zeros_like(edit, dtype=bool)
+    del delta, chroma_delta, max_channel_delta
+
+    component_count, labels, stats, _centroids = cv2.connectedComponentsWithStats(
+        shadow_like.astype(np.uint8), connectivity=8
+    )
+    kept_shadow = np.zeros_like(shadow_like, dtype=bool)
+    min_area = max(1, int(shadow_min_component_area_px))
+    retained_components = 0
+    for component_id in range(1, int(component_count)):
+        if int(stats[component_id, cv2.CC_STAT_AREA]) < min_area:
+            continue
+        kept_shadow[labels == component_id] = True
+        retained_components += 1
+
+    max_darkening = abs(float(shadow_max_darkening_delta))
+    shadow_field = np.where(kept_shadow, np.clip(luma_delta, -max_darkening, 0.0), 0.0).astype(np.float32)
+    blur_sigma = max(0.0, float(shadow_blur_px))
+    if blur_sigma > 0.0 and np.any(kept_shadow):
+        shadow_field = cv2.GaussianBlur(
+            shadow_field,
+            (0, 0),
+            sigmaX=blur_sigma,
+            sigmaY=blur_sigma,
+            borderType=cv2.BORDER_REPLICATE,
+        )
+    if np.any(kept_shadow):
+        allowed_shadow_region = edit & ~protected
+        shadow_field = np.where(allowed_shadow_region, np.minimum(shadow_field, 0.0), 0.0)
+        shadow_source = "provider_neutral_darken_only"
+        fallback_shadow_trace: dict[str, Any] = {"applied": False, "reason": "trusted_provider_shadow_available"}
+    else:
+        # Build a small conventional down-right contact shadow from the exact
+        # mount geometry. This is intentionally local and low-amplitude. It is
+        # preferable to accepting neutral-looking fragments of a relocated
+        # provider object, which can form an L-shaped or rectangular ghost.
+        ys, xs = np.where(mount)
+        bbox_width = int(xs.max() - xs.min() + 1)
+        bbox_height = int(ys.max() - ys.min() + 1)
+        min_dimension = max(1, min(bbox_width, bbox_height))
+        offset_px = max(1, min(8, int(round(min_dimension * 0.018))))
+        fallback_blur_sigma = max(1.25, min(8.0, float(min_dimension) * 0.025))
+        shifted_mount = np.zeros_like(mount, dtype=np.float32)
+        shifted_mount[offset_px:, offset_px:] = mount[:-offset_px, :-offset_px].astype(np.float32)
+        projected_alpha = cv2.GaussianBlur(
+            shifted_mount,
+            (0, 0),
+            sigmaX=fallback_blur_sigma,
+            sigmaY=fallback_blur_sigma,
+            borderType=cv2.BORDER_REPLICATE,
+        )
+        projected_alpha = np.clip(projected_alpha, 0.0, 1.0)
+        projected_region = edit & ~mount
+        fallback_darkening = abs(float(fallback_shadow_max_darkening_delta))
+        shadow_field = np.where(projected_region, -fallback_darkening * projected_alpha, 0.0).astype(np.float32)
+        shadow_source = "mask_projected_contact_shadow"
+        fallback_shadow_trace = {
+            "applied": True,
+            "reason": "provider_identity_untrusted" if not provider_identity_trusted else "no_connected_provider_shadow",
+            "offset_x_px": int(offset_px),
+            "offset_y_px": int(offset_px),
+            "blur_sigma_px": float(fallback_blur_sigma),
+            "max_darkening_delta": float(fallback_darkening),
+        }
+
+    # The hard-paste remains authoritative for color, texture, perspective and
+    # every pixel outside the local neutral-shadow scope.
+    composed = hard.copy()
+    for channel in range(3):
+        composed[:, :, channel] = np.clip(
+            hard[:, :, channel].astype(np.float32) + shadow_field,
+            0.0,
+            255.0,
+        ).astype(np.uint8)
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    tmp_output = output.with_name(f".{output.name}.tmp")
+    try:
+        with tmp_output.open("wb") as handle:
+            Image.fromarray(composed, mode="RGB").save(handle, format="PNG")
+            handle.flush()
+            os.fsync(handle.fileno())
+        tmp_output.replace(output)
+    except Exception:
+        tmp_output.unlink(missing_ok=True)
+        raise
+
+    applied = shadow_field < -0.25
+    return {
+        "enabled": True,
+        "mode": "identity_locked_shadow_composite_v2",
+        "output_path": str(output),
+        "provider_render_path": str(provider_render_path),
+        "hard_paste_path": str(hard_paste_path),
+        "artwork_front_mask_path": str(artwork_front_mask_path),
+        "mount_mask_path": str(mount_mask_path),
+        "edit_mask_path": str(edit_mask_path),
+        "scope_enforced_locally": True,
+        "artwork_geometry_locked_to_candidate": True,
+        "hardpaste_core_pixel_restore": True,
+        "hardpaste_mount_pixel_restore": True,
+        "outside_edit_mask_restored": True,
+        "provider_identity_trusted": bool(provider_identity_trusted),
+        "shadow_source": shadow_source,
+        "provider_contribution": "neutral_darken_only_contact_shadow" if shadow_source.startswith("provider_") else "none",
+        "provider_contribution_present": bool(shadow_source.startswith("provider_") and np.any(applied)),
+        "fallback_shadow": fallback_shadow_trace,
+        "front_area_px": int(np.count_nonzero(front)),
+        "mount_area_px": int(np.count_nonzero(mount)),
+        "edit_area_px": int(np.count_nonzero(edit)),
+        "protected_area_px": int(np.count_nonzero(protected)),
+        "raw_shadow_like_area_px": int(np.count_nonzero(shadow_like)),
+        "retained_shadow_component_count": int(retained_components),
+        "retained_shadow_seed_area_px": int(np.count_nonzero(kept_shadow)),
+        "applied_shadow_area_px": int(np.count_nonzero(applied)),
+        "applied_shadow_min_luma_delta": float(np.min(shadow_field)) if np.any(applied) else 0.0,
+        "thresholds": {
+            "protect_dilate_px": int(protect_radius),
+            "shadow_min_darkening_delta": float(abs(float(shadow_min_darkening_delta))),
+            "shadow_max_brighten_delta": float(shadow_max_brighten_delta),
+            "shadow_max_chroma_delta": float(shadow_max_chroma_delta),
+            "shadow_max_darkening_delta": float(max_darkening),
+            "shadow_blur_px": float(blur_sigma),
+            "shadow_min_component_area_px": int(min_area),
+            "fallback_shadow_max_darkening_delta": float(abs(float(fallback_shadow_max_darkening_delta))),
+        },
+    }
 
 
 def masked_global_ssim(a: np.ndarray, b: np.ndarray, mask: np.ndarray) -> float:

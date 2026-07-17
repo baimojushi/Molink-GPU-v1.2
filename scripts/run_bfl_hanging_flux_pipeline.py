@@ -22,7 +22,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from hanging_mvp.hardpaste import load_rgba, save_rgb, warp_artwork_mount_to_geometry, warp_artwork_to_quad
-from hanging_mvp.render_qa import evaluate_mask_anchored_render_qa
+from hanging_mvp.render_qa import enforce_identity_locked_shadow_composite, evaluate_mask_anchored_render_qa
 from image_editing.pipeline import cleanup_objects, render_hanging
 from image_editing.provider_registry import build_image_edit_provider
 from image_editing.providers import ImageEditResult
@@ -1348,7 +1348,15 @@ def _render_failure_diagnosis(
     if isinstance(qa.get("adaptive_relight"), dict):
         diagnosis["adaptive_relight"] = qa.get("adaptive_relight")
 
-    if (
+    identity_locked = bool(trace.get("identity_lock_enforced_locally"))
+    if bool(qa.get("passed")):
+        diagnosis["status"] = "passed_after_identity_lock" if identity_locked else "passed"
+        diagnosis["root_cause"] = None
+        if identity_locked:
+            diagnosis["recovery"] = "candidate_geometry_and_artwork_identity_locked_locally; neutral provider shadow retained"
+    elif identity_locked:
+        diagnosis["root_cause"] = "post_identity_lock_qa_failure"
+    elif (
         provider == "bfl"
         and not using_apiyi_gpt_image2_vip
         and bool(trace.get("mask_sent_to_flux2"))
@@ -1726,18 +1734,79 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                         "hardpaste_core_pixel_restore_allowed": False,
                     },
                 )
-                # QA runs for diagnostics only — render output is always used directly
+                raw_provider_render_size_qa = _run_mask_anchored_qa(
+                    args,
+                    hard_paste=hard_paste_after_erase,
+                    render=render_result.image,
+                    art_mask=qa_art_mask,
+                )
+                post_render_identity_lock_trace: dict[str, Any] = {
+                    "enabled": False,
+                    "reason": "provider_output_did_not_use_unmasked_full_space_mode",
+                }
+                raw_render_trace = dict(render_result.trace or {})
+                if using_apiyi_gpt_image2_vip and bool(
+                    raw_render_trace.get("full_space_coordinate_prompt")
+                    or raw_render_trace.get("remote_coordinate_matrix_sent")
+                ):
+                    identity_locked_path = item_dir / "03_flux2_render.identity_locked.png"
+                    try:
+                        post_render_identity_lock_trace = enforce_identity_locked_shadow_composite(
+                            hard_paste_path=hard_paste_after_erase,
+                            provider_render_path=render_result.image,
+                            artwork_front_mask_path=qa_art_mask,
+                            mount_mask_path=render_object_mask,
+                            edit_mask_path=render_mask,
+                            output_path=identity_locked_path,
+                            protect_dilate_px=max(0, int(os.getenv("MOLINK_FULLSPACE_IDENTITY_PROTECT_DILATE_PX", "4"))),
+                            shadow_min_darkening_delta=float(args.qa_shadow_min_darkening_delta),
+                            shadow_max_brighten_delta=float(args.qa_shadow_max_brighten_delta),
+                            shadow_max_chroma_delta=float(args.qa_shadow_max_chroma_delta),
+                            shadow_max_darkening_delta=max(0.0, _env_float("MOLINK_FULLSPACE_SHADOW_MAX_DARKENING", 24.0)),
+                            shadow_blur_px=max(0.0, _env_float("MOLINK_FULLSPACE_SHADOW_BLUR_PX", 1.25)),
+                            shadow_min_component_area_px=max(1, int(os.getenv("MOLINK_FULLSPACE_SHADOW_MIN_COMPONENT_AREA_PX", "4"))),
+                            provider_identity_trusted=bool(raw_provider_render_size_qa.get("passed")),
+                            fallback_shadow_max_darkening_delta=max(
+                                0.0, _env_float("MOLINK_FULLSPACE_FALLBACK_SHADOW_MAX_DARKENING", 14.0)
+                            ),
+                        )
+                        render_result = ImageEditResult(
+                            image=identity_locked_path,
+                            trace={
+                                **raw_render_trace,
+                                "provider_output_path": str(raw_render_trace.get("output_path") or render_result.image),
+                                "output_path": str(identity_locked_path),
+                                "output_scope": "full_space_identity_locked_shadow_composite",
+                                "mask_enforced_locally": True,
+                                "mask_local_composite": True,
+                                "identity_lock_enforced_locally": True,
+                                "post_render_identity_lock": post_render_identity_lock_trace,
+                            },
+                        )
+                    except Exception as identity_lock_exc:
+                        post_render_identity_lock_trace = {
+                            "enabled": False,
+                            "reason": "identity_lock_failed",
+                            "error": str(identity_lock_exc),
+                        }
+                        aggregate["warnings"].append({
+                            "asset_id": asset_id,
+                            "mode": "full_space_identity_lock_failed",
+                            "message": f"Full-space identity lock failed for {asset_id}: {identity_lock_exc}",
+                        })
+
+                # Delivery QA runs on the deterministic local composite. The raw
+                # provider QA remains visible in trace so repainting is auditable.
                 primary_render_size_qa = _run_mask_anchored_qa(
                     args,
                     hard_paste=hard_paste_after_erase,
                     render=render_result.image,
                     art_mask=qa_art_mask,
                 )
-
-                # No photometric_lock — render output from GPT Image is used as-is
                 post_render_photometric_lock_trace = {
                     "enabled": False,
-                    "reason": "disabled_use_render_output_directly",
+                    "reason": "superseded_by_identity_locked_shadow_composite",
+                    "identity_lock_enabled": bool(post_render_identity_lock_trace.get("enabled")),
                     "qa_result": primary_render_size_qa,
                 }
 
@@ -1883,6 +1952,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                 selected_apiyi_gpt_image2_vip = bool(selected_trace.get("apiyi_images_edit_request")) and str(selected_trace.get("provider")) == "apiyi_gpt_image2_vip"
                 selected_remote_native_mask_sent = bool(selected_mask_sent and not selected_apiyi_gpt_image2_vip and not using_mock_provider)
                 selected_mask_enforced_locally = bool(selected_trace.get("mask_enforced_locally") or selected_trace.get("mask_local_composite"))
+                selected_identity_lock = bool(selected_trace.get("identity_lock_enforced_locally"))
                 selected_remote_coordinate_matrix = bool(selected_trace.get("remote_coordinate_matrix_sent") or selected_trace.get("full_space_coordinate_prompt"))
                 selected_edit_scope_ok = selected_mask_sent or (selected_apiyi_gpt_image2_vip and (selected_mask_enforced_locally or selected_remote_coordinate_matrix))
                 selected_edit_scope = (
@@ -1892,9 +1962,13 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                         "gpt_image2_vip_mask_photometric_composite"
                         if bool(selected_trace.get("mask_photometric_composite"))
                         else (
-                            "gpt_image2_vip_full_space_coordinate_prompt"
-                            if selected_remote_coordinate_matrix
-                            else ("gpt_image2_vip_mask_local_composite" if selected_mask_enforced_locally else "unmasked_unknown")
+                            "gpt_image2_vip_full_space_identity_locked_shadow_composite"
+                            if selected_identity_lock
+                            else (
+                                "gpt_image2_vip_full_space_coordinate_prompt"
+                                if selected_remote_coordinate_matrix
+                                else ("gpt_image2_vip_mask_local_composite" if selected_mask_enforced_locally else "unmasked_unknown")
+                            )
                         )
                     )
                 )
@@ -1913,7 +1987,10 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
 
                 finalization_trace: dict[str, Any] = {
                     "policy": finalize_policy,
-                    "raw_flux_passed": qa_passed,
+                    "raw_flux_passed": bool(raw_provider_render_size_qa.get("passed")),
+                    "raw_provider_qa_passed": bool(raw_provider_render_size_qa.get("passed")),
+                    "delivery_qa_passed": qa_passed,
+                    "identity_lock_applied": bool(post_render_identity_lock_trace.get("enabled")),
                     "qa_hard_blocked": qa_hard_blocked,
                     "qa_hard_block_reasons": qa_hard_block_reasons,
                     "qa_hard_thresholds": {
@@ -2010,9 +2087,11 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                     "render_object_mask_source": render_object_mask_source,
                     "render_size_qa_status": selected_render_size_qa.get("status"),
                     "primary_render_size_qa": primary_render_size_qa,
+                    "raw_provider_render_size_qa": raw_provider_render_size_qa,
                     "selected_render_size_qa": selected_render_size_qa,
                     "post_flux_finalization": finalization_trace,
                     "post_render_photometric_lock": post_render_photometric_lock_trace,
+                    "post_render_identity_lock": post_render_identity_lock_trace,
                     "render_failure_diagnosis": render_failure_diagnosis,
                     "render_fallback": render_fallback_trace,
                     "exit_code": item_exit_code,

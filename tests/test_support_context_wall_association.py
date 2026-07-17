@@ -231,3 +231,66 @@ def test_v5_recognized_job_support_uses_cabinet_clearance_instead_of_default_152
     assert abs(result["center_height_above_floor_m"] - 1.618230652809143) < 1e-9
     assert abs(result["bottom_gap_to_support_m"] - 0.25) < 1e-12
     assert result["center_height_above_floor_m"] > 1.52
+
+
+def test_geometry_support_remaps_to_nearest_semantic_furniture():
+    """When geometry_support is selected but a semantic table exists (rejected),
+    the label should remap to the semantic furniture for user-facing output."""
+    from hanging_mvp.schemas import WallBasis, WallPlane
+    h, w = 20, 20
+    xyz = np.zeros((h, w, 3), np.float32)
+    # Wall at z=5.0, g_hat = -y so y>0 gives h_abs<0 (above floor=-1.6)
+    xyz[:, :, 0] = np.linspace(-0.2, 0.2, w, dtype=np.float32)[None, :]
+    xyz[:, :, 1] = 0.85  # h_abs=-0.85, h_above_floor=0.75m (in 0.55-1.45 range)
+    xyz[:10, :, 2] = 4.55  # Near-wall geometry band (0.45m from wall)
+    xyz[10:, :, 2] = 2.0   # Distant foreground
+    basis = WallBasis(
+        origin=(0.0, 0.0, 5.0),
+        u=(1.0, 0.0, 0.0),
+        v=(0.0, -1.0, 0.0),
+        n=(0.0, 0.0, -1.0),
+        g_hat_cam=(0.0, -1.0, 0.0),
+    )
+    plane = WallPlane(n=(0.0, 0.0, -1.0), d=5.0)
+    rules = {
+        "support_surface_constraints": {
+            "geometry_fallback_enabled": True,
+            "geometry_min_front_distance_m": 0.12,
+            "geometry_max_front_distance_m": 0.90,
+            "geometry_min_support_height_above_floor_m": 0.55,
+            "geometry_max_support_height_above_floor_m": 1.45,
+            "geometry_height_bin_m": 0.04,
+            "geometry_min_height_bin_points": 20,
+            "geometry_min_support_span_m": 0.25,
+            "bbox_fallback_max_distance_to_wall_m": 0.90,
+            "max_distance_to_wall_m": 0.10,
+            "min_touch_ratio": 0.08,
+            "furniture_min_bottom_gap_m": 0.15,
+            "min_valid_points": 20,
+            "min_floor_valid_points": 20,
+        },
+        "height_rules": {
+            "table": {"center_height_m": 1.35, "min_bottom_gap_to_support_m": 0.20},
+            "floor": {"center_height_above_floor_m": 1.52},
+        },
+    }
+    # Table whose bbox covers the far-from-wall region (z=2.0 → 3m from wall)
+    objects = {
+        "table_01": {
+            "object_id": "table_01",
+            "label": "table",
+            "bbox_xyxy_processed": [0.0, 10, 20.0, 20.0],
+        },
+    }
+
+    result = _estimate_axis_support_context(
+        objects, xyz, basis, 0.0, 0.5, 0.4, rules, -1.6,
+        plane=plane, floor_source_trusted=False,
+    )
+
+    # Label should remap to "table", not "geometry_support"
+    assert result["label"] == "table", f"Expected 'table', got '{result['label']}'"
+    assert result.get("semantic_proxy_for") == "table"
+    # Height should come from geometry probe's clearance, NOT floor_default 1.52
+    assert result["center_height_above_floor_m"] < 1.52, \
+        f"Height {result['center_height_above_floor_m']} should not be floor_default 1.52 for semantic proxy"

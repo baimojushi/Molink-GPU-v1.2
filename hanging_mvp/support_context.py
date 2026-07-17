@@ -386,6 +386,7 @@ def _resolve_furniture_height(
     floor_height_abs_m: float,
     artwork_height_m: float,
     rules: Dict[str, Any],
+    is_semantic_proxy: bool = False,
 ) -> Dict[str, Any]:
     """Resolve furniture-aware height with label-specific bottom clearance."""
     cfg_key = selected_label if selected_label in {"table", "cabinet", "counter"} else "cabinet"
@@ -393,11 +394,16 @@ def _resolve_furniture_height(
     preferred_center_height_m = float(cfg.get("center_height_m", 1.35))
     floor_cfg = rules.get("height_rules", {}).get("floor", {})
     floor_default_center_m = float(floor_cfg.get("center_height_above_floor_m", 1.52))
-    never_below_floor_default = bool(rule_value(
-        rules,
-        ["support_surface_constraints", "furniture_never_below_floor_default"],
-        True,
-    ))
+    # When the label came from geometry_support remap, the height is known from
+    # point-cloud geometry — don't let the floor_default override it.
+    never_below_floor_default = (
+        bool(rule_value(
+            rules,
+            ["support_surface_constraints", "furniture_never_below_floor_default"],
+            True,
+        ))
+        and not is_semantic_proxy
+    )
     base_center_height_m = (
         max(preferred_center_height_m, floor_default_center_m)
         if never_below_floor_default
@@ -559,6 +565,31 @@ def _estimate_axis_support_context(
     if selected_label is None:
         selected_label = "floor" if floor_source_trusted else "unknown"
         selected_probe = None
+
+    # Remap geometry_support to nearest semantic furniture label.
+    # geometry_support is a point-cloud fallback — VLM may have detected a
+    # nearby table/cabinet/etc whose points failed wall association.  Use its
+    # label for user-facing output regardless of height match.
+    if selected_label == "geometry_support":
+        geo_top = selected_probe.get("support_top_abs_m_p85")
+        nearest_sem_label: Optional[str] = None
+        nearest_sem_dist = float("inf")
+        for p in probes:
+            p_label = p.get("label", "")
+            if p_label in {"sofa", "table", "cabinet", "counter", "counter_fixture", "sideboard"}:
+                p_top = p.get("support_top_abs_m_p85")
+                if p_top is not None and geo_top is not None:
+                    dist = abs(float(p_top) - float(geo_top))
+                else:
+                    dist = 0.0  # no height data — treat as nearest by presence
+                if dist < nearest_sem_dist:
+                    nearest_sem_dist = dist
+                    nearest_sem_label = p_label
+        if nearest_sem_label is not None:
+            selected_label = nearest_sem_label
+            # Keep the geometry probe for height computation but tag it
+            selected_probe = {**selected_probe, "semantic_proxy_for": nearest_sem_label}
+
     floor_abs = float(floor_height_abs_m)
     flux_visual_refinement: Optional[Dict[str, Any]] = None
     if selected_label == "sofa":
@@ -578,12 +609,14 @@ def _estimate_axis_support_context(
         mode = "metric_rule"; center_height_above_floor_m = center_abs - floor_abs
     elif selected_label in {"table", "cabinet", "counter", "counter_fixture", "sideboard", "geometry_support"}:
         support_top_abs = selected_probe.get("support_top_abs_m_p85") if selected_probe else None
+        is_proxy = isinstance(selected_probe, dict) and "semantic_proxy_for" in selected_probe
         furniture_height = _resolve_furniture_height(
             selected_label=selected_label,
             support_top_abs_m=support_top_abs,
             floor_height_abs_m=floor_abs,
             artwork_height_m=artwork_h_m,
             rules=rules,
+            is_semantic_proxy=is_proxy,
         )
         center_abs = float(furniture_height["center_height_abs_m"])
         center_height_above_floor_m = float(furniture_height["center_height_above_floor_m"])
@@ -643,6 +676,7 @@ def _estimate_axis_support_context(
             "support_requires_current_wall_association": plane is not None,
             "probes": probes[:24],
         },
+        **({"semantic_proxy_for": selected_probe["semantic_proxy_for"]} if isinstance(selected_probe, dict) and "semantic_proxy_for" in selected_probe else {}),
     }
 
 

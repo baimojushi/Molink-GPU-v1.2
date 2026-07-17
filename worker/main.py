@@ -51,7 +51,7 @@ if not WORKER_SECRET:
 GPU_MODEL = os.getenv("GPU_MODEL", "TITAN Xp")
 GPU_COUNT = int(os.getenv("GPU_COUNT", "1"))
 IDLE_TIMEOUT_S = int(os.getenv("IDLE_TIMEOUT_S", "300"))
-WORKER_VERSION = "1.0.0"
+WORKER_VERSION = "1.0.1"
 
 
 def _truthy_env(name: str, default: str = "0") -> bool:
@@ -270,13 +270,13 @@ class Worker:
         print(f"[worker] 已注册 {INSTANCE_ID} ({GPU_MODEL})")
 
     async def send_result(self, ws, job, payload) -> None:
+        result_stage, result_state, result_pct, result_message = result_builder.terminal_progress_contract(
+            payload.get("status") if isinstance(payload, dict) else None
+        )
         if isinstance(payload, dict) and payload.get("narration_bundle") is None:
-            result_stage = "r2_upload" if payload.get("status") in {"succeeded", "succeeded_partial", "render_review"} else "failed"
-            result_state = "done" if result_stage == "r2_upload" else "failed"
-            result_pct = 100 if payload.get("status") in {"succeeded", "succeeded_partial"} else 92
             bundle = self._narration_bundle(
                 result_stage, result_state, result_pct,
-                "完成" if result_state == "done" else "本次自动生成遇到异常，团队会继续为您处理…",
+                result_message,
                 delta=_result_delivery_delta(payload),
             )
             if bundle:
@@ -296,10 +296,10 @@ class Worker:
                 "status": payload.get("status"), "order_id": job.get("order_id"),
                 "payload": payload,
             }))
-            if payload.get("status") in {"succeeded", "succeeded_partial"}:
-                await self.progress(ws, job, "done", "done", 100, "完成")
-            else:
-                await self.progress(ws, job, "failed", "failed", 92, "本次自动生成遇到异常，团队会继续为您处理…")
+            await self.progress(
+                ws, job, result_stage, result_state, result_pct, result_message,
+                causal_delta=_result_delivery_delta(payload),
+            )
         except Exception as exc:
             # Connection died — reconnect and resend via a fresh connection.
             print(f"[worker] send_result failed ({exc}), reconnecting to resend result…", flush=True)
@@ -312,10 +312,10 @@ class Worker:
                     "status": payload.get("status"), "order_id": job.get("order_id"),
                     "payload": payload,
                 }))
-                if payload.get("status") in {"succeeded", "succeeded_partial"}:
-                    await self.progress(fresh_ws, job, "done", "done", 100, "完成")
-                else:
-                    await self.progress(fresh_ws, job, "failed", "failed", 92, "本次自动生成遇到异常，团队会继续为您处理…")
+                await self.progress(
+                    fresh_ws, job, result_stage, result_state, result_pct, result_message,
+                    causal_delta=_result_delivery_delta(payload),
+                )
                 print(f"[worker-debug] send_result retransmitted via fresh connection job_id={job.get('job_id')}", flush=True)
             except Exception as retry_exc:
                 print(f"[worker] send_result retransmit also failed ({retry_exc}), result saved locally only", flush=True)
