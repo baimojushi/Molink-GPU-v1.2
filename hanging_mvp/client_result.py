@@ -20,6 +20,7 @@ LABEL_ZH = {
     "door": "门", "window": "窗", "arch": "拱", "opening": "开口",
     "sofa": "沙发", "table": "边柜/茶几", "cabinet": "柜体",
     "counter": "吧台/操作台", "counter_fixture": "吧台/操作台", "sideboard": "边柜",
+    "bar": "吧台",
     "floor": "悬空", "unknown": "未知支撑",
 }
 
@@ -155,7 +156,7 @@ def _composition_context(candidate: Dict[str, Any], artwork_h_m: float) -> Dict[
     above_zh = LABEL_ZH.get(lbl, lbl)
     return {
         "above_furniture_label": lbl,
-        "above_furniture_label_zh": "悬空墙面" if lbl == "floor" else (f"{above_zh}上方" if lbl in ("sofa", "table", "cabinet", "counter", "counter_fixture", "sideboard") else above_zh),
+        "above_furniture_label_zh": "悬空墙面" if lbl == "floor" else (f"{above_zh}上方" if lbl in ("sofa", "table", "cabinet", "counter", "counter_fixture", "sideboard", "bar") else above_zh),
         "height_rule_label": RULE_LABELS.get(rule_id, rule_id),
         "bottom_gap_to_furniture_cm": _to_cm(bottom_gap),
         "center_t_label": t_label,

@@ -146,6 +146,10 @@
       "requires_flux_visual_height_refinement": false,
       "preserve_artwork_scale": true,
       "notes": "Unknown support remains provisional unless a trusted metric floor source is available. Provisional previews must not be presented as finalized installation height."
+    },
+    "bar": {
+      "center_height_m": 1.52,
+      "min_bottom_gap_to_support_m": 0.2
     }
   },
   "height_rule_consistency": {

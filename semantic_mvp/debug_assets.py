@@ -53,7 +53,7 @@ def draw_semantic_wall_debug(
     wall_labels = {"wall"}
     structural_labels = {"opening", "arch", "door", "window", "tv", "mirror", "lamp", "track_lighting"}
     existing_labels = {"existing_art", "wall_clutter", "wall_label", "hook", "nail", "small_shelf"}
-    support_labels = {"floor", "sofa", "table", "cabinet"}
+    support_labels = {"floor", "sofa", "table", "cabinet", "bar"}
 
     for obj in objects or []:
         label = str(obj.get("label", "object"))

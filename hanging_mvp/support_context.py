@@ -389,7 +389,7 @@ def _resolve_furniture_height(
     is_semantic_proxy: bool = False,
 ) -> Dict[str, Any]:
     """Resolve furniture-aware height with label-specific bottom clearance."""
-    cfg_key = selected_label if selected_label in {"table", "cabinet", "counter"} else "cabinet"
+    cfg_key = selected_label if selected_label in {"table", "cabinet", "counter", "bar"} else "cabinet"
     cfg = rules.get("height_rules", {}).get(cfg_key, rules.get("height_rules", {}).get("cabinet", {}))
     preferred_center_height_m = float(cfg.get("center_height_m", 1.35))
     floor_cfg = rules.get("height_rules", {}).get("floor", {})
@@ -576,7 +576,7 @@ def _estimate_axis_support_context(
         nearest_sem_dist = float("inf")
         for p in probes:
             p_label = p.get("label", "")
-            if p_label in {"sofa", "table", "cabinet", "counter", "counter_fixture", "sideboard"}:
+            if p_label in {"sofa", "table", "cabinet", "counter", "counter_fixture", "sideboard", "bar"}:
                 p_top = p.get("support_top_abs_m_p85")
                 if p_top is not None and geo_top is not None:
                     dist = abs(float(p_top) - float(geo_top))
@@ -607,7 +607,7 @@ def _estimate_axis_support_context(
                 bottom_gap = max_gap
                 rule_id = "sofa_bottom_gap_15"
         mode = "metric_rule"; center_height_above_floor_m = center_abs - floor_abs
-    elif selected_label in {"table", "cabinet", "counter", "counter_fixture", "sideboard", "geometry_support"}:
+    elif selected_label in {"table", "cabinet", "counter", "counter_fixture", "sideboard", "bar", "geometry_support"}:
         support_top_abs = selected_probe.get("support_top_abs_m_p85") if selected_probe else None
         is_proxy = isinstance(selected_probe, dict) and "semantic_proxy_for" in selected_probe
         furniture_height = _resolve_furniture_height(

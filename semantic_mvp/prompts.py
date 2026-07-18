@@ -17,7 +17,7 @@ def _causal_vlm_fields_enabled() -> bool:
 
 
 LABEL_POLICY = {
-    "support": ["sofa", "floor", "roof", "table", "cabinet"],
+    "support": ["sofa", "floor", "roof", "table", "cabinet", "bar"],
     "structural_forbidden": ["window", "door", "tv", "mirror", "lamp", "track_lighting", "arch", "opening"],
     "existing_content": ["existing_art", "painting", "poster", "framed_art", "artwork", "wall_clutter", "wall_label", "hook", "nail", "small_shelf", "green_board", "notice_board"],
     "non_support": ["pedestal", "plinth", "display_stand"],
@@ -68,7 +68,7 @@ Return an object:
 Coordinate system: pixels of the image attached in this request.
 Prioritize high-recall boxes. Coarse bbox is acceptable for MVP.
 Required labels when visible:
-wall, floor, roof, sofa, table, cabinet, window, door, tv, mirror, lamp,
+wall, floor, roof, sofa, table, cabinet, bar, window, door, tv, mirror, lamp,
 track_lighting, arch, opening, existing_art, painting, poster, framed_art,
 artwork, wall_clutter, wall_label, hook, nail, small_shelf, green_board,
 notice_board, person, human, people, pedestal, plinth, display_stand,
@@ -107,7 +107,7 @@ Gallery-specific rules:
 - arch/opening are forbidden, never wall.
 - existing displayed artworks, posters, framed art, green boards and labels are existing_art / painting / poster / framed_art / wall_label with role=existing_content.
 - track lights and spotlights are track_lighting or lamp / forbidden.
-- pedestal/plinth/display stand are non_support, not table/cabinet support.
+- pedestal/plinth/display stand are non_support, not table/cabinet/bar support.
 - floor is support for height rule, not clutter.
 - roof/ceiling must be returned as label=roof with role=support when visible; it is a gravity-reference surface, not a wall.
 

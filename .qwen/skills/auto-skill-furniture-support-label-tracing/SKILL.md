@@ -90,4 +90,16 @@ for i, c in enumerate(d):
 
 `geometry_support` is a geometry-derived fallback that is **remapped** to the nearest semantic furniture label before reaching user-facing output. The `semantic_proxy_for` field in `support_context` indicates when this remapping occurred. Height computation still uses the geometry probe's `support_top_abs_m` value regardless of the remapped label.
 
-When V5+ furniture clearance rules are active, remapped labels (table, cabinet, counter) apply their per-label `min_bottom_gap_to_support_m` values from `rules_v1.json`.
+### Height fix (V6+): semantic proxy bypasses floor_default
+
+When `semantic_proxy_for` is present, `_resolve_furniture_height()` disables the `furniture_never_below_floor_default` constraint. This prevents the 1.52m floor default from overriding the geometry-inferred height. Without this fix, remapped labels (table/cabinet/etc) would incorrectly use `max(preferred_center_height, 1.52)` instead of the actual geometry clearance height.
+
+```python
+# In _resolve_furniture_height():
+never_below_floor_default = (
+    bool(rule_value(rules, ["support_surface_constraints", "furniture_never_below_floor_default"], True))
+    and not is_semantic_proxy  # <-- skip floor_default when height is from geometry
+)
+```
+
+When V5+ furniture clearance rules are active, remapped labels (table, cabinet, counter) still apply their per-label `min_bottom_gap_to_support_m` values from `rules_v1.json` — but the floor_default ceiling is lifted for semantic proxies.
