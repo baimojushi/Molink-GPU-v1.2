@@ -54,6 +54,7 @@ Detect large surfaces and objects needed for hanging geometry.
 
 Return an object:
 {
+  "coordinate_space": "pixels",
   "objects": [
     {
       "label": "...",
@@ -66,6 +67,8 @@ Return an object:
 }
 
 Coordinate system: pixels of the image attached in this request.
+Use the exact width and height stated by the user. Do not normalize either axis
+to 0..1 or 0..1000, and never mix normalized x values with pixel y values.
 Prioritize high-recall boxes. Coarse bbox is acceptable for MVP.
 Required labels when visible:
 wall, floor, roof, sofa, table, cabinet, bar, window, door, tv, mirror, lamp,

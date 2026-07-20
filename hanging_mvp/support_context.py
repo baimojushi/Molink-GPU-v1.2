@@ -17,6 +17,7 @@ def _estimate_floor_wall_intersection(
     s_range_m,
     visible_wall_t_vals: np.ndarray,
     solid_wall_mask=None,
+    normal: Optional[np.ndarray] = None,
     rules: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Estimate the real floor-wall intersection for the *current* wall plane.
@@ -90,7 +91,53 @@ def _estimate_floor_wall_intersection(
         return result
 
     if floor_mask is not None:
-        floor_pts = points_from_mask(xyz, floor_mask, max_points=max_floor_points)
+        raw_floor_points = int(np.count_nonzero(floor_mask))
+        floor_sampling_mask = floor_mask
+        floor_normal_debug: Dict[str, Any] = {
+            "enabled": False,
+            "raw_floor_mask_points": raw_floor_points,
+            "source": "semantic_floor_mask_unfiltered",
+        }
+        if (
+            normal is not None
+            and isinstance(normal, np.ndarray)
+            and normal.shape[:2] == floor_mask.shape[:2]
+            and normal.ndim == 3
+            and normal.shape[-1] == 3
+        ):
+            floor_normal_alignment_threshold = float(rule_value(
+                rules,
+                ["floor_wall_intersection", "floor_normal_alignment_dot_threshold"],
+                0.72,
+            ))
+            normal_len = np.linalg.norm(normal, axis=-1)
+            finite_normal = np.isfinite(normal).all(axis=-1) & (normal_len > 1e-8)
+            normalized_normal = np.zeros_like(normal, dtype=np.float32)
+            normalized_normal[finite_normal] = (
+                normal[finite_normal] / normal_len[finite_normal].reshape(-1, 1)
+            )
+            floor_alignment = np.abs(np.sum(
+                normalized_normal * g_hat.reshape(1, 1, 3), axis=-1
+            ))
+            floor_like_mask = (
+                (floor_mask > 0)
+                & finite_normal
+                & (floor_alignment >= floor_normal_alignment_threshold)
+            ).astype(np.uint8) * 255
+            floor_like_points = int(np.count_nonzero(floor_like_mask))
+            floor_normal_debug = {
+                "enabled": True,
+                "raw_floor_mask_points": raw_floor_points,
+                "floor_like_points": floor_like_points,
+                "floor_normal_alignment_dot_threshold": floor_normal_alignment_threshold,
+                "source": "semantic_floor_mask_intersect_gravity_aligned_normals",
+                "used": bool(floor_like_points >= min_floor_points),
+            }
+            if floor_like_points >= min_floor_points:
+                floor_sampling_mask = floor_like_mask
+
+        debug["floor_normal_prefilter"] = floor_normal_debug
+        floor_pts = points_from_mask(xyz, floor_sampling_mask, max_points=max_floor_points)
         floor_pts = floor_pts[np.isfinite(floor_pts).all(axis=1)] if floor_pts.size else floor_pts
         fit_cfg = dict(rules.get("room_corner_floor_fit", {}) or {})
         fit_attempt = {"source": "wall_floor_plane_intersection", "raw_floor_points": int(len(floor_pts))}

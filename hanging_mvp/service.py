@@ -839,6 +839,7 @@ def _semantic_solid_max_empty_rect_axes(
     artwork_w_m: float,
     artwork_h_m: float,
     min_edge_margin_m: float,
+    metric_seed_tolerance_m: float = 0.02,
     max_axes: int = 3,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Generate fallback candidates from semantic_clear_wall_mask ∩ solid_wall_mask.
@@ -863,6 +864,8 @@ def _semantic_solid_max_empty_rect_axes(
         "min_component_area_px": int(min_component_area_px),
         "required_width_m": float(required_w_m),
         "required_height_m": float(required_h_m),
+        "metric_seed_tolerance_m": float(metric_seed_tolerance_m),
+        "tolerance_policy": "candidate_seed_only_exact_projected_footprint_remains_authoritative",
         "added_count": 0,
         "components": [],
     }
@@ -929,12 +932,20 @@ def _semantic_solid_max_empty_rect_axes(
             "width_m": float(width_m),
             "height_m": float(height_m),
         })
-        if width_m < required_w_m:
+        # Metric3D percentile projection is noisy by a few millimetres.  This
+        # rectangle only proposes a horizontal seed; the exact projected quad
+        # is still checked later against wall support, edges, structures and
+        # blocking fixtures.  A small tolerance here prevents a 0.957 m clear
+        # region from being discarded against a 0.960 m seed requirement.
+        if width_m + float(metric_seed_tolerance_m) < required_w_m:
             comp_debug["skip_reason"] = "largest_rect_too_narrow_for_artwork_with_edge_margin"
             continue
-        if height_m < required_h_m:
+        if height_m + float(metric_seed_tolerance_m) < required_h_m:
             comp_debug["skip_reason"] = "largest_rect_too_short_for_artwork_with_edge_margin"
             continue
+        comp_debug["accepted_with_metric_seed_tolerance"] = bool(
+            width_m < required_w_m or height_m < required_h_m
+        )
 
         axis_s = float(0.5 * (s_min + s_max))
         axes.append({
@@ -1331,6 +1342,7 @@ async def analyze_hanging_mvp(
     g_conf = 0.0
     g_debug = {}
     gravity_source = None
+    gravity_candidates = []
     reference_sets = [
         ("floor", floors, floor_gravity_mask),
         ("roof", roofs, _union_reference_masks(roofs)),
@@ -1367,7 +1379,7 @@ async def analyze_hanging_mvp(
             )
         attempt = {
             "reference_label": reference_label,
-            "status": "accepted" if float(candidate_conf) > 0.0 else "unusable",
+            "status": "candidate" if float(candidate_conf) > 0.0 else "unusable",
             "object_count": len(reference_objects),
             "object_ids": [obj.get("object_id") for obj in reference_objects],
             "confidence": float(candidate_conf),
@@ -1375,11 +1387,28 @@ async def analyze_hanging_mvp(
         }
         gravity_attempts.append(attempt)
         if float(candidate_conf) > 0.0:
-            g_hat = candidate_g
-            g_conf = float(candidate_conf)
-            g_debug = dict(candidate_debug)
-            gravity_source = f"semantic_{reference_label}_mask"
-            break
+            gravity_candidates.append({
+                "reference_label": reference_label,
+                "g_hat": candidate_g,
+                "confidence": float(candidate_conf),
+                "debug": dict(candidate_debug),
+                "attempt": attempt,
+            })
+
+    if gravity_candidates:
+        # Floor remains the first tie-breaker, but a barely usable floor mask
+        # must not suppress a much stronger ceiling/roof/table reference.  This
+        # is particularly important when SAM's floor mask is mostly a person or
+        # another vertical foreground region.
+        selected_gravity = max(gravity_candidates, key=lambda item: item["confidence"])
+        selected_gravity["attempt"]["status"] = "selected"
+        for candidate in gravity_candidates:
+            if candidate is not selected_gravity:
+                candidate["attempt"]["status"] = "not_selected_lower_confidence"
+        g_hat = selected_gravity["g_hat"]
+        g_conf = float(selected_gravity["confidence"])
+        g_debug = dict(selected_gravity["debug"])
+        gravity_source = f"semantic_{selected_gravity['reference_label']}_mask"
 
     if g_hat is None:
         candidate_g, candidate_conf, candidate_debug = estimate_g_hat_from_global_floor_like_normals(
@@ -1410,6 +1439,7 @@ async def analyze_hanging_mvp(
         "direction_dot_camera_up": float(np.dot(g_hat, np.array([0.0, -1.0, 0.0], np.float32))),
         "direction_flip_applied_at_service_boundary": bool(float(np.dot(g_hat_before_canonicalization, g_hat)) < 0.0),
         "reference_priority": ["floor", "roof", "table", "metric3d_global_floor_like_normals"],
+        "semantic_reference_selection_policy": "highest_confidence_with_floor_first_tie_break",
         "semantic_reference_counts": {
             "floor": len(floors),
             "roof": len(roofs),
@@ -2140,6 +2170,11 @@ async def analyze_hanging_mvp(
                 artwork_w_m=artwork_w_m,
                 artwork_h_m=artwork_h_m,
                 min_edge_margin_m=min_edge_margin_m,
+                metric_seed_tolerance_m=float(rule_value(
+                    rules,
+                    ["candidate_generation", "max_empty_rect_metric_seed_tolerance_m"],
+                    0.02,
+                )),
                 max_axes=max(1, min(3, max_axis)),
             )
             semantic_axis_debug["max_empty_rect_fallback"] = max_rect_debug
@@ -2313,6 +2348,7 @@ async def analyze_hanging_mvp(
             s_range_m=s_range_for_floor,
             visible_wall_t_vals=t_vals,
             solid_wall_mask=solid_wall_mask_u8,
+            normal=normal,
             rules=rules,
         )
         t_floor = float(floor_wall_estimation["t_floor_m"])

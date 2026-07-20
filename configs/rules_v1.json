@@ -307,6 +307,16 @@
     },
     "max_floor_wall_projection_distance_m": {
       "value": 0.45
+    },
+    "floor_normal_alignment_dot_threshold": {
+      "value": 0.72,
+      "notes": "Before floor RANSAC/project-to-wall, keep semantic-floor pixels whose Metric3D normals align with the chosen gravity reference; prevents person/wall contamination from becoming the floor plane."
+    }
+  },
+  "candidate_generation": {
+    "max_empty_rect_metric_seed_tolerance_m": {
+      "value": 0.02,
+      "notes": "Seed-only tolerance for percentile noise. Exact projected artwork footprint gates remain authoritative and unchanged."
     }
   },
   "existing_content_overlap_policy": {

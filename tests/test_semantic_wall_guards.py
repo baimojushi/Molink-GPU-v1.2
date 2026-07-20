@@ -88,6 +88,29 @@ def test_vlm_0_1000_bbox_space_is_detected_and_scaled_to_original_pixels():
     assert abs(door[2] - 572.42) < 1.0
     assert abs(door[3] - 766.46) < 1.0
 
+
+def test_regression_b7d44210_mixed_x_grid_and_pixel_y_are_scaled_per_axis():
+    # The provider used a 0..1000 x grid, but emitted the floor's y2 in the
+    # requested 1080-pixel height.  A single four-coordinate hypothesis used to
+    # classify everything as original pixels and compressed all VLM walls into
+    # the left 52% of this wide scene.
+    objects = [
+        {"label": "wall_left", "role": "wall", "bbox_xyxy": [0, 0, 345, 999]},
+        {"label": "wall_front", "role": "wall", "bbox_xyxy": [346, 0, 728, 999]},
+        {"label": "wall_right", "role": "wall", "bbox_xyxy": [728, 0, 1000, 999]},
+        {"label": "floor", "role": "support", "bbox_xyxy": [0, 820, 1000, 1080]},
+    ]
+
+    mode, debug = _infer_vlm_bbox_coordinate_space(objects, 1920, 1080)
+
+    assert mode == "mixed_x_1000_y_original"
+    assert debug["coordinate_hypothesis_scores"]["x_prefers_1000_grid"] is True
+    assert debug["coordinate_hypothesis_scores"]["y_prefers_1000_grid"] is False
+    front = _normalize_vlm_bbox_to_original_pixels([346, 0, 728, 999], 1920, 1080, mode)
+    assert abs(front[0] - 664.32) < 0.01
+    assert abs(front[2] - 1397.76) < 0.01
+    assert front[3] == 999
+
 from semantic_mvp.service import _canonical_label_and_role, _build_object_inventory
 
 

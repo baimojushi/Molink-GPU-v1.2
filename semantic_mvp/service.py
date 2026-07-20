@@ -403,6 +403,46 @@ def _infer_vlm_bbox_coordinate_space(objects, original_w, original_h, vlm_image_
         "coverage_prefers_1000_grid": coverage_prefers_1000_grid,
     }
 
+    # A few OpenAI-compatible vision providers occasionally mix coordinate
+    # conventions by axis: x is emitted on a 0..1000 visual grid while y keeps
+    # the requested image's pixel height (or vice versa).  Treating the four
+    # values as one coordinate space compresses every wall into the upper-left
+    # part of a wide image.  Infer strong boundary evidence independently for
+    # each axis before applying the legacy all-axis decision below.
+    x_1000_like = bool(min_x >= -20.0 and max_x <= 1024.0 and max_x >= 850.0)
+    y_1000_like = bool(min_y >= -20.0 and max_y <= 1024.0 and max_y >= 850.0)
+    x_prefers_1000_grid = bool(
+        x_1000_like
+        and abs(float(original_w) - 1000.0) >= 70.0
+        and grid_right_gap + 0.035 < original_right_gap
+    )
+    y_prefers_1000_grid = bool(
+        y_1000_like
+        and abs(float(original_h) - 1000.0) >= 70.0
+        and grid_bottom_gap + 0.035 < original_bottom_gap
+    )
+    debug["coordinate_hypothesis_scores"].update({
+        "x_prefers_1000_grid": x_prefers_1000_grid,
+        "y_prefers_1000_grid": y_prefers_1000_grid,
+    })
+
+    if x_prefers_1000_grid and not y_prefers_1000_grid:
+        debug.update({
+            'source_coordinate_space': 'mixed_x_1000_y_original',
+            'reason': 'axis_independent_boundary_evidence_x_1000_y_original_pixels',
+            'scale_x_to_original': float(original_w) / 1000.0,
+            'scale_y_to_original': 1.0,
+        })
+        return 'mixed_x_1000_y_original', debug
+    if y_prefers_1000_grid and not x_prefers_1000_grid:
+        debug.update({
+            'source_coordinate_space': 'mixed_x_original_y_1000',
+            'reason': 'axis_independent_boundary_evidence_x_original_pixels_y_1000',
+            'scale_x_to_original': 1.0,
+            'scale_y_to_original': float(original_h) / 1000.0,
+        })
+        return 'mixed_x_original_y_1000', debug
+
     if normalized_1000_like and (
         y_exceeds_original
         or looks_1000_tall
@@ -474,6 +514,10 @@ def _normalize_vlm_bbox_to_original_pixels(bbox, original_w, original_h, coordin
         box = [x1 * float(original_w), y1 * float(original_h), x2 * float(original_w), y2 * float(original_h)]
     elif coordinate_space == 'normalized_0_1000':
         box = [x1 / 1000.0 * float(original_w), y1 / 1000.0 * float(original_h), x2 / 1000.0 * float(original_w), y2 / 1000.0 * float(original_h)]
+    elif coordinate_space == 'mixed_x_1000_y_original':
+        box = [x1 / 1000.0 * float(original_w), y1, x2 / 1000.0 * float(original_w), y2]
+    elif coordinate_space == 'mixed_x_original_y_1000':
+        box = [x1, y1 / 1000.0 * float(original_h), x2, y2 / 1000.0 * float(original_h)]
     elif coordinate_space == 'sent_image_pixels':
         vlm_image_meta = vlm_image_meta or {}
         sent_size = vlm_image_meta.get("sent_size") if isinstance(vlm_image_meta, dict) else None
