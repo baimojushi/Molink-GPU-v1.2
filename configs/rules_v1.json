@@ -31,6 +31,11 @@
         "value": 5000,
         "notes": "Filtered pixel count needed for full sample-count confidence."
       }
+    },
+    "gravity_consensus": {
+      "max_inlier_angle_deg": 12.0,
+      "conflict_angle_deg": 18.0,
+      "policy": "Fuse floor, roof/table and global Metric3D references in camera coordinates by weighted angular medoid. Preserve legitimate camera pitch/roll; reject reference outliers instead of forcibly leveling the point cloud."
     }
   },
   "artwork": {
@@ -232,8 +237,19 @@
     "lamp",
     "track_lighting",
     "arch",
-    "opening"
+    "opening",
+    "curtain",
+    "drape",
+    "blind"
   ],
+  "projection_shape_gate": {
+    "enabled": true,
+    "review_distortion_ratio": 1.55,
+    "hard_reject_distortion_ratio": 2.0,
+    "hard_reject_opposing_edge_ratio": 3.0,
+    "orientation_margin_ratio": 0.08,
+    "policy": "Preserve width/height edge identity from the 3D quad. Hard-reject orientation flips and extreme anisotropic foreshortening; review moderate distortion. This is independent of projected pixel size."
+  },
   "existing_content_classes": [
     "existing_art",
     "wall_clutter",

@@ -40,6 +40,9 @@ ROLE_BY_LABEL = {
     "track_lighting": "forbidden",
     "arch": "forbidden",
     "opening": "forbidden",
+    "curtain": "forbidden",
+    "drape": "forbidden",
+    "blind": "forbidden",
     "existing_art": "existing_content",
     "painting": "existing_content",
     "poster": "existing_content",
@@ -91,6 +94,15 @@ LABEL_ALIASES = {
     "man": "person",
     "woman": "person",
     "visitor": "person",
+    "curtains": "curtain",
+    "drapes": "drape",
+    "window curtain": "curtain",
+    "window curtains": "curtain",
+    "sheer curtain": "curtain",
+    "sheer curtains": "curtain",
+    "blackout curtain": "curtain",
+    "roller blind": "blind",
+    "window blind": "blind",
 }
 
 EXISTING_CONTENT_LABELS = {
@@ -408,6 +420,80 @@ def _infer_vlm_bbox_coordinate_space(objects, original_w, original_h, vlm_image_
         "coverage_prefers_1000_grid": coverage_prefers_1000_grid,
     }
 
+    def _grid_axis_with_original_boundary_sentinel(values, extent):
+        """Detect a provider's 0..1000 grid plus exact image-edge sentinels.
+
+        Some VLM gateways emit ordinary object coordinates on an internal
+        0..1000 visual grid, but copy 0/original_width/original_height for boxes
+        touching an image edge.  Looking only at the global maximum then makes
+        the whole batch look like original pixels.  Require both an exact-ish
+        original edge and strong internal-grid extent so normal original-pixel
+        responses are not reclassified merely because their coordinates are
+        smaller than 1000.
+        """
+        extent = float(extent)
+        tolerance = max(2.0, extent * 0.008)
+        boundary = [float(v) for v in values if abs(float(v) - extent) <= tolerance]
+        internal = [
+            float(v) for v in values
+            if float(v) >= -20.0 and abs(float(v) - extent) > tolerance
+        ]
+        positive_internal = [v for v in internal if v > 1.0]
+        internal_max = max(positive_internal, default=0.0)
+        internal_within_grid = bool(
+            positive_internal
+            and min(positive_internal) >= -20.0
+            and internal_max <= 1024.0
+        )
+        internal_grid_like = bool(internal_within_grid and internal_max >= 850.0)
+        detected = bool(extent > 1060.0 and boundary and internal_grid_like)
+        return detected, {
+            "detected": detected,
+            "extent": extent,
+            "boundary_sentinel_count": len(boundary),
+            "internal_max": float(internal_max),
+            "internal_within_grid": internal_within_grid,
+            "internal_grid_like": internal_grid_like,
+            "boundary_tolerance": float(tolerance),
+        }
+
+    x_boundary_grid, x_boundary_debug = _grid_axis_with_original_boundary_sentinel(xs, original_w)
+    y_boundary_grid, y_boundary_debug = _grid_axis_with_original_boundary_sentinel(ys, original_h)
+    # When one axis exposes the 1000-grid boundary and both axes contain exact
+    # original-edge sentinels, use the same internal grid for the other axis.
+    # The failing portrait case had x=1000 evidence while internal y stopped at
+    # ~690 because all lower objects touched the original-height sentinel.
+    joint_boundary_grid = bool(
+        (
+            x_boundary_grid
+            and y_boundary_debug["boundary_sentinel_count"] > 0
+            and y_boundary_debug["internal_within_grid"]
+        )
+        or (
+            y_boundary_grid
+            and x_boundary_debug["boundary_sentinel_count"] > 0
+            and x_boundary_debug["internal_within_grid"]
+        )
+    )
+    if joint_boundary_grid:
+        x_boundary_grid = True
+        y_boundary_grid = True
+    debug["coordinate_hypothesis_scores"].update({
+        "x_1000_grid_with_original_boundary_sentinel": x_boundary_grid,
+        "y_1000_grid_with_original_boundary_sentinel": y_boundary_grid,
+        "x_boundary_sentinel_debug": x_boundary_debug,
+        "y_boundary_sentinel_debug": y_boundary_debug,
+    })
+    if x_boundary_grid and y_boundary_grid:
+        debug.update({
+            'source_coordinate_space': 'normalized_0_1000_with_original_boundary_sentinels',
+            'reason': 'internal_0_1000_grid_with_exact_original_image_edge_sentinels',
+            'scale_x_to_original': float(original_w) / 1000.0,
+            'scale_y_to_original': float(original_h) / 1000.0,
+            'preserve_original_boundary_sentinels': True,
+        })
+        return 'normalized_0_1000_with_original_boundary_sentinels', debug
+
     # A few OpenAI-compatible vision providers occasionally mix coordinate
     # conventions by axis: x is emitted on a 0..1000 visual grid while y keeps
     # the requested image's pixel height (or vice versa).  Treating the four
@@ -519,6 +605,19 @@ def _normalize_vlm_bbox_to_original_pixels(bbox, original_w, original_h, coordin
         box = [x1 * float(original_w), y1 * float(original_h), x2 * float(original_w), y2 * float(original_h)]
     elif coordinate_space == 'normalized_0_1000':
         box = [x1 / 1000.0 * float(original_w), y1 / 1000.0 * float(original_h), x2 / 1000.0 * float(original_w), y2 / 1000.0 * float(original_h)]
+    elif coordinate_space == 'normalized_0_1000_with_original_boundary_sentinels':
+        def _grid_or_boundary(value, extent):
+            extent = float(extent)
+            tolerance = max(2.0, extent * 0.008)
+            if abs(float(value) - extent) <= tolerance:
+                return extent
+            return float(value) / 1000.0 * extent
+        box = [
+            _grid_or_boundary(x1, original_w),
+            _grid_or_boundary(y1, original_h),
+            _grid_or_boundary(x2, original_w),
+            _grid_or_boundary(y2, original_h),
+        ]
     elif coordinate_space == 'mixed_x_1000_y_original':
         box = [x1 / 1000.0 * float(original_w), y1, x2 / 1000.0 * float(original_w), y2]
     elif coordinate_space == 'mixed_x_original_y_1000':
@@ -665,7 +764,7 @@ def _sanitize_wall_bboxes_against_edge_structures(objects, processed_w, processe
     tall and edge-attached; interior windows/openings are left for fine-grained
     clearance checks.
     """
-    structural_labels = {'opening', 'arch', 'door', 'window', 'tv', 'mirror', 'lamp', 'track_lighting'}
+    structural_labels = {'opening', 'arch', 'door', 'window', 'tv', 'mirror', 'lamp', 'track_lighting', 'curtain', 'drape', 'blind'}
     structures = [o for o in objects if str(o.get('label')) in structural_labels or o.get('role') == 'forbidden']
     out = []
     trims = []
@@ -828,7 +927,7 @@ def _geometry_wall_candidates_full_scene(objects, processed_w, processed_h, sx, 
 
     h, w = normal.shape[:2]
     roi = np.ones((h, w), dtype=bool)
-    exclude_labels = {'opening', 'arch', 'door', 'window', 'tv', 'mirror', 'lamp', 'track_lighting'}
+    exclude_labels = {'opening', 'arch', 'door', 'window', 'tv', 'mirror', 'lamp', 'track_lighting', 'curtain', 'drape', 'blind'}
     exclude_roles = {'support', 'forbidden', 'foreground', 'non_support'}
     exclude = np.zeros((h, w), np.uint8)
     for obj in objects:
@@ -1073,7 +1172,7 @@ def _semantic_multiwall_postprocess(objects, processed_w, processed_h, sx, sy, m
     h, w = normal.shape[:2]
     roi = _rect_mask(h, w, [x1, y1, x2, y2]) > 0
 
-    exclude_labels = {'opening', 'arch', 'door', 'window', 'tv', 'mirror', 'lamp', 'track_lighting'}
+    exclude_labels = {'opening', 'arch', 'door', 'window', 'tv', 'mirror', 'lamp', 'track_lighting', 'curtain', 'drape', 'blind'}
     exclude = np.zeros((h, w), np.uint8)
     for obj in objects:
         if str(obj.get('label')) in exclude_labels:

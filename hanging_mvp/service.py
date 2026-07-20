@@ -19,7 +19,7 @@ from .masks import load_semantic_masks, masks_by_label, masks_by_role, semantic_
 from .geometry import (
     backproject, estimate_g_hat_from_floor_normals, estimate_g_hat_from_global_floor_like_normals,
     estimate_g_hat_from_horizontal_reference_normals, fit_plane_ransac, fit_vertical_plane_ransac, make_wall_basis,
-    orient_vector_to_camera_up,
+    orient_vector_to_camera_up, select_gravity_consensus,
     points_from_mask, project_points, project_quad, polygon_mask, ray_plane_depth_for_mask, scale_points_to_original
 )
 from .hardpaste import load_rgba, warp_artwork_mount_to_geometry, warp_artwork_to_quad
@@ -33,6 +33,7 @@ from .structural_clearance import _candidate_structural_clearance
 from .support_context import (
     _estimate_floor_wall_intersection, _object_points_near_axis,
     _estimate_axis_support_context, _estimate_same_wall_art_height_anchor, _quad_metrics_original,
+    evaluate_projection_shape_gate,
 )
 from .response_assets import _png_bytes, _draw_overlay, _zip_response
 from .exit_review import review_hardpaste_exit
@@ -63,7 +64,7 @@ except Exception:  # pragma: no cover - causal layer is optional at runtime
 API_KEY = os.getenv("API_KEY", "")
 ALLOW_UNAUTH_LOCAL = os.getenv("ALLOW_UNAUTH_LOCAL", "").strip().lower() in {"1", "true", "yes", "on"}
 PORT = int(os.getenv("HANGING_MVP_PORT", "6010"))
-HANGING_PIPELINE_BUILD_ID = "2026-07-20-positive-wall-recovery-v7"
+HANGING_PIPELINE_BUILD_ID = "2026-07-20-oblique-perspective-curtain-guard-v8"
 
 
 def _truthy_env(name: str, default: str = "0") -> bool:
@@ -1407,40 +1408,57 @@ async def analyze_hanging_mvp(
                 "attempt": attempt,
             })
 
-    if gravity_candidates:
-        # Floor remains the first tie-breaker, but a barely usable floor mask
-        # must not suppress a much stronger ceiling/roof/table reference.  This
-        # is particularly important when SAM's floor mask is mostly a person or
-        # another vertical foreground region.
-        selected_gravity = max(gravity_candidates, key=lambda item: item["confidence"])
-        selected_gravity["attempt"]["status"] = "selected"
-        for candidate in gravity_candidates:
-            if candidate is not selected_gravity:
-                candidate["attempt"]["status"] = "not_selected_lower_confidence"
-        g_hat = selected_gravity["g_hat"]
-        g_conf = float(selected_gravity["confidence"])
-        g_debug = dict(selected_gravity["debug"])
-        gravity_source = f"semantic_{selected_gravity['reference_label']}_mask"
-
-    if g_hat is None:
-        candidate_g, candidate_conf, candidate_debug = estimate_g_hat_from_global_floor_like_normals(
-            normal,
-            normal_y_max=normal_y_max,
-            abs_z_max=abs_z_max,
-            min_pixels=min_g_pixels,
-            angular_variance_soft_limit_rad=angular_variance_soft_limit,
-            full_confidence_pixels=full_confidence_pixels,
-        )
-        g_hat = candidate_g
-        g_conf = float(candidate_conf)
-        g_debug = dict(candidate_debug)
-        gravity_source = "metric3d_global_floor_like_normals"
-        gravity_attempts.append({
+    # Always compare semantic references with the global Metric3D normal
+    # population.  The vector remains in camera coordinates: this validates
+    # consistency without erasing a legitimate camera pitch/roll.
+    candidate_g, candidate_conf, candidate_debug = estimate_g_hat_from_global_floor_like_normals(
+        normal,
+        normal_y_max=normal_y_max,
+        abs_z_max=abs_z_max,
+        min_pixels=min_g_pixels,
+        angular_variance_soft_limit_rad=angular_variance_soft_limit,
+        full_confidence_pixels=full_confidence_pixels,
+    )
+    global_attempt = {
+        "reference_label": "global_metric3d_floor_like",
+        "status": "candidate" if float(candidate_conf) > 0.0 else "unusable_default_up",
+        "confidence": float(candidate_conf),
+        "debug": candidate_debug,
+    }
+    gravity_attempts.append(global_attempt)
+    if float(candidate_conf) > 0.0:
+        gravity_candidates.append({
             "reference_label": "global_metric3d_floor_like",
-            "status": "accepted" if float(candidate_conf) > 0.0 else "unusable_default_up",
+            "g_hat": candidate_g,
             "confidence": float(candidate_conf),
-            "debug": candidate_debug,
+            "debug": dict(candidate_debug),
+            "attempt": global_attempt,
         })
+
+    if gravity_candidates:
+        g_hat, g_conf, consensus_debug = select_gravity_consensus(
+            gravity_candidates,
+            max_inlier_angle_deg=float(rule_value(rules, ["camera", "gravity_consensus", "max_inlier_angle_deg"], 12.0)),
+            conflict_angle_deg=float(rule_value(rules, ["camera", "gravity_consensus", "conflict_angle_deg"], 18.0)),
+        )
+        included = {
+            item["reference_label"]
+            for item in consensus_debug.get("candidates", [])
+            if item.get("included_in_consensus")
+        }
+        for candidate in gravity_candidates:
+            candidate["attempt"]["status"] = (
+                "selected_consensus_inlier"
+                if candidate["reference_label"] in included
+                else "rejected_consensus_outlier"
+            )
+        g_debug = dict(consensus_debug)
+        gravity_source = "multi_reference_camera_coordinate_consensus"
+    else:
+        g_hat = np.array([0.0, -1.0, 0.0], np.float32)
+        g_conf = 0.0
+        g_debug = {"reason": "no_usable_gravity_reference_default_camera_up"}
+        gravity_source = "default_camera_up"
 
     g_hat_before_canonicalization = np.asarray(g_hat, dtype=np.float32).reshape(3)
     g_hat = orient_vector_to_camera_up(g_hat_before_canonicalization)
@@ -1451,7 +1469,7 @@ async def analyze_hanging_mvp(
         "direction_dot_camera_up": float(np.dot(g_hat, np.array([0.0, -1.0, 0.0], np.float32))),
         "direction_flip_applied_at_service_boundary": bool(float(np.dot(g_hat_before_canonicalization, g_hat)) < 0.0),
         "reference_priority": ["floor", "roof", "table", "metric3d_global_floor_like_normals"],
-        "semantic_reference_selection_policy": "highest_confidence_with_floor_first_tie_break",
+        "semantic_reference_selection_policy": "weighted_angular_medoid_consensus_in_camera_coordinates",
         "semantic_reference_counts": {
             "floor": len(floors),
             "roof": len(roofs),
@@ -1527,14 +1545,22 @@ async def analyze_hanging_mvp(
             and semantic_wall_bbox_max_right >= int(w * 0.82)
         )
 
-        if len(walls) >= 2 and (semantic_multiwall_adequate or semantic_bbox_multiwall_adequate):
+        if len(walls) >= 2:
             auto_multiwall_debug["semantic_wall_count"] = len(walls)
             if semantic_multiwall_adequate:
                 auto_multiwall_debug["reason"] = "semantic_multiwall_preserved"
-            else:
+            elif semantic_bbox_multiwall_adequate:
                 auto_multiwall_debug["reason"] = "semantic_multiwall_preserved_bbox_mask_coordinate_mismatch_suspected"
                 auto_multiwall_debug["semantic_wall_reason"] = "mask_coverage_low_but_bbox_coverage_ok"
-                auto_multiwall_debug["used"] = False
+            else:
+                # Multiple VLM walls are authority. A low-coverage set may be
+                # incomplete, but replacing it with full-image normal clusters
+                # can promote a curtain/window pseudo-plane to a wall. Missing
+                # wall augmentation belongs to semantic_mvp, where forbidden
+                # objects and original coordinate evidence are still available.
+                auto_multiwall_debug["reason"] = "semantic_multiwall_preserved_conservative_low_coverage"
+                auto_multiwall_debug["semantic_wall_reason"] = "geometry_replacement_forbidden_when_multiple_semantic_walls_exist"
+            auto_multiwall_debug["used"] = False
         else:
             source_wall_mask = np.zeros((h, w), np.uint8)
             for _wobj in walls:
@@ -1709,6 +1735,10 @@ async def analyze_hanging_mvp(
     # walls must still be eligible when wall support and geometry are safe.
     projection_size_gate_enabled = False
     max_quad_aspect_ratio_long_over_short = float(rule_value(rules, ["hard_constraints", "max_quad_aspect_ratio_long_over_short"], 8.0))
+    projection_shape_review_ratio = float(rule_value(rules, ["projection_shape_gate", "review_distortion_ratio"], 1.55))
+    projection_shape_hard_ratio = float(rule_value(rules, ["projection_shape_gate", "hard_reject_distortion_ratio"], 2.0))
+    projection_opposing_edge_hard_ratio = float(rule_value(rules, ["projection_shape_gate", "hard_reject_opposing_edge_ratio"], 3.0))
+    projection_orientation_margin = float(rule_value(rules, ["projection_shape_gate", "orientation_margin_ratio"], 0.08))
     wall_center_composition_weight = float(rule_value(rules, ["candidate_ranking", "wall_center_composition_weight"], 0.32))
     wall_corner_soft_penalty_weight = float(rule_value(rules, ["candidate_ranking", "wall_corner_soft_penalty_weight"], 0.12))
     wall_center_composition_weight = max(0.0, min(0.60, wall_center_composition_weight))
@@ -1829,6 +1859,15 @@ async def analyze_hanging_mvp(
         wall_id = wall_obj["object_id"]
         wall_object_registry[wall_id] = wall_obj
         wall_debug_registry.setdefault(wall_id, {"wall_id": wall_id, "wall_source": wall_obj.get("source"), "wall_mask": wall_obj.get("mask").copy(), "summary": {}})
+        if bool(g_debug.get("gravity_consensus_unresolved")):
+            rejected.append({
+                "wall_id": wall_id,
+                "reason": "gravity_reference_conflict_unresolved",
+                "wall_has_no_safe_candidate": True,
+                "g_hat_debug": g_debug,
+            })
+            wall_debug_registry[wall_id]["summary"]["gravity_reference_conflict_unresolved"] = True
+            continue
         raw_wall_mask_before_structural = wall_obj["mask"].copy()
         wall_mask = raw_wall_mask_before_structural.copy()
         # subtract structural forbidden from wall mask
@@ -2581,6 +2620,15 @@ async def analyze_hanging_mvp(
             candidate_idx += 1
             quad = project_quad(basis.origin, basis.u, basis.v, bundle.intr, axis_s, center_t, artwork_w_m, artwork_h_m)
             quad_metrics = _quad_metrics_original(quad, bundle.scale_to_original)
+            projection_shape_gate = evaluate_projection_shape_gate(
+                quad_metrics,
+                artwork_w_m,
+                artwork_h_m,
+                review_distortion_ratio=projection_shape_review_ratio,
+                hard_reject_distortion_ratio=projection_shape_hard_ratio,
+                hard_reject_opposing_edge_ratio=projection_opposing_edge_hard_ratio,
+                orientation_margin_ratio=projection_orientation_margin,
+            )
             quad_original_np = np.asarray(scale_points_to_original(quad, bundle.scale_to_original), dtype=np.float32)
             img_w_original, img_h_original = bundle.original_size
             border_margin_px = {
@@ -2929,6 +2977,8 @@ async def analyze_hanging_mvp(
             # far wall is allowed to proceed when placement support is safe.
             if quad_metrics["quad_aspect_ratio_long_over_short"] > max_quad_aspect_ratio_long_over_short:
                 reasons.append("projected_quad_aspect_ratio_too_extreme")
+            reasons.extend(projection_shape_gate.get("hard_reasons", []))
+            soft_risk_reasons.extend(projection_shape_gate.get("review_reasons", []))
 
             height_penalty = 0.08 if not bool(support_context.get("metric_height_finalized", support_context.get("height_mode") == "metric_rule")) else 0.0
             quality_score = _clamp01(
@@ -2947,7 +2997,21 @@ async def analyze_hanging_mvp(
                 candidate_risk_level = "medium"
             else:
                 candidate_risk_level = "low"
-            requires_hardpaste_vlm_review = bool(vlm_review_for_high_risk and candidate_risk_level == "high")
+            wall_source_text = str(wall_obj.get("source") or "").lower()
+            geometry_proposed_wall = bool("geometry" in wall_source_text or wall_id.startswith("auto_wall_"))
+            projection_requires_review = projection_shape_gate.get("status") == "review"
+            requires_hardpaste_vlm_review = bool(
+                (vlm_review_for_high_risk and candidate_risk_level == "high")
+                or geometry_proposed_wall
+                or projection_requires_review
+            )
+            hardpaste_review_reasons = []
+            if vlm_review_for_high_risk and candidate_risk_level == "high":
+                hardpaste_review_reasons.append("low_or_uncertain_geometry_score_after_structural_clearance_pass")
+            if geometry_proposed_wall:
+                hardpaste_review_reasons.append("geometry_proposed_wall_requires_visual_material_validation")
+            if projection_requires_review:
+                hardpaste_review_reasons.append("projection_foreshortening_requires_visual_validation")
 
             hard = {
                 "passed": not reasons,
@@ -2995,7 +3059,8 @@ async def analyze_hanging_mvp(
                     "high_risk_score_threshold": float(high_risk_score_threshold),
                     "medium_risk_score_threshold": float(medium_risk_score_threshold),
                     "requires_hardpaste_vlm_review": requires_hardpaste_vlm_review,
-                    "hardpaste_vlm_review_reason": "low_or_uncertain_geometry_score_after_structural_clearance_pass" if requires_hardpaste_vlm_review else None,
+                    "hardpaste_vlm_review_reason": hardpaste_review_reasons[0] if hardpaste_review_reasons else None,
+                    "hardpaste_vlm_review_reasons": hardpaste_review_reasons,
                     "review_input_asset": f"wall_assets/{wall_id}/hard_paste.png",
                 },
                 "existing_content_overlap_ratio": float(existing_overlap_on_candidate_wall),
@@ -3054,6 +3119,7 @@ async def analyze_hanging_mvp(
                 "wall_filter_debug": wall_filter_debug,
                 "projection_degenerate_guard": {
                     **quad_metrics,
+                    "projection_shape_gate": projection_shape_gate,
                     "projection_size_gate_enabled": bool(projection_size_gate_enabled),
                     "projection_size_policy": "no_minimum_projected_width_height_or_area_gate",
                     "max_quad_aspect_ratio_long_over_short": float(max_quad_aspect_ratio_long_over_short),
@@ -3062,6 +3128,7 @@ async def analyze_hanging_mvp(
                     "edge_margin_debug": edge_margin_debug,
                     "visible_wall_s_range_m": visible_wall_s_range_m,
                     "artwork_width_m": float(artwork_w_m),
+                    "artwork_height_m": float(artwork_h_m),
                 },
             }
 
@@ -3186,12 +3253,14 @@ async def analyze_hanging_mvp(
                     "center_px_original": [float(np.mean(quad[:,0]) * bundle.scale_to_original[0]), float(np.mean(quad[:,1]) * bundle.scale_to_original[1])],
                     "projected_quad_px_processed": [[float(x), float(y)] for x, y in quad],
                     "projected_quad_px_original": scale_points_to_original(quad, bundle.scale_to_original),
+                    "shape_gate": projection_shape_gate,
                 },
                 "hard_constraints": hard,
                 "reject_reasons": reasons,
                 "soft_risk_reasons": soft_risk_reasons,
                 "risk_level": candidate_risk_level,
                 "requires_hardpaste_vlm_review": requires_hardpaste_vlm_review,
+                "hardpaste_vlm_review_reasons": hardpaste_review_reasons,
                 "score": float(quality_score),
                 "causal_light_facts": causal_wall_light.get("light_facts") if isinstance(causal_wall_light, dict) else None,
                 "causal_light_semantics": causal_wall_light.get("semantic_light") if isinstance(causal_wall_light, dict) else None,
@@ -3729,7 +3798,7 @@ async def analyze_hanging_mvp(
             review["selection_status"] = "approved_but_dropped_by_manifest_cap_or_nms"
 
     selected_requires_hardpaste_vlm_review = bool(selected and selected.get("requires_hardpaste_vlm_review"))
-    selected_exit_code = "OK_SELECTED_HIGH_RISK_VLM_REVIEW_REQUIRED" if selected_requires_hardpaste_vlm_review else "OK_SELECTED"
+    selected_exit_code = "OK_SELECTED_VLM_REVIEW_REQUIRED" if selected_requires_hardpaste_vlm_review else "OK_SELECTED"
     if selected and not final_hardpaste_assets:
         selected_exit_code = "OK_NO_FLUX_APPROVED_HARDPASTE_PENDING_REVIEW"
 
@@ -3740,7 +3809,9 @@ async def analyze_hanging_mvp(
             "build_id": HANGING_PIPELINE_BUILD_ID,
             "height_contract": "metric_height_authoritative_exact_footprint_v3",
             "support_contract": "recognized_support_label_specific_clearance_v5",
-            "gravity_contract": "camera_up_canonicalized_v2",
+            "gravity_contract": "multi_reference_camera_coordinate_consensus_v3",
+            "semantic_coordinate_contract": "internal_1000_grid_with_original_boundary_sentinels_v2",
+            "projection_contract": "ordered_edge_aspect_and_nonrigid_surface_guard_v2",
             "render_contract": "fullspace_identity_locked_shadow_v2",
             "worker_result_contract": "render_review_is_completed_review_v1",
         },

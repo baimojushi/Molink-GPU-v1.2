@@ -29,6 +29,84 @@ def orient_vector_to_camera_up(v: np.ndarray) -> np.ndarray:
         value = -value
     return value.astype(np.float32)
 
+
+def select_gravity_consensus(
+    candidates: List[Dict[str, Any]],
+    *,
+    max_inlier_angle_deg: float = 12.0,
+    conflict_angle_deg: float = 18.0,
+) -> Tuple[np.ndarray, float, Dict[str, Any]]:
+    """Select and fuse mutually consistent gravity references.
+
+    Metric3D normals are expressed in camera coordinates, so a pitched camera
+    legitimately produces a gravity vector that is not ``[0,-1,0]``.  We must
+    not "repair" that camera pose.  Instead, compare independent floor,
+    ceiling/table and global-normal estimates, choose the weighted angular
+    medoid, and fuse only references agreeing with it.  A conflicting semantic
+    mask can no longer tilt all wall bases by winning on pixel count alone.
+    """
+    normalized: List[Dict[str, Any]] = []
+    for item in candidates or []:
+        try:
+            confidence = max(0.0, float(item.get("confidence", 0.0)))
+            vector = orient_vector_to_camera_up(np.asarray(item.get("g_hat"), np.float32).reshape(3))
+        except Exception:
+            continue
+        if confidence <= 0.0 or not np.isfinite(vector).all():
+            continue
+        normalized.append({**item, "confidence": confidence, "g_hat": vector})
+    if not normalized:
+        return CAMERA_UP.copy(), 0.0, {"reason": "no_usable_gravity_candidates", "candidate_count": 0}
+
+    vectors = np.stack([item["g_hat"] for item in normalized], axis=0)
+    weights = np.asarray([item["confidence"] for item in normalized], np.float64)
+    dots = np.clip(np.abs(vectors @ vectors.T), 0.0, 1.0)
+    angles = np.degrees(np.arccos(dots))
+    weighted_cost = (angles * weights.reshape(1, -1)).sum(axis=1) / max(float(weights.sum()), EPS)
+    medoid_index = int(np.argmin(weighted_cost))
+    medoid = vectors[medoid_index]
+    medoid_angles = angles[medoid_index]
+    inlier_mask = medoid_angles <= float(max_inlier_angle_deg)
+    if not np.any(inlier_mask):
+        inlier_mask[medoid_index] = True
+    fused = np.sum(vectors[inlier_mask] * weights[inlier_mask].reshape(-1, 1), axis=0)
+    fused = orient_vector_to_camera_up(fused)
+    fused_angles = np.degrees(np.arccos(np.clip(np.abs(vectors @ fused), 0.0, 1.0)))
+    inlier_weight = float(weights[inlier_mask].sum())
+    total_weight = max(float(weights.sum()), EPS)
+    coherence = max(0.0, 1.0 - float(np.average(fused_angles[inlier_mask], weights=weights[inlier_mask])) / max(float(max_inlier_angle_deg), EPS))
+    confidence = min(1.0, float(np.average(weights[inlier_mask])) * (inlier_weight / total_weight) * (0.65 + 0.35 * coherence))
+    strong = weights >= 0.35
+    strong_pairwise = angles[np.ix_(strong, strong)] if int(np.count_nonzero(strong)) >= 2 else np.zeros((0, 0), np.float64)
+    strong_max_angle = float(strong_pairwise.max()) if strong_pairwise.size else 0.0
+    conflict = bool(strong_max_angle > float(conflict_angle_deg))
+    strong_inlier_count = int(np.count_nonzero(strong & inlier_mask))
+    unresolved_conflict = bool(conflict and strong_inlier_count < 2)
+    debug = {
+        "policy": "weighted_angular_medoid_then_inlier_fusion_in_camera_coordinates",
+        "camera_pose_is_preserved": True,
+        "candidate_count": len(normalized),
+        "selected_medoid": str(normalized[medoid_index].get("reference_label") or normalized[medoid_index].get("source") or medoid_index),
+        "max_inlier_angle_deg": float(max_inlier_angle_deg),
+        "conflict_angle_deg": float(conflict_angle_deg),
+        "strong_reference_max_pairwise_angle_deg": strong_max_angle,
+        "gravity_reference_conflict": conflict,
+        "strong_consensus_inlier_count": strong_inlier_count,
+        "gravity_consensus_unresolved": unresolved_conflict,
+        "fused_g_hat_cam": [float(x) for x in fused],
+        "candidates": [
+            {
+                "reference_label": str(item.get("reference_label") or item.get("source") or idx),
+                "confidence": float(item["confidence"]),
+                "g_hat_cam": [float(x) for x in item["g_hat"]],
+                "angle_to_fused_deg": float(fused_angles[idx]),
+                "included_in_consensus": bool(inlier_mask[idx]),
+            }
+            for idx, item in enumerate(normalized)
+        ],
+    }
+    return fused.astype(np.float32), float(confidence), debug
+
 def backproject(depth: np.ndarray, intr: Intrinsics) -> np.ndarray:
     h, w = depth.shape
     yy, xx = np.meshgrid(np.arange(h), np.arange(w), indexing="ij")

@@ -111,6 +111,28 @@ def test_regression_b7d44210_mixed_x_grid_and_pixel_y_are_scaled_per_axis():
     assert abs(front[2] - 1397.76) < 0.01
     assert front[3] == 999
 
+
+def test_regression_83f8bf2e_internal_1000_grid_with_original_edge_sentinels():
+    # Internal objects use the provider's 0..1000 grid. Objects touching the
+    # image boundary copy exact original dimensions (1280/1708), which used to
+    # make the entire response look like original pixels.
+    objects = [
+        {"label": "wall", "role": "wall", "bbox_xyxy": [0, 220, 341, 640]},
+        {"label": "wall", "role": "wall", "bbox_xyxy": [342, 257, 600, 487]},
+        {"label": "wall", "role": "wall", "bbox_xyxy": [600, 210, 1000, 650]},
+        {"label": "window", "role": "forbidden", "bbox_xyxy": [600, 205, 1280, 690]},
+        {"label": "floor", "role": "support", "bbox_xyxy": [0, 620, 1280, 1708]},
+        {"label": "roof", "role": "support", "bbox_xyxy": [0, 0, 1280, 280]},
+    ]
+    mode, debug = _infer_vlm_bbox_coordinate_space(objects, 1280, 1708)
+    assert mode == "normalized_0_1000_with_original_boundary_sentinels"
+    assert debug["preserve_original_boundary_sentinels"] is True
+
+    center = _normalize_vlm_bbox_to_original_pixels([342, 257, 600, 487], 1280, 1708, mode)
+    assert all(abs(a - b) < 1e-6 for a, b in zip(center, [437.76, 438.956, 768.0, 831.796]))
+    floor = _normalize_vlm_bbox_to_original_pixels([0, 620, 1280, 1708], 1280, 1708, mode)
+    assert all(abs(a - b) < 1e-6 for a, b in zip(floor, [0.0, 1058.96, 1279.0, 1707.0]))
+
 from semantic_mvp.service import _canonical_label_and_role, _build_object_inventory
 
 
@@ -121,6 +143,7 @@ def test_semantic_label_aliases_promote_art_and_people_to_cleanup_inventory():
     assert _canonical_label_and_role("framed_art_02", "existing_content") == ("framed_art", "existing_content")
     assert _canonical_label_and_role("people", None) == ("person", "foreground")
     assert _canonical_label_and_role("person_02", "foreground") == ("person", "foreground")
+    assert _canonical_label_and_role("sheer_curtains", None) == ("curtain", "forbidden")
     objects = [
         {"object_id": "paint_1", "label": "painting", "role": "existing_content", "bbox_xyxy_original": [1, 2, 3, 4]},
         {"object_id": "person_1", "label": "person", "role": "foreground", "bbox_xyxy_original": [5, 6, 7, 8]},

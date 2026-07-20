@@ -39,12 +39,21 @@ _LABEL_ALIASES = {
     "built-in shelf": "built_in_shelf",
     "book shelf": "bookshelf",
     "counter fixture": "counter_fixture",
+    "curtains": "curtain",
+    "drapes": "drape",
+    "window curtain": "curtain",
+    "window curtains": "curtain",
+    "sheer curtain": "curtain",
+    "sheer curtains": "curtain",
+    "blackout curtain": "curtain",
+    "roller blind": "blind",
+    "window blind": "blind",
 }
 
 
 _KNOWN_CANONICAL_LABELS = {
     "wall", "floor", "roof", "sofa", "table", "cabinet", "shelf", "wall_mounted_shelf", "built_in_shelf", "storage", "counter_fixture", "counter", "appliance", "bookcase", "bookshelf", "rack", "window", "door", "tv", "mirror",
-    "lamp", "track_lighting", "arch", "opening", "existing_art", "painting", "poster",
+    "lamp", "track_lighting", "arch", "opening", "curtain", "drape", "blind", "existing_art", "painting", "poster",
     "framed_art", "artwork", "green_board", "notice_board", "wall_clutter", "wall_label",
     "hook", "nail", "small_shelf", "pedestal", "plinth", "display_stand",
     "foreground_object", "person", "plant", "chair", "sideboard", "small_sign", "signage", "sticker",

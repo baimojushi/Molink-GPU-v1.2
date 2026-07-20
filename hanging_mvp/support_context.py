@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 import cv2
 import numpy as np
@@ -845,4 +845,67 @@ def _quad_metrics_original(quad_processed: np.ndarray, scale_xy) -> Dict[str, fl
     height_px = 0.5 * (edge[1] + edge[3])
     short_side = max(1e-6, min(width_px, height_px)); long_side = max(width_px, height_px)
     area_px = float(abs(cv2.contourArea(q.astype(np.float32))))
-    return {"projected_width_px_original": float(width_px), "projected_height_px_original": float(height_px), "projected_area_px_original": float(area_px), "quad_aspect_ratio_long_over_short": float(long_side / short_side)}
+    return {
+        "projected_width_px_original": float(width_px),
+        "projected_height_px_original": float(height_px),
+        "projected_width_height_ratio_ordered": float(width_px / max(height_px, 1e-6)),
+        "projected_area_px_original": float(area_px),
+        "quad_aspect_ratio_long_over_short": float(long_side / short_side),
+        "top_bottom_edge_ratio": float(max(edge[0], edge[2]) / max(1e-6, min(edge[0], edge[2]))),
+        "left_right_edge_ratio": float(max(edge[1], edge[3]) / max(1e-6, min(edge[1], edge[3]))),
+    }
+
+
+def evaluate_projection_shape_gate(
+    quad_metrics: Mapping[str, Any],
+    artwork_width_m: float,
+    artwork_height_m: float,
+    *,
+    review_distortion_ratio: float = 1.55,
+    hard_reject_distortion_ratio: float = 2.0,
+    hard_reject_opposing_edge_ratio: float = 3.0,
+    orientation_margin_ratio: float = 0.08,
+) -> Dict[str, Any]:
+    """Reject mathematically valid but visually unusable wall projections.
+
+    Quad ordering preserves artwork width on edges 0/2 and height on 1/3.
+    A landscape work becoming visibly portrait (or vice versa) is therefore a
+    direct signal of extreme foreshortening, commonly caused by a curtain or a
+    side-return pseudo plane.  This guard intentionally does not enforce a
+    minimum pixel size.
+    """
+    physical_ratio = max(1e-6, float(artwork_width_m)) / max(1e-6, float(artwork_height_m))
+    projected_ratio = max(1e-6, float(quad_metrics.get("projected_width_height_ratio_ordered", 1.0)))
+    distortion = max(projected_ratio / physical_ratio, physical_ratio / projected_ratio)
+    margin = max(0.0, float(orientation_margin_ratio))
+    orientation_flip = bool(
+        (physical_ratio >= 1.0 + margin and projected_ratio <= 1.0 - margin)
+        or (physical_ratio <= 1.0 - margin and projected_ratio >= 1.0 + margin)
+    )
+    opposing_edge_ratio = max(
+        float(quad_metrics.get("top_bottom_edge_ratio", 1.0)),
+        float(quad_metrics.get("left_right_edge_ratio", 1.0)),
+    )
+    hard_reasons: List[str] = []
+    review_reasons: List[str] = []
+    if orientation_flip:
+        hard_reasons.append("projected_artwork_orientation_flipped_by_foreshortening")
+    if distortion > float(hard_reject_distortion_ratio):
+        hard_reasons.append("projected_artwork_aspect_distortion_exceeds_hard_limit")
+    elif distortion > float(review_distortion_ratio):
+        review_reasons.append("projected_artwork_aspect_distortion_requires_visual_review")
+    if opposing_edge_ratio > float(hard_reject_opposing_edge_ratio):
+        hard_reasons.append("projected_quad_opposing_edge_ratio_exceeds_hard_limit")
+    return {
+        "status": "hard_reject" if hard_reasons else ("review" if review_reasons else "pass"),
+        "physical_width_height_ratio": float(physical_ratio),
+        "projected_width_height_ratio_ordered": float(projected_ratio),
+        "aspect_distortion_ratio": float(distortion),
+        "orientation_flip": orientation_flip,
+        "max_opposing_edge_ratio": float(opposing_edge_ratio),
+        "review_distortion_ratio": float(review_distortion_ratio),
+        "hard_reject_distortion_ratio": float(hard_reject_distortion_ratio),
+        "hard_reject_opposing_edge_ratio": float(hard_reject_opposing_edge_ratio),
+        "hard_reasons": hard_reasons,
+        "review_reasons": review_reasons,
+    }

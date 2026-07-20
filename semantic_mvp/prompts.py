@@ -18,7 +18,7 @@ def _causal_vlm_fields_enabled() -> bool:
 
 LABEL_POLICY = {
     "support": ["sofa", "floor", "roof", "table", "cabinet", "bar"],
-    "structural_forbidden": ["window", "door", "tv", "mirror", "lamp", "track_lighting", "arch", "opening"],
+    "structural_forbidden": ["window", "door", "tv", "mirror", "lamp", "track_lighting", "arch", "opening", "curtain", "drape", "blind"],
     "existing_content": ["existing_art", "painting", "poster", "framed_art", "artwork", "wall_clutter", "wall_label", "hook", "nail", "small_shelf", "green_board", "notice_board"],
     "non_support": ["pedestal", "plinth", "display_stand"],
     "foreground": ["foreground_object", "person", "human", "people", "plant", "chair"],
@@ -73,7 +73,7 @@ to 0..1 or 0..1000, and never mix normalized x values with pixel y values.
 Prioritize high-recall boxes. Coarse bbox is acceptable for MVP.
 Required labels when visible:
 wall, floor, roof, sofa, table, cabinet, bar, window, door, tv, mirror, lamp,
-track_lighting, arch, opening, existing_art, painting, poster, framed_art,
+track_lighting, arch, opening, curtain, drape, blind, existing_art, painting, poster, framed_art,
 artwork, wall_clutter, wall_label, hook, nail, small_shelf, green_board,
 notice_board, person, human, people, pedestal, plinth, display_stand,
 foreground_object.
@@ -86,6 +86,7 @@ VLM-first wall proposal rules:
 - If a large wall bbox spans multiple differently oriented wall planes, output the coarsest separate wall proposals you can infer.
 - Existing displayed artworks, posters, frames, green boards, labels and wall-mounted clutter must be returned separately as existing_content objects, not merged into wall.
 - Opening, arch, door and window must be separate forbidden objects, not merged into wall.
+- Curtains, drapes, sheer curtains and blinds are forbidden non-rigid/window-covering surfaces. Return them separately even when Metric3D makes them look planar; never label them as wall.
 - Door panels are never hangable wall. If a door/window/opening touches a wall edge, clip the wall bbox at that structure boundary instead of including it.
 - Do not stop a wall bbox at the last detected artwork/person. Include the full visible wall plane behind foreground people and wall-mounted artworks.
 - For wide gallery photos, prioritize front-vs-side wall separation.

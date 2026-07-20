@@ -161,7 +161,7 @@ def _mask_bbox(mask: np.ndarray) -> List[float] | None:
 def default_refine_label_set() -> set[str]:
     labels = os.getenv(
         "SAM_REFINE_LABELS",
-        "sofa,floor,table,cabinet,bar,window,door,tv,mirror,lamp,track_lighting,arch,opening,"
+        "sofa,floor,table,cabinet,bar,window,door,tv,mirror,lamp,track_lighting,arch,opening,curtain,drape,blind,"
         "existing_art,wall_clutter,wall_label,hook,nail,small_shelf,foreground_object,plant,chair,"
         "pedestal,plinth,display_stand",
     )

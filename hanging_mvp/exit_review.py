@@ -64,6 +64,8 @@ def _call_openai_compatible_review(image_rgb, candidate: Mapping[str, Any]) -> d
         ],
         "reject_when": [
             "artwork is placed on a structural object, opening, person or impossible geometry",
+            "artwork is placed on a curtain, sheer curtain, drape, blind, window covering or other non-rigid surface even if it looks planar",
+            "a landscape artwork is visibly warped into portrait orientation, a portrait artwork into landscape orientation, or the perspective foreshortening is implausibly severe",
             "major part of the artwork is off-wall or occluded",
             "hard paste creates an obviously invalid target for final rendering",
         ],
