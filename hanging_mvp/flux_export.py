@@ -311,9 +311,9 @@ def build_stage_b_prompt(
 
     parts = [
         "Stage B spatial styling edit. HARD CONSTRAINTS:",
-        "1. Edit only inside the supplied edit_mask. Keep every pixel outside the mask unchanged, including the protected artwork and frame region.",
-        "2. Do not change the geometry of doors, windows, ceiling, floor, walls, furniture, architectural lines, camera viewpoint, or perspective.",
-        "3. Preserve existing light-source positions, shadow directions, and material structure; any lighting adjustment must be low-frequency and subtle.",
+        "1. Do not change the geometry of doors, windows, ceiling, floor, walls, furniture, architectural lines, camera viewpoint, or perspective.",
+        "2. Preserve existing light-source positions, shadow directions, and material structure; any lighting adjustment must be low-frequency and subtle.",
+        "3. Keep every artwork and frame pixel unchanged.",
     ]
     next_number = 4
     if soft_furnishing:
@@ -375,7 +375,7 @@ def build_stage_b_prompt(
         except (TypeError, ValueError):
             rgb = [58, 62, 71]
         parts.extend([
-            f"{next_number}. Recolor only the editable wall zone to rgb({rgb[0]}, {rgb[1]}, {rgb[2]}), preserving the original wall's illumination gradients, shadows, and texture instead of applying a flat fill.",
+            f"{next_number}. Recolor only the wall zone to rgb({rgb[0]}, {rgb[1]}, {rgb[2]}), preserving the original wall's illumination gradients, shadows, and texture instead of applying a flat fill.",
             f"{next_number + 1}. Keep baseboards, corners, switches, outlets, seams, and material grain unchanged. Add no wallpaper pattern, molding, graphic, or wall decoration.",
         ])
         next_number += 2
@@ -388,27 +388,6 @@ def build_stage_b_prompt(
     else:
         parts.append("Final artwork lock: preserve the complete artwork footprint and all artwork pixels exactly; do not invent a frame or mat.")
     return "\n".join(parts)
-
-
-def build_stage_b_mask(
-    soft_furnishing: bool,
-    wallpaper_enabled: bool,
-    decor_zone: np.ndarray,
-    wall_zone: np.ndarray,
-    protect_zone: np.ndarray,
-) -> np.ndarray:
-    """Combine Stage B zones once, then subtract the protected artwork region."""
-    arrays = [np.asarray(decor_zone), np.asarray(wall_zone), np.asarray(protect_zone)]
-    shape = arrays[0].shape[:2]
-    if any(arr.shape[:2] != shape for arr in arrays[1:]):
-        raise ValueError("Stage B mask zones must share the same height and width")
-    selected = np.zeros(shape, dtype=bool)
-    if soft_furnishing:
-        selected |= arrays[0] > 0
-    if wallpaper_enabled:
-        selected |= arrays[1] > 0
-    selected &= ~(arrays[2] > 0)
-    return np.where(selected, 255, 0).astype(np.uint8)
 
 
 def _entry_center_and_width(entry: Mapping[str, Any]) -> tuple[float, float, float]:

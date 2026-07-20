@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import numpy as np
 from PIL import Image
 
-from hanging_mvp.flux_export import build_stage_b_mask, build_stage_b_prompt
+from hanging_mvp.flux_export import build_stage_b_prompt
 from semantic_mvp.vlm_client import parse_styling_analysis_with_vlm
 from worker import render_api, result_builder
 
@@ -91,22 +91,6 @@ def test_algorithmic_styling_analysis_honors_fixed_wall_tone(tmp_path):
     assert "preserve the complete visible physical frame" in prompt
 
 
-def test_stage_b_mask_unions_requested_zones_and_subtracts_protection():
-    decor = np.zeros((6, 8), dtype=np.uint8)
-    wall = np.zeros((6, 8), dtype=np.uint8)
-    protect = np.zeros((6, 8), dtype=np.uint8)
-    decor[3:, :] = 255
-    wall[:4, :] = 255
-    protect[2:5, 3:5] = 255
-
-    assert not build_stage_b_mask(False, False, decor, wall, protect).any()
-    assert build_stage_b_mask(True, False, decor, wall, protect)[5, 0] == 255
-    assert build_stage_b_mask(False, True, decor, wall, protect)[0, 0] == 255
-    combined = build_stage_b_mask(True, True, decor, wall, protect)
-    assert combined[0, 0] == 255 and combined[5, 0] == 255
-    assert combined[3, 3] == 0
-
-
 def test_stage_b_pipeline_calls_zero_or_once_per_asset_for_all_combinations(tmp_path):
     combinations = [
         (False, None, 0, "not_requested"),
@@ -169,7 +153,6 @@ def test_stage_b_content_qa_rejects_whole_decor_repaint(tmp_path, monkeypatch):
     )
     final_path = output_dir / "final_hd" / "wall_a__candidate_1.png"
     assert aggregate["outputs"][0]["styling_status"] == "qa_rejected_fallback_to_plain"
-    assert aggregate["outputs"][0]["qa"]["outside_changed_pixel_count"] == 0
     assert aggregate["outputs"][0]["qa"]["protect_changed_pixel_count"] == 0
     assert "decor_changed_ratio_above_threshold" in aggregate["outputs"][0]["qa"]["failures"]
     assert final_path.read_bytes() == original_bytes
@@ -198,7 +181,6 @@ def test_stage_b_content_qa_rejects_random_noise_inside_large_edit_mask(tmp_path
     qa = aggregate["outputs"][0]["qa"]
     assert aggregate["outputs"][0]["styling_status"] == "qa_rejected_fallback_to_plain"
     assert qa["passed"] is False
-    assert qa["changed_inside_edit_mask_ratio"] > 0.99
     assert qa["content_quality"]["decor"]["masked_ssim"] < 0.60
     assert final_path.read_bytes() == original_bytes
 

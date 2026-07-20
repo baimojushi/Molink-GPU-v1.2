@@ -24,7 +24,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from scripts import run_bfl_hanging_flux_pipeline as bfl  # noqa: E402
-from hanging_mvp.flux_export import build_stage_b_mask, build_stage_b_prompt  # noqa: E402
+from hanging_mvp.flux_export import build_stage_b_prompt  # noqa: E402
 from hanging_mvp.render_qa import masked_global_ssim  # noqa: E402
 from image_editing.pipeline import render_hanging  # noqa: E402
 from image_editing.provider_registry import build_image_edit_provider  # noqa: E402
@@ -217,7 +217,6 @@ def _masked_luma_gradient_metrics(a: np.ndarray, b: np.ndarray, mask: np.ndarray
 def _masked_stage_b_composite_and_qa(
     stage_a_path: Path,
     generated_path: Path,
-    edit_mask_path: Path,
     protect_mask_path: Path,
     output_path: Path,
     *,
@@ -236,32 +235,25 @@ def _masked_stage_b_composite_and_qa(
                 "stage_a_size": list(base.size),
                 "generated_size": list(generated.size),
             }
-        with Image.open(edit_mask_path) as edit_image, Image.open(protect_mask_path) as protect_image:
-            edit = edit_image.convert("L").resize(base.size, Image.Resampling.NEAREST)
+        with Image.open(protect_mask_path) as protect_image:
             protect = protect_image.convert("L").resize(base.size, Image.Resampling.NEAREST)
-        edit_arr = np.asarray(edit, dtype=np.uint8) > 0
         protect_arr = np.asarray(protect, dtype=np.uint8) > 0
-        if np.any(edit_arr & protect_arr):
-            return {"passed": False, "reason": "edit_mask_overlaps_protect_zone"}
         composited = base.copy()
-        composited.paste(generated, (0, 0), edit)
+        composited.paste(generated, (0, 0))
         output_path.parent.mkdir(parents=True, exist_ok=True)
         composited.save(output_path)
 
     base_arr = np.asarray(base, dtype=np.int16)
     out_arr = np.asarray(composited, dtype=np.int16)
     changed = np.any(base_arr != out_arr, axis=2)
-    outside_changed = int(np.count_nonzero(changed & (~edit_arr)))
     protect_changed = int(np.count_nonzero(changed & protect_arr))
     delta = np.mean(np.abs(out_arr - base_arr), axis=2)
     failures: list[str] = []
     content_quality: dict[str, Any] = {}
 
     if soft_furnishing_requested:
-        decor_eval = (np.asarray(decor_zone) > 0) & edit_arr
+        decor_eval = (np.asarray(decor_zone) > 0)
         if wallpaper_enabled:
-            # A rare semantic overlap belongs to wall recolor QA, otherwise a
-            # permitted base-color change could incorrectly fail decor SSIM.
             decor_eval &= ~(np.asarray(wall_zone) > 0)
         decor_area = int(np.count_nonzero(decor_eval))
         min_ssim = float(os.getenv("MOLINK_STAGE_B_QA_MIN_DECOR_SSIM", "0.60"))
@@ -291,7 +283,7 @@ def _masked_stage_b_composite_and_qa(
             content_quality["decor"] = {"area_px": decor_area, "status": "too_small"}
 
     if wallpaper_enabled:
-        wall_eval = (np.asarray(wall_zone) > 0) & edit_arr
+        wall_eval = (np.asarray(wall_zone) > 0)
         wall_area = int(np.count_nonzero(wall_eval))
         min_gradient_correlation = float(os.getenv("MOLINK_STAGE_B_QA_MIN_WALL_GRADIENT_CORRELATION", "0.45"))
         max_gradient_energy_ratio = float(os.getenv("MOLINK_STAGE_B_QA_MAX_WALL_GRADIENT_ENERGY_RATIO", "4.0"))
@@ -316,18 +308,12 @@ def _masked_stage_b_composite_and_qa(
             failures.append("wall_qa_region_too_small")
             content_quality["wall"] = {"area_px": wall_area, "status": "too_small"}
 
-    if outside_changed:
-        failures.append("outside_edit_mask_pixels_changed")
     if protect_changed:
         failures.append("protected_pixels_changed")
     return {
         "passed": not failures,
         "reason": "ok" if not failures else "content_or_spatial_quality_gate_failed",
-        "outside_changed_pixel_count": outside_changed,
         "protect_changed_pixel_count": protect_changed,
-        "edit_mask_area_px": int(np.count_nonzero(edit_arr)),
-        "changed_inside_edit_mask_px": int(np.count_nonzero(changed & edit_arr)),
-        "changed_inside_edit_mask_ratio": float(np.mean(changed[edit_arr])) if np.any(edit_arr) else 0.0,
         "content_quality": content_quality,
         "failures": failures,
         "output_size": list(composited.size),
@@ -466,20 +452,9 @@ def run_stage_b_pipeline(
                     item.get("stage_b_protect_zone_mask_path"),
                 )
                 protect_zone = _load_required_stage_b_zone(protect_path, size, "protected artwork/frame zone mask")
-                edit_mask = build_stage_b_mask(
-                    bool(soft_furnishing_requested),
-                    bool(normalized_wallpaper),
-                    decor_zone,
-                    wall_zone,
-                    protect_zone,
-                )
-                if not np.any(edit_mask):
-                    raise ValueError("Stage B semantic edit mask is empty")
 
                 item_dir = output_root / asset_id / "stage_b"
                 item_dir.mkdir(parents=True, exist_ok=True)
-                mask_path = item_dir / "edit_mask.png"
-                Image.fromarray(edit_mask, mode="L").save(mask_path)
                 artwork_context = dict(item.get("artwork_analysis") or {}) if isinstance(item.get("artwork_analysis"), dict) else {}
                 artwork_context["physical_width_m"] = item.get("artwork_physical_width_m")
                 artwork_context["physical_height_m"] = item.get("artwork_physical_height_m")
@@ -495,7 +470,6 @@ def run_stage_b_pipeline(
                     provider_adapter,
                     stage_a_path,
                     prompt,
-                    art_mask=mask_path,
                     output_dir=item_dir,
                     output_name="styled.png",
                     metadata={
@@ -505,16 +479,12 @@ def run_stage_b_pipeline(
                         "wall_id": item.get("wall_id"),
                         "stage_b_single_call": True,
                         "stage_b_zone_source": item.get("styling_zone_source") or aggregate["zone_source"],
-                        "mask_edit_mode": "local_composite",
-                        "render_object_mask_path": str(protect_path) if protect_path else None,
-                        "qa_art_mask_path": str(protect_path) if protect_path else None,
                     },
                 )
                 composited_path = item_dir / "styled_masked_composite.png"
                 qa = _masked_stage_b_composite_and_qa(
                     stage_a_path,
                     Path(result.image),
-                    mask_path,
                     protect_path,
                     composited_path,
                     decor_zone=decor_zone,
@@ -526,7 +496,6 @@ def run_stage_b_pipeline(
                     record.update({
                         "styling_status": "qa_rejected_fallback_to_plain",
                         "qa": qa,
-                        "edit_mask_path": str(mask_path),
                         "prompt_path": str(item_dir / "prompt.txt"),
                         "styling_zone_source": item.get("styling_zone_source") or aggregate["zone_source"],
                         "trace": dict(result.trace),
@@ -538,7 +507,6 @@ def run_stage_b_pipeline(
                 record.update({
                     "styling_status": "succeeded",
                     "styling_zone_source": item.get("styling_zone_source") or aggregate["zone_source"],
-                    "edit_mask_path": str(mask_path),
                     "prompt_path": str(item_dir / "prompt.txt"),
                     "qa": qa,
                     "trace": dict(result.trace),
