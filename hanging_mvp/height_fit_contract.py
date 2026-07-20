@@ -38,12 +38,13 @@ def resolve_candidate_center_t(
     axis_item: Mapping[str, Any] | None = None,
     max_metric_rule_deviation_m: float = 0.10,
 ) -> dict[str, Any]:
-    """Resolve vertical placement without letting auto geometry rewrite a metric rule.
+    """Resolve vertical placement while preserving bounded metric authority.
 
-    Empty-space discovery is allowed to choose a horizontal axis.  When a
-    trusted metric rule exists, its center height remains authoritative; any
-    automatic ``center_t_m_override`` is retained only as rejected diagnostic
-    evidence.  Provisional/manual height modes may still use such a seed.
+    Ordinary automatic overrides cannot rewrite a metric height.  A max-empty-
+    rectangle seed is the sole exception: it may raise (never lower) the work
+    within an explicit bound to clear a counter/shelf, after which the caller's
+    exact footprint hard gates remain authoritative.  Provisional/manual modes
+    may continue to use an unconstrained visual seed.
     """
     if abs(float(dot_v_g)) < 1e-8:
         raise ValueError("height_projection_unstable_dot_v_g")
@@ -61,14 +62,29 @@ def resolve_candidate_center_t(
         except (TypeError, ValueError):
             requested_finite = False
 
-    metric_rule = str(height_mode or "") == "metric_rule"
-    override_applied = bool(requested_finite and not metric_rule)
+    metric_rule = str(height_mode or "") in {"metric_rule", "same_wall_existing_art_anchor"}
+    obstruction_aware = bool(axis_item.get("metric_obstruction_aware_height", False))
+    max_obstruction_shift_m = float(axis_item.get("max_metric_height_shift_m", 0.0) or 0.0)
+    requested_height_shift_m = (
+        float((requested - rule_center_t_m) * float(dot_v_g)) if requested_finite else None
+    )
+    obstruction_override_allowed = bool(
+        requested_finite
+        and metric_rule
+        and obstruction_aware
+        and requested_height_shift_m is not None
+        # Empty-space geometry may raise a work above a counter/shelf.  It may
+        # never lower the installation below the trusted metric rule.
+        and requested_height_shift_m >= -1e-6
+        and requested_height_shift_m <= max_obstruction_shift_m + 1e-6
+    )
+    override_applied = bool(requested_finite and (not metric_rule or obstruction_override_allowed))
     resolved_t = float(requested) if override_applied else float(rule_center_t_m)
     resolved_abs = float(wall_origin_dot_g) + float(dot_v_g) * resolved_t
     resolved_above_floor = resolved_abs - float(floor_height_abs_m)
     rule_above_floor = float(rule_center_height_abs_m) - float(floor_height_abs_m)
     deviation_m = abs(resolved_above_floor - rule_above_floor)
-    consistent = (not metric_rule) or deviation_m <= float(max_metric_rule_deviation_m)
+    consistent = (not metric_rule) or obstruction_override_allowed or deviation_m <= float(max_metric_rule_deviation_m)
 
     return {
         "rule_center_t_m": float(rule_center_t_m),
@@ -81,8 +97,18 @@ def resolve_candidate_center_t(
         "center_t_override_source": axis_item.get("source") if requested_finite else None,
         "center_t_override_applied": bool(override_applied),
         "center_t_override_ignored_reason": (
-            "metric_height_rule_is_authoritative" if requested_finite and metric_rule else None
+            (
+                "metric_height_rule_is_authoritative"
+                if requested_finite and metric_rule and not obstruction_aware
+                else "obstruction_aware_shift_must_raise_and_stay_within_limit"
+            )
+            if requested_finite and metric_rule and not obstruction_override_allowed
+            else None
         ),
+        "obstruction_aware_height_override": bool(obstruction_aware),
+        "obstruction_aware_height_override_allowed": bool(obstruction_override_allowed),
+        "requested_height_shift_m": requested_height_shift_m,
+        "max_obstruction_aware_height_shift_m": float(max_obstruction_shift_m),
         "metric_height_rule_deviation_m": float(deviation_m),
         "max_metric_height_rule_deviation_m": float(max_metric_rule_deviation_m),
         "metric_height_rule_consistent": bool(consistent),

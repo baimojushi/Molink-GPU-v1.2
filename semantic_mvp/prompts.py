@@ -57,6 +57,7 @@ Return an object:
   "coordinate_space": "pixels",
   "objects": [
     {
+      "object_id": "stable instance id, e.g. wall_front_01",
       "label": "...",
       "role": "wall|support|forbidden|foreground|non_support|existing_content",
       "bbox_xyxy": [x1,y1,x2,y2],
@@ -100,7 +101,9 @@ Multi-wall rules:
 - Detect EVERY visible wall plane as a separate object. Never merge walls with different orientations.
 - Typical cases include: left wall, front wall, right wall, inner wall beyond an opening.
 - Each wall must have its own independent bbox. The bbox should cover the full visible extent of that wall plane, including areas behind foreground occluders, but excluding doors/windows/openings.
-- Use object_id patterns like wall_left_01, wall_front_01, wall_right_01, wall_inner_01 when applicable.
+- Every wall object's label must be exactly "wall". Put positional identity only
+  in object_id patterns such as wall_left_01, wall_front_01, wall_right_01 or
+  wall_inner_01; never emit wall_front_01 as the label.
 - If a wall contains an opening/arch, still return the enclosing wall as wall, and also return opening/arch as separate forbidden objects.
 - Existing displayed artworks, posters, frames, green boards, labels and wall-mounted clutter must be returned separately as existing_content objects, not merged into wall.
 """

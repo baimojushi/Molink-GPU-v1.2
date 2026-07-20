@@ -18,7 +18,7 @@ from .metric3d_io import load_metric3d_zip
 from .masks import load_semantic_masks, masks_by_label, masks_by_role, semantic_label_matches, canonical_semantic_label
 from .geometry import (
     backproject, estimate_g_hat_from_floor_normals, estimate_g_hat_from_global_floor_like_normals,
-    estimate_g_hat_from_horizontal_reference_normals, fit_plane_ransac, make_wall_basis,
+    estimate_g_hat_from_horizontal_reference_normals, fit_plane_ransac, fit_vertical_plane_ransac, make_wall_basis,
     orient_vector_to_camera_up,
     points_from_mask, project_points, project_quad, polygon_mask, ray_plane_depth_for_mask, scale_points_to_original
 )
@@ -32,7 +32,7 @@ from .numeric_utils import _safe_percentile, _mask_bbox, _clamp01
 from .structural_clearance import _candidate_structural_clearance
 from .support_context import (
     _estimate_floor_wall_intersection, _object_points_near_axis,
-    _estimate_axis_support_context, _quad_metrics_original,
+    _estimate_axis_support_context, _estimate_same_wall_art_height_anchor, _quad_metrics_original,
 )
 from .response_assets import _png_bytes, _draw_overlay, _zip_response
 from .exit_review import review_hardpaste_exit
@@ -63,7 +63,7 @@ except Exception:  # pragma: no cover - causal layer is optional at runtime
 API_KEY = os.getenv("API_KEY", "")
 ALLOW_UNAUTH_LOCAL = os.getenv("ALLOW_UNAUTH_LOCAL", "").strip().lower() in {"1", "true", "yes", "on"}
 PORT = int(os.getenv("HANGING_MVP_PORT", "6010"))
-HANGING_PIPELINE_BUILD_ID = "2026-07-17-render-identity-review-state-v6"
+HANGING_PIPELINE_BUILD_ID = "2026-07-20-positive-wall-recovery-v7"
 
 
 def _truthy_env(name: str, default: str = "0") -> bool:
@@ -839,15 +839,18 @@ def _semantic_solid_max_empty_rect_axes(
     artwork_w_m: float,
     artwork_h_m: float,
     min_edge_margin_m: float,
-    metric_seed_tolerance_m: float = 0.02,
+    metric_seed_tolerance_m: float = 0.05,
+    max_obstruction_height_shift_m: float = 0.75,
     max_axes: int = 3,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Generate fallback candidates from semantic_clear_wall_mask ∩ solid_wall_mask.
 
     This path is only for low safe-coverage walls: a wall can have poor full-mask
     coverage while still containing a contiguous solid rectangle large enough for
-    the artwork.  The rectangle may propose a horizontal axis and a safe vertical
-    interval, but it must never replace a trusted metric installation height.
+    the artwork.  The rectangle proposes a horizontal axis and may raise a
+    trusted metric installation height within a configured bound to clear a
+    counter/shelf.  It cannot lower the work, and the exact projected footprint
+    remains authoritative.
     """
     safe_clear = ((semantic_clear_wall_mask > 0) & (solid_wall_mask > 0)).astype(np.uint8)
     safe_clear = cv2.morphologyEx(safe_clear, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
@@ -855,7 +858,12 @@ def _semantic_solid_max_empty_rect_axes(
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(safe_clear, connectivity=8)
     min_component_area_px = max(900, int(np.count_nonzero(semantic_clear_wall_mask > 0) * 0.005))
     required_w_m = float(artwork_w_m + 2.0 * min_edge_margin_m)
-    required_h_m = float(artwork_h_m + 2.0 * min_edge_margin_m)
+    # The rectangle is a proposal generator, not the final safety gate.  Requiring
+    # top/bottom edge margin here previously suppressed the only clear region in
+    # counter/shelf scenes before the exact projected footprint could be tested.
+    # Horizontal margin is retained for axis stability; vertical eligibility is
+    # artwork height plus a small Metric3D tolerance only.
+    required_h_m = float(artwork_h_m)
     debug: dict[str, Any] = {
         "enabled": True,
         "source": "semantic_clear_wall_mask_intersect_solid_wall_mask_max_empty_rect",
@@ -865,7 +873,8 @@ def _semantic_solid_max_empty_rect_axes(
         "required_width_m": float(required_w_m),
         "required_height_m": float(required_h_m),
         "metric_seed_tolerance_m": float(metric_seed_tolerance_m),
-        "tolerance_policy": "candidate_seed_only_exact_projected_footprint_remains_authoritative",
+        "tolerance_policy": "candidate_seed_only_vertical_margin_not_pre_rejected_exact_projected_footprint_remains_authoritative",
+        "max_obstruction_height_shift_m": float(max_obstruction_height_shift_m),
         "added_count": 0,
         "components": [],
     }
@@ -932,22 +941,22 @@ def _semantic_solid_max_empty_rect_axes(
             "width_m": float(width_m),
             "height_m": float(height_m),
         })
-        # Metric3D percentile projection is noisy by a few millimetres.  This
-        # rectangle only proposes a horizontal seed; the exact projected quad
-        # is still checked later against wall support, edges, structures and
-        # blocking fixtures.  A small tolerance here prevents a 0.957 m clear
-        # region from being discarded against a 0.960 m seed requirement.
+        # Metric3D percentile projection is noisy by several centimetres in
+        # distant/oblique regions.  This is only a seed; the exact projected
+        # quad is still checked against wall support, edges, structures and
+        # blocking fixtures.
         if width_m + float(metric_seed_tolerance_m) < required_w_m:
             comp_debug["skip_reason"] = "largest_rect_too_narrow_for_artwork_with_edge_margin"
             continue
         if height_m + float(metric_seed_tolerance_m) < required_h_m:
-            comp_debug["skip_reason"] = "largest_rect_too_short_for_artwork_with_edge_margin"
+            comp_debug["skip_reason"] = "largest_rect_too_short_for_artwork_seed"
             continue
         comp_debug["accepted_with_metric_seed_tolerance"] = bool(
             width_m < required_w_m or height_m < required_h_m
         )
 
         axis_s = float(0.5 * (s_min + s_max))
+        center_t_seed = float(0.5 * (t_min + t_max))
         axes.append({
             "axis_s_m": axis_s,
             "component_id": int(comp_id),
@@ -957,8 +966,11 @@ def _semantic_solid_max_empty_rect_axes(
             "component_width_m": float(width_m),
             "component_height_m": float(height_m),
             "source": "semantic_clear_subregion_max_empty_rect_horizontal_axis",
-            "candidate_generation_policy": "horizontal_axis_only_metric_height_remains_authoritative",
-            "vertical_policy": "diagnostic_only_exact_projected_footprint_is_authoritative",
+            "center_t_m_override": center_t_seed,
+            "metric_obstruction_aware_height": True,
+            "max_metric_height_shift_m": float(max_obstruction_height_shift_m),
+            "candidate_generation_policy": "empty_rect_axis_and_limited_raise_seed_exact_footprint_authoritative",
+            "vertical_policy": "limited_raise_only_then_exact_projected_footprint_authoritative",
             "max_empty_rect_bbox_processed": [int(gx1), int(gy1), int(gx2), int(gy2)],
         })
         debug["added_count"] += 1
@@ -1923,19 +1935,87 @@ async def analyze_hanging_mvp(
             # For a true vertical wall, wall normal should be roughly perpendicular to gravity.
             plane_n = np.array(plane.n, np.float32)
             fitted_plane_abs_dot_g = float(abs(np.dot(plane_n, g_hat)))
+            wall_filter_debug["unconstrained_plane_inlier_ratio"] = float(inlier_ratio)
+            wall_filter_debug["unconstrained_fitted_plane_abs_dot_g"] = fitted_plane_abs_dot_g
             wall_filter_debug["fitted_plane_abs_dot_g"] = fitted_plane_abs_dot_g
             wall_filter_debug["wall_plane_verticality_pass_threshold"] = 0.55
 
             if fitted_plane_abs_dot_g > 0.55:
-                rejected.append({
-                    "wall_id": wall_id,
-                    "reason": "fitted_plane_is_not_vertical_wall",
-                    "fitted_plane_abs_dot_g": fitted_plane_abs_dot_g,
-                    "wall_filter_debug": wall_filter_debug
-                })
-                continue
+                min_vertical_ratio = float(rule_value(
+                    rules,
+                    ["wall_plane_fit", "min_constrained_vertical_inlier_ratio"],
+                    0.12,
+                ))
+                min_vertical_points = int(rule_value(
+                    rules,
+                    ["wall_plane_fit", "min_constrained_vertical_inlier_points"],
+                    500,
+                ))
+                wall_filter_debug["vertical_constrained_fallback"] = {
+                    "attempted": True,
+                    "reason": "unconstrained_ransac_selected_non_vertical_dominant_plane",
+                    "min_inlier_ratio": min_vertical_ratio,
+                    "min_inlier_points": min_vertical_points,
+                }
+                try:
+                    vertical_plane, vertical_ratio = fit_vertical_plane_ransac(
+                        pts,
+                        g_hat,
+                        iterations=int(rule_value(rules, ["wall_plane_fit", "vertical_ransac_iterations"], 700)),
+                        threshold=float(rule_value(rules, ["wall_plane_fit", "vertical_ransac_threshold_m"], 0.08)),
+                    )
+                    vertical_n = np.asarray(vertical_plane.n, dtype=np.float32)
+                    vertical_abs_dot_g = float(abs(np.dot(vertical_n, g_hat)))
+                    vertical_inliers = int(round(vertical_ratio * len(pts)))
+                    accepted = bool(
+                        vertical_abs_dot_g <= 0.08
+                        and vertical_ratio >= min_vertical_ratio
+                        and vertical_inliers >= min_vertical_points
+                    )
+                    wall_filter_debug["vertical_constrained_fallback"].update({
+                        "inlier_ratio": float(vertical_ratio),
+                        "inlier_points": vertical_inliers,
+                        "fitted_plane_abs_dot_g": vertical_abs_dot_g,
+                        "accepted": accepted,
+                    })
+                    if accepted:
+                        plane = vertical_plane
+                        inlier_ratio = vertical_ratio
+                        fitted_plane_abs_dot_g = vertical_abs_dot_g
+                        wall_filter_debug["fitted_plane_abs_dot_g"] = vertical_abs_dot_g
+                        wall_filter_debug["plane_fit_mode"] = "gravity_constrained_vertical_ransac"
+                    else:
+                        rejected.append({
+                            "wall_id": wall_id,
+                            "reason": "fitted_plane_is_not_vertical_wall",
+                            "fitted_plane_abs_dot_g": fitted_plane_abs_dot_g,
+                            "wall_filter_debug": wall_filter_debug,
+                        })
+                        continue
+                except Exception as vertical_exc:
+                    wall_filter_debug["vertical_constrained_fallback"].update({
+                        "accepted": False,
+                        "error": str(vertical_exc),
+                    })
+                    rejected.append({
+                        "wall_id": wall_id,
+                        "reason": "fitted_plane_is_not_vertical_wall",
+                        "fitted_plane_abs_dot_g": fitted_plane_abs_dot_g,
+                        "wall_filter_debug": wall_filter_debug,
+                    })
+                    continue
+            else:
+                wall_filter_debug["plane_fit_mode"] = "unconstrained_ransac_vertical_pass"
 
-            basis = make_wall_basis(plane, pts, g_hat)
+            plane_dist = np.abs(pts @ np.asarray(plane.n, np.float32).reshape(3) + float(plane.d))
+            plane_inlier_pts = pts[plane_dist < 0.08]
+            basis_points = plane_inlier_pts if len(plane_inlier_pts) >= 300 else pts
+            wall_filter_debug["basis_point_source"] = "plane_inliers" if basis_points is plane_inlier_pts else "all_filtered_wall_points"
+            wall_filter_debug["basis_point_count"] = int(len(basis_points))
+            basis = make_wall_basis(plane, basis_points, g_hat)
+            # All wall-local ranges must come from the selected plane, not from
+            # ceiling/cove points that happened to remain in the coarse box.
+            pts = basis_points
         except Exception as e:
             rejected.append({"wall_id": wall_id, "reason": f"wall_plane_fit_failed: {e}", "wall_filter_debug": wall_filter_debug})
             continue
@@ -2173,7 +2253,12 @@ async def analyze_hanging_mvp(
                 metric_seed_tolerance_m=float(rule_value(
                     rules,
                     ["candidate_generation", "max_empty_rect_metric_seed_tolerance_m"],
-                    0.02,
+                    0.05,
+                )),
+                max_obstruction_height_shift_m=float(rule_value(
+                    rules,
+                    ["candidate_generation", "max_obstruction_aware_height_shift_m"],
+                    0.75,
                 )),
                 max_axes=max(1, min(3, max_axis)),
             )
@@ -2183,7 +2268,17 @@ async def analyze_hanging_mvp(
                 min_axis_separation_m = max(0.04, artwork_w_m * 0.10)
                 for max_rect_axis in max_rect_axes:
                     axis_s_rect = float(max_rect_axis.get("axis_s_m", 0.0))
-                    if any(abs(axis_s_rect - ex) < min_axis_separation_m for ex in existing_axis_s):
+                    # A rectangle seed at the same horizontal position as a
+                    # component-centre candidate is still distinct: it carries
+                    # the limited raise-only obstruction height.  Suppressing it
+                    # by x alone recreated the shelf-overlap failure.
+                    duplicate_rect_seed = any(
+                        abs(axis_s_rect - float(existing.get("axis_s_m", 0.0))) < min_axis_separation_m
+                        and str(existing.get("source", "")) == str(max_rect_axis.get("source", ""))
+                        and abs(float(existing.get("center_t_m_override", 0.0)) - float(max_rect_axis.get("center_t_m_override", 0.0))) < 0.05
+                        for existing in axes
+                    )
+                    if duplicate_rect_seed:
                         continue
                     axes.append(max_rect_axis)
                     existing_axis_s.append(axis_s_rect)
@@ -2368,9 +2463,21 @@ async def analyze_hanging_mvp(
 
         floor_height_abs_m = float(floor_wall_estimation["floor_height_abs_m"])
         floor_source_trusted = floor_source_is_metric_trusted(floor_wall_estimation.get("source"))
+        same_wall_art_height_anchor = _estimate_same_wall_art_height_anchor(
+            objects=objects,
+            xyz=xyz,
+            plane=plane,
+            basis=basis,
+            s_range_m=visible_wall_s_range_m,
+            rules=rules,
+        )
         if wall_id in wall_debug_registry:
             wall_debug_registry[wall_id]["floor_wall_estimation"] = floor_wall_estimation
+            wall_debug_registry[wall_id]["same_wall_art_height_anchor"] = same_wall_art_height_anchor
             wall_debug_registry[wall_id]["summary"]["floor_wall_estimation_source"] = floor_wall_estimation.get("source")
+            wall_debug_registry[wall_id]["summary"]["height_anchor_source"] = (
+                same_wall_art_height_anchor.get("source") if same_wall_art_height_anchor else None
+            )
         if floor_source_trusted and not bool(floor_wall_estimation.get("floor_below_camera", floor_height_abs_m < 0.0)):
             rejected.append({
                 "wall_id": wall_id,
@@ -2380,8 +2487,18 @@ async def analyze_hanging_mvp(
                 "g_hat_debug": g_debug,
             })
             continue
-        if bool((rules.get("room_corner_floor_fit", {}) or {}).get("require_trusted_floor_for_auto_candidate", True)) and not floor_source_trusted:
-            rejected.append({"wall_id": wall_id, "reason": "trusted_wall_floor_intersection_required", "wall_has_no_safe_candidate": True, "floor_wall_estimation": floor_wall_estimation})
+        if (
+            bool((rules.get("room_corner_floor_fit", {}) or {}).get("require_trusted_floor_for_auto_candidate", True))
+            and not floor_source_trusted
+            and same_wall_art_height_anchor is None
+        ):
+            rejected.append({
+                "wall_id": wall_id,
+                "reason": "trusted_wall_floor_intersection_or_same_wall_art_anchor_required",
+                "wall_has_no_safe_candidate": True,
+                "floor_wall_estimation": floor_wall_estimation,
+                "same_wall_art_height_anchor": None,
+            })
             continue
         for axis_item in axes:
             axis_s = float(axis_item["axis_s_m"])
@@ -2397,7 +2514,24 @@ async def analyze_hanging_mvp(
                 plane=plane,
                 floor_source_trusted=floor_source_trusted,
             )
-            if not floor_source_trusted:
+            if not floor_source_trusted and same_wall_art_height_anchor is not None:
+                support_context.update({
+                    "source": "same_wall_existing_art_height_anchor",
+                    "height_mode": "same_wall_existing_art_anchor",
+                    "rule_id": "same_wall_existing_art_center",
+                    "center_height_abs_m": float(same_wall_art_height_anchor["center_height_abs_m"]),
+                    "metric_height_finalized": True,
+                    "height_is_provisional": False,
+                    "requires_frontend_visual_height_selection": False,
+                    "requires_visual_height_selection": False,
+                    "requires_flux_visual_height_refinement": False,
+                    "height_band_base": "same_wall_existing_art_center",
+                    "height_warning": None,
+                    "floor_height_is_trusted": False,
+                    "center_height_above_floor_is_trusted": False,
+                    "same_wall_art_height_anchor": same_wall_art_height_anchor,
+                })
+            elif not floor_source_trusted:
                 support_context.update({
                     "height_mode": "provisional_visual_review_required",
                     "metric_height_finalized": False,
@@ -2796,7 +2930,7 @@ async def analyze_hanging_mvp(
             if quad_metrics["quad_aspect_ratio_long_over_short"] > max_quad_aspect_ratio_long_over_short:
                 reasons.append("projected_quad_aspect_ratio_too_extreme")
 
-            height_penalty = 0.08 if support_context.get("height_mode") != "metric_rule" else 0.0
+            height_penalty = 0.08 if not bool(support_context.get("metric_height_finalized", support_context.get("height_mode") == "metric_rule")) else 0.0
             quality_score = _clamp01(
                 0.25 * effective_wall_inside
                 + 0.20 * effective_wall_support_ratio

@@ -334,6 +334,115 @@ def _object_points_near_axis(
     return pts[np.abs(s_vals - float(axis_s_m)) <= float(margin_m)], point_source
 
 
+def _estimate_same_wall_art_height_anchor(
+    *,
+    objects: Dict[str, Dict[str, Any]],
+    xyz: np.ndarray,
+    plane,
+    basis,
+    s_range_m,
+    rules: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Use existing artwork on the same fitted wall as a direct height anchor.
+
+    This is deliberately not a synthetic floor estimate.  In a crowded room
+    the floor can be entirely occluded while one or more already-hung works are
+    visible.  Their wall-local centres are valid metric positions for proposing
+    another work on that same plane.  Plane distance, horizontal wall range and
+    minimum point support all have to pass; labels such as signs, hooks and
+    shelves are never accepted as anchors.
+    """
+    rules = rules or {}
+    cfg = dict(rules.get("existing_art_height_anchor", {}) or {})
+    if not bool(cfg.get("enabled", True)) or plane is None:
+        return None
+    labels = {
+        str(v).strip().lower()
+        for v in cfg.get(
+            "labels",
+            ["existing_art", "framed_art", "painting", "artwork", "poster"],
+        )
+        if str(v).strip()
+    }
+    min_points = int(cfg.get("min_points", 30))
+    max_plane_distance_m = float(cfg.get("max_plane_distance_m", 0.22))
+    min_near_plane_ratio = float(cfg.get("min_near_plane_ratio", 0.30))
+    s_margin_m = float(cfg.get("s_margin_m", 0.20))
+    max_anchor_spread_m = float(cfg.get("max_anchor_spread_m", 0.45))
+
+    origin = np.asarray(basis.origin, dtype=np.float32).reshape(3)
+    u = np.asarray(basis.u, dtype=np.float32).reshape(3)
+    v = np.asarray(basis.v, dtype=np.float32).reshape(3)
+    g_hat = np.asarray(basis.g_hat_cam, dtype=np.float32).reshape(3)
+    n = np.asarray(plane.n, dtype=np.float32).reshape(3)
+    s_min, s_max = sorted((float(s_range_m[0]), float(s_range_m[1])))
+    anchors: List[Dict[str, Any]] = []
+
+    for obj in objects.values():
+        label = str(obj.get("label") or "").strip().lower()
+        if label not in labels:
+            continue
+        mask, point_source = _object_sampling_mask(obj, xyz.shape[:2])
+        if mask is None:
+            continue
+        pts = points_from_mask(xyz, mask, max_points=15000)
+        pts = pts[np.isfinite(pts).all(axis=1)] if pts.size else pts
+        if len(pts) < min_points:
+            continue
+        dist = np.abs(pts @ n + float(plane.d))
+        near = dist <= max_plane_distance_m
+        near_count = int(np.count_nonzero(near))
+        near_ratio = float(near_count / max(1, len(pts)))
+        if near_count < min_points or near_ratio < min_near_plane_ratio:
+            continue
+        wall_pts = pts[near]
+        rel = wall_pts - origin.reshape(1, 3)
+        s_vals = rel @ u
+        t_vals = rel @ v
+        s_center = float(np.median(s_vals))
+        if s_center < s_min - s_margin_m or s_center > s_max + s_margin_m:
+            continue
+        anchors.append({
+            "object_id": obj.get("object_id"),
+            "label": label,
+            "point_source": point_source,
+            "point_count": int(len(pts)),
+            "near_plane_point_count": near_count,
+            "near_plane_ratio": near_ratio,
+            "plane_distance_p50_m": float(np.percentile(dist[near], 50)),
+            "center_s_m": s_center,
+            "center_t_m": float(np.median(t_vals)),
+            "center_height_abs_m": float(np.median(wall_pts @ g_hat)),
+        })
+
+    if not anchors:
+        return None
+    center_heights = np.asarray([a["center_height_abs_m"] for a in anchors], dtype=np.float32)
+    center_ts = np.asarray([a["center_t_m"] for a in anchors], dtype=np.float32)
+    spread = float(np.max(center_heights) - np.min(center_heights)) if len(center_heights) > 1 else 0.0
+    if spread > max_anchor_spread_m:
+        # Keep the densest height cluster instead of averaging works hung on
+        # intentionally different rows.  A single isolated row is still valid.
+        best_cluster: List[int] = []
+        for idx, value in enumerate(center_heights):
+            members = [j for j, other in enumerate(center_heights) if abs(float(other - value)) <= max_anchor_spread_m / 2.0]
+            if len(members) > len(best_cluster):
+                best_cluster = members
+        anchors = [anchors[i] for i in best_cluster]
+        center_heights = np.asarray([a["center_height_abs_m"] for a in anchors], dtype=np.float32)
+        center_ts = np.asarray([a["center_t_m"] for a in anchors], dtype=np.float32)
+
+    return {
+        "source": "same_wall_existing_art_center",
+        "metric_trusted": True,
+        "center_height_abs_m": float(np.median(center_heights)),
+        "center_t_m": float(np.median(center_ts)),
+        "anchor_count": len(anchors),
+        "anchors": anchors,
+        "policy": "direct_same_wall_height_anchor_never_relabel_as_floor",
+    }
+
+
 def _infer_wall_adjacent_geometry_support(
     *,
     xyz: np.ndarray,

@@ -175,6 +175,22 @@ def default_refine_label_set() -> set[str]:
         out.add("wall")
     return out
 
+
+def canonical_refine_label(label: str, role: str = "") -> str:
+    """Map instance-style VLM labels to the semantic class used by SAM policy.
+
+    The VLM intentionally emits IDs such as ``wall_front_01`` and
+    ``wall_right_02`` so multiple planes remain distinguishable.  SAM policy,
+    however, is configured with the class name ``wall``.  Exact string
+    matching silently skipped every such wall even when ``wall`` was present in
+    ``SAM_REFINE_LABELS``.
+    """
+    value = str(label or "").strip().lower()
+    role_value = str(role or "").strip().lower()
+    if role_value == "wall" or value == "wall" or value.startswith("wall_"):
+        return "wall"
+    return value
+
 def refine_objects_with_sam(
     image_rgb: np.ndarray,
     objects: List[Dict[str, Any]],
@@ -221,7 +237,8 @@ def refine_objects_with_sam(
     refined: List[Dict[str, Any]] = []
     for obj in objects:
         label = str(obj.get("label", "")); oid = str(obj.get("object_id", label))
-        if label not in refine_labels:
+        policy_label = canonical_refine_label(label, str(obj.get("role", "")))
+        if policy_label not in refine_labels:
             debug["skipped_count"] += 1; refined.append(obj); continue
         bbox_orig = obj.get("bbox_xyxy_original") or obj.get("bbox_xyxy") or []
         if len(bbox_orig) != 4:
@@ -243,7 +260,7 @@ def refine_objects_with_sam(
             bbox_proc = _clip_box(bbox_proc, processed_w, processed_h)
             bbox_area = max(1.0, _bbox_area(bbox_proc))
             mask_area = float(np.count_nonzero(mask_proc)); area_ratio = mask_area / bbox_area
-            min_ratio = float(os.getenv("SAM_MIN_MASK_TO_BOX_RATIO_WALL" if label == "wall" else "SAM_MIN_MASK_TO_BOX_RATIO", "0.20" if label == "wall" else "0.015"))
+            min_ratio = float(os.getenv("SAM_MIN_MASK_TO_BOX_RATIO_WALL" if policy_label == "wall" else "SAM_MIN_MASK_TO_BOX_RATIO", "0.20" if policy_label == "wall" else "0.015"))
             poly_proc = mask_to_polygon(mask_proc, max_points=int(os.getenv("SAM_MAX_POLYGON_POINTS", "96")))
             poly_orig = mask_to_polygon(mask_orig, max_points=int(os.getenv("SAM_MAX_POLYGON_POINTS", "96")))
             if len(poly_proc) < 3 or area_ratio < min_ratio:
@@ -262,10 +279,10 @@ def refine_objects_with_sam(
                 "model_type": os.getenv("SAM_MODEL_TYPE", "vit_b"),
             }
             refined.append(obj2); debug["refined_count"] += 1
-            debug["items"].append({"object_id": oid, "label": label, "status": "refined", "score": score, "area_ratio": float(area_ratio)})
+            debug["items"].append({"object_id": oid, "label": label, "policy_label": policy_label, "status": "refined", "score": score, "area_ratio": float(area_ratio)})
         except Exception as e:
             obj2 = dict(obj); obj2["sam"] = {"enabled": True, "fallback_to_bbox": True, "error": str(e)}
             refined.append(obj2); debug["fallback_count"] += 1
-            debug["items"].append({"object_id": oid, "label": label, "status": "fallback", "reason": str(e)})
+            debug["items"].append({"object_id": oid, "label": label, "policy_label": policy_label, "status": "fallback", "reason": str(e)})
     debug["runtime"] = get_sam_runtime_status()
     return refined, debug

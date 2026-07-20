@@ -80,6 +80,67 @@ def fit_plane_ransac(points: np.ndarray, iterations: int = 500, threshold: float
     d = -float(np.dot(n, c))
     return WallPlane(tuple(map(float, n)), float(d)), inlier_ratio
 
+
+def fit_vertical_plane_ransac(
+    points: np.ndarray,
+    g_hat_cam: np.ndarray,
+    iterations: int = 700,
+    threshold: float = 0.08,
+) -> Tuple[WallPlane, float]:
+    """Fit a plane whose normal is constrained perpendicular to gravity.
+
+    Coarse semantic wall regions can contain a larger ceiling, floor or cove
+    plane.  Unconstrained RANSAC then correctly finds the largest plane but it
+    is the wrong *kind* of plane.  This fallback samples a horizontal wall
+    tangent and constructs only vertical-plane hypotheses.  The final PCA
+    normal is projected back onto the gravity-orthogonal subspace so refinement
+    cannot drift to a horizontal surface again.
+    """
+    pts = np.asarray(points, dtype=np.float32)
+    pts = pts[np.isfinite(pts).all(axis=1)] if pts.ndim == 2 else pts
+    if pts.ndim != 2 or pts.shape[1] != 3 or len(pts) < 50:
+        raise ValueError("not enough points for vertical plane fitting")
+    g = normalize(np.asarray(g_hat_cam, dtype=np.float32).reshape(3))
+    if float(np.linalg.norm(g)) < EPS:
+        raise ValueError("invalid gravity reference")
+
+    best_n = None
+    best_d = 0.0
+    best_inliers = 0
+    npts = len(pts)
+    for _ in range(int(iterations)):
+        i0, i1 = np.random.choice(npts, 2, replace=False)
+        p0, p1 = pts[i0], pts[i1]
+        tangent = p1 - p0
+        tangent = tangent - float(np.dot(tangent, g)) * g
+        if float(np.linalg.norm(tangent)) < EPS:
+            continue
+        n = normalize(np.cross(g, tangent))
+        if float(np.linalg.norm(n)) < EPS:
+            continue
+        d = -float(np.dot(n, p0))
+        inliers = int(np.count_nonzero(np.abs(pts @ n + d) < float(threshold)))
+        if inliers > best_inliers:
+            best_inliers = inliers
+            best_n = n
+            best_d = d
+    if best_n is None or best_inliers < 3:
+        raise ValueError("vertical RANSAC failed")
+
+    first_inliers = np.abs(pts @ best_n + best_d) < float(threshold)
+    P = pts[first_inliers]
+    center = P.mean(axis=0)
+    _, _, vh = np.linalg.svd(P - center, full_matrices=False)
+    pca_n = np.asarray(vh[-1], dtype=np.float32)
+    n = pca_n - float(np.dot(pca_n, g)) * g
+    if float(np.linalg.norm(n)) < EPS:
+        n = best_n
+    n = normalize(n)
+    d = -float(np.median(P @ n))
+    final_inliers = np.abs(pts @ n + d) < float(threshold)
+    inlier_ratio = float(np.mean(final_inliers))
+    return WallPlane(tuple(map(float, n)), float(d)), inlier_ratio
+
 def estimate_g_hat_from_floor_normals(
     normal_xyz: np.ndarray,
     floor_mask: Optional[np.ndarray],

@@ -17,8 +17,6 @@ from pathlib import Path
 import websockets
 
 from worker import pipeline, render_api, r2_upload, result_builder, autodl_api, diagnostics
-from worker.progress_protocol import ProgressEmitter
-from worker.runtime_probe import collect_runtime_resource
 
 try:
     from molink_causal import CausalEngine, Event
@@ -53,8 +51,7 @@ if not WORKER_SECRET:
 GPU_MODEL = os.getenv("GPU_MODEL", "TITAN Xp")
 GPU_COUNT = int(os.getenv("GPU_COUNT", "1"))
 IDLE_TIMEOUT_S = int(os.getenv("IDLE_TIMEOUT_S", "300"))
-WORKER_VERSION = os.getenv("WORKER_VERSION", "1.1.0")
-ETA_PROTOCOL_V2_ENABLED = os.getenv("ETA_PROTOCOL_V2_ENABLED", "1").strip().lower() not in {"", "0", "false", "no", "off"}
+WORKER_VERSION = "1.0.1"
 
 
 def _truthy_env(name: str, default: str = "0") -> bool:
@@ -255,13 +252,6 @@ class Worker:
         self._executed_jobs: set[str] = set()
         self._causal_engine = None
         self._causal_base_delta: dict = {}
-        self._resource = collect_runtime_resource(
-            instance_id=INSTANCE_ID,
-            gpu_model=GPU_MODEL,
-            gpu_count=GPU_COUNT,
-            worker_version=WORKER_VERSION,
-        )
-        self._eta_emitter: ProgressEmitter | None = None
 
     async def _create_ws(self):
         """Create a fresh WebSocket connection to the business server."""
@@ -275,8 +265,6 @@ class Worker:
             "gpu_model": GPU_MODEL,
             "gpu_count": GPU_COUNT,
             "worker_version": WORKER_VERSION,
-            "precision": self._resource.get("precision"),
-            "benchmark_score": self._resource.get("benchmark_score"),
             "services": ["metric3d", "semantic", "hanging", "bfl"],
         }))
         print(f"[worker] 已注册 {INSTANCE_ID} ({GPU_MODEL})")
@@ -347,26 +335,9 @@ class Worker:
                     "status": "busy" if self._current_job_id else "idle",
                     "current_job_id": self._current_job_id,
                     "uptime_s": int(time.time() - START_TS),
-                    "resource": self._resource,
-                    "last_seq": self._eta_emitter.seq if self._eta_emitter else 0,
-                    "run_id": self._eta_emitter.run_id if self._eta_emitter else None,
-                    "current_stage_snapshot": self._eta_emitter.heartbeat_snapshot() if self._eta_emitter else None,
                 }))
             except Exception:
                 return
-
-    async def _send_progress_payload(self, ws, payload: dict, *, label: str, max_retries: int = 3) -> bool:
-        for attempt in range(max_retries):
-            try:
-                await ws.send(json.dumps(payload, ensure_ascii=False))
-                return True
-            except Exception as exc:
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(0.5 * (attempt + 1))
-                    continue
-                print(f"[{label}] failed to send after {max_retries} attempts: {exc}", flush=True)
-                return False
-        return False
 
     async def progress(self, ws, job, stage, state, pct, message, advisor_message=None, causal_delta=None) -> None:
         payload = {
@@ -395,22 +366,18 @@ class Worker:
             flush=True,
         )
 
-        legacy_sent = await self._send_progress_payload(ws, payload, label="progress", max_retries=3)
-        if not legacy_sent:
-            print("[progress] progress message dropped, pipeline continues", flush=True)
-
-        if ETA_PROTOCOL_V2_ENABLED and self._eta_emitter is not None:
+        max_retries = 3
+        for attempt in range(max_retries):
             try:
-                events = self._eta_emitter.transition(
-                    stage, state, message=message,
-                    metadata={"legacy_pct": pct, "advisor_message_present": bool(advisor_message)},
-                )
-                for event in events:
-                    sent = await self._send_progress_payload(ws, event, label="progress_v2", max_retries=2)
-                    if not sent:
-                        print("[progress_v2] event dropped, legacy pipeline continues", flush=True)
-            except Exception as exc:
-                print(f"[progress_v2] build/send skipped: {exc}", flush=True)
+                await ws.send(json.dumps(payload, ensure_ascii=False))
+                return
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(0.5 * (attempt + 1))
+                    continue
+                print(f"[progress] failed to send after {max_retries} attempts: {e}", flush=True)
+                print(f"[progress] progress message dropped, pipeline continues", flush=True)
+                return
 
     def _reset_causal_engine(self, job: dict | None = None) -> None:
         self._causal_engine = CausalEngine() if _causal_enabled() else None
@@ -440,17 +407,15 @@ class Worker:
             print(f"[causal] narration bundle skipped: {exc}", flush=True)
             return None
 
-    async def on_job_received(self, job: dict) -> None:
+    async def on_job_received(self, job_id) -> None:
         if self._shutdown_task:
             self._shutdown_task.cancel()
             self._shutdown_task = None
         self.idle_since = None
-        self._current_job_id = job["job_id"]
-        self._eta_emitter = ProgressEmitter(job, self._resource) if ETA_PROTOCOL_V2_ENABLED else None
+        self._current_job_id = job_id
 
     async def on_job_complete(self, ws) -> None:
         self._current_job_id = None
-        self._eta_emitter = None
         self._causal_engine = None
         self._causal_base_delta = {}
         try:
@@ -488,7 +453,7 @@ class Worker:
         """
         job_id = job.get("job_id")
         print(f"[worker-debug] supplement_job_received job_id={job_id} order_id={job.get('order_id')} targets={job.get('target_wall_ids')}", flush=True)
-        await self.on_job_received(job)
+        await self.on_job_received(job["job_id"])
         self._reset_causal_engine(job)
         await ws.send(json.dumps({"type": "job_accepted", "job_id": job["job_id"], "instance_id": INSTANCE_ID}))
         render_provider, render_provider_source = resolve_render_provider(job)
@@ -605,7 +570,7 @@ class Worker:
             await self.run_supplement_job(ws, job)
             return
         print(f"[worker-debug] job_received job_id={job.get('job_id')} order_id={job.get('order_id')} r2_prefix={job.get('r2_output_prefix')}", flush=True)
-        await self.on_job_received(job)
+        await self.on_job_received(job["job_id"])
         self._reset_causal_engine(job)
         await ws.send(json.dumps({"type": "job_accepted", "job_id": job["job_id"], "instance_id": INSTANCE_ID}))
         print(f"[worker-debug] job_accepted job_id={job.get('job_id')}", flush=True)

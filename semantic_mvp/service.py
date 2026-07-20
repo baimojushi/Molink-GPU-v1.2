@@ -208,6 +208,11 @@ def _canonical_label_and_role(label: str, role: str | None) -> tuple[str, str]:
             canonical = candidate_key
             break
     raw_role = str(role or "").strip().lower()
+    if raw_role == "wall" and (canonical == "wall" or canonical.startswith("wall_")):
+        # Positional identity belongs in object_id.  Keeping wall_front_01 as a
+        # class label bypasses class-based SAM refinement and downstream label
+        # policies even though the role is correct.
+        canonical = "wall"
     inferred = ROLE_BY_LABEL.get(canonical, "foreground")
     if canonical in EXISTING_CONTENT_LABELS:
         inferred = "existing_content"

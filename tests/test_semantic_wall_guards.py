@@ -115,6 +115,7 @@ from semantic_mvp.service import _canonical_label_and_role, _build_object_invent
 
 
 def test_semantic_label_aliases_promote_art_and_people_to_cleanup_inventory():
+    assert _canonical_label_and_role("wall_front_01", "wall") == ("wall", "wall")
     assert _canonical_label_and_role("painting", "wall") == ("painting", "existing_content")
     assert _canonical_label_and_role("painting_01", "existing_content") == ("painting", "existing_content")
     assert _canonical_label_and_role("framed_art_02", "existing_content") == ("framed_art", "existing_content")

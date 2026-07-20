@@ -65,6 +65,45 @@ def test_provisional_height_may_use_empty_rect_as_visual_seed():
     assert result["resolved_center_t_m"] == 0.5
 
 
+def test_obstruction_aware_metric_seed_may_raise_within_limit():
+    result = resolve_candidate_center_t(
+        rule_center_height_abs_m=1.5,
+        floor_height_abs_m=0.0,
+        wall_origin_dot_g=0.0,
+        dot_v_g=1.0,
+        height_mode="metric_rule",
+        axis_item={
+            "center_t_m_override": 2.05,
+            "source": "semantic_clear_subregion_max_empty_rect_horizontal_axis",
+            "metric_obstruction_aware_height": True,
+            "max_metric_height_shift_m": 0.75,
+        },
+    )
+
+    assert result["center_t_override_applied"] is True
+    assert result["obstruction_aware_height_override_allowed"] is True
+    assert result["resolved_center_t_m"] == 2.05
+    assert result["metric_height_rule_consistent"] is True
+
+
+def test_obstruction_aware_metric_seed_cannot_lower_or_exceed_limit():
+    for requested in (1.3, 2.4):
+        result = resolve_candidate_center_t(
+            rule_center_height_abs_m=1.5,
+            floor_height_abs_m=0.0,
+            wall_origin_dot_g=0.0,
+            dot_v_g=1.0,
+            height_mode="metric_rule",
+            axis_item={
+                "center_t_m_override": requested,
+                "metric_obstruction_aware_height": True,
+                "max_metric_height_shift_m": 0.75,
+            },
+        )
+        assert result["center_t_override_applied"] is False
+        assert result["resolved_center_t_m"] == 1.5
+
+
 def test_regression_job_461299b7_metric_target_outside_high_empty_rect_is_diagnostic_only():
     result = evaluate_semantic_clear_rect_vertical_fit(
         center_t_m=0.129624654020198,

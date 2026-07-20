@@ -40,6 +40,14 @@ Candidates now expose lightweight required fields for production decisions and t
 
 Semantic axes are dropped as a set when `semantic_axis_safe_mask_coverage` is below threshold. The service does not clip the semantic `s_range`; safe connected-component geometry axes remain eligible as a fallback. A wall may exit with `wall_has_no_safe_candidate=true` instead of being forced into the Flux manifest.
 
+Positive-wall recovery v7 adds three fail-closed recovery paths without weakening the final projected-footprint gates:
+
+- instance-style VLM wall labels are canonicalized to class `wall` for SAM refinement, while position stays in `object_id`;
+- when an unconstrained fit selects a horizontal surface inside a coarse wall proposal, a gravity-constrained vertical RANSAC fallback must meet explicit inlier ratio/count thresholds;
+- if the floor is fully occluded, a plane-associated existing artwork on the same wall may supply a direct center-height anchor. It is never reported as a floor estimate.
+
+The max-empty-rectangle path may also emit a limited raise-only obstruction-aware height seed. It cannot lower a metric placement, is capped by `candidate_generation.max_obstruction_aware_height_shift_m`, and remains subject to unchanged exact wall-support, edge/corner, structural-fixture, blocking-content and image-border gates.
+
 ## P3 Flux additions
 
 The safe render handoff adds:

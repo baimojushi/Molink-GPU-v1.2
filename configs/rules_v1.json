@@ -315,9 +315,44 @@
   },
   "candidate_generation": {
     "max_empty_rect_metric_seed_tolerance_m": {
-      "value": 0.02,
-      "notes": "Seed-only tolerance for percentile noise. Exact projected artwork footprint gates remain authoritative and unchanged."
+      "value": 0.05,
+      "notes": "Seed-only tolerance for Metric3D percentile noise. Exact projected artwork footprint, edge/corner, structure and blocking-fixture gates remain authoritative and unchanged."
+    },
+    "max_obstruction_aware_height_shift_m": {
+      "value": 0.75,
+      "notes": "A max-empty-rectangle candidate may only raise a trusted metric placement by this amount to clear a counter/shelf; lowering is forbidden and the exact final footprint is still hard-gated."
     }
+  },
+  "wall_plane_fit": {
+    "vertical_ransac_iterations": {
+      "value": 700
+    },
+    "vertical_ransac_threshold_m": {
+      "value": 0.08
+    },
+    "min_constrained_vertical_inlier_ratio": {
+      "value": 0.12
+    },
+    "min_constrained_vertical_inlier_points": {
+      "value": 500
+    },
+    "notes": "If unconstrained RANSAC selects a horizontal plane from a coarse wall box, retry with a gravity-constrained vertical plane and accept only quantified support."
+  },
+  "existing_art_height_anchor": {
+    "enabled": true,
+    "labels": [
+      "existing_art",
+      "framed_art",
+      "painting",
+      "artwork",
+      "poster"
+    ],
+    "min_points": 30,
+    "max_plane_distance_m": 0.22,
+    "min_near_plane_ratio": 0.3,
+    "s_margin_m": 0.2,
+    "max_anchor_spread_m": 0.45,
+    "notes": "When the floor is fully occluded, an existing work on the same fitted wall may provide a direct metric center-height anchor. This never creates or relabels a floor estimate."
   },
   "existing_content_overlap_policy": {
     "mode": "candidate_wall_cleanup_then_render",
