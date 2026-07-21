@@ -173,7 +173,7 @@ def test_v13_joint_hypothesis_accepts_grid_xy_when_axis_x_alone_is_weak():
     assert joint["accepted"] is True
     assert joint["selected"] == "grid_boundary_x__grid_boundary_y"
     assert joint["score_margin"] >= joint["minimum_score_margin"]
-    assert joint["policy"] == "joint_2d_pixel_grid_hypothesis_with_scene_evidence_v4"
+    assert joint["policy"] == "joint_2d_pixel_grid_hypothesis_with_semantic_layout_quorum_v5"
 
 
 def test_v13_ambiguous_joint_hypothesis_exposes_no_selected_coordinate_space():
@@ -196,6 +196,64 @@ def test_v13_ambiguous_joint_hypothesis_exposes_no_selected_coordinate_space():
         item = debug["dynamic_axis_coordinate_inference"].get(axis)
         if item is not None and not item["accepted"]:
             assert item["selected"] is None
+
+
+def test_v14_same_call_regression_resolves_complete_left_front_right_grid_layout():
+    # Exact 16-object family captured by semantic_422_response.json.  v13
+    # discarded object_id, so grid/grid beat pixel-x/grid-y by only 0.78 and
+    # returned 422.  The complete relational wall triplet resolves x without
+    # lowering the fail-closed margin: grid puts wall_front at x=0.47, while
+    # pixel interpretation drifts it to x=0.367.
+    objects = [
+        {"object_id": "wall_left_01", "label": "wall", "role": "wall", "bbox_xyxy": [0, 165, 340, 543]},
+        {"object_id": "wall_front_01", "label": "wall", "role": "wall", "bbox_xyxy": [340, 255, 600, 492]},
+        {"object_id": "wall_right_01", "label": "wall", "role": "wall", "bbox_xyxy": [600, 230, 1280, 515]},
+        {"object_id": "roof_01", "label": "roof", "role": "support", "bbox_xyxy": [0, 0, 1280, 308]},
+        {"object_id": "floor_01", "label": "floor", "role": "non_support", "bbox_xyxy": [0, 520, 1280, 1708]},
+        {"object_id": "sofa_01", "label": "sofa", "role": "support", "bbox_xyxy": [333, 455, 1280, 770]},
+        {"object_id": "table_01", "label": "table", "role": "support", "bbox_xyxy": [455, 500, 805, 620]},
+        {"object_id": "window_left_01", "label": "window", "role": "forbidden", "bbox_xyxy": [0, 165, 340, 543]},
+        {"object_id": "window_right_01", "label": "window", "role": "forbidden", "bbox_xyxy": [600, 230, 1280, 515]},
+        {"object_id": "person_01", "label": "person", "role": "foreground", "bbox_xyxy": [138, 433, 214, 565]},
+        {"object_id": "existing_art_01", "label": "painting", "role": "existing_content", "bbox_xyxy": [390, 460, 444, 500]},
+        {"object_id": "existing_art_02", "label": "poster", "role": "existing_content", "bbox_xyxy": [844, 492, 938, 550]},
+        {"object_id": "existing_art_03", "label": "framed_art", "role": "existing_content", "bbox_xyxy": [660, 472, 725, 510]},
+        {"object_id": "hook_01", "label": "hook", "role": "existing_content", "bbox_xyxy": [240, 482, 255, 495]},
+        {"object_id": "nail_01", "label": "nail", "role": "existing_content", "bbox_xyxy": [245, 495, 258, 508]},
+        {"object_id": "small_shelf_01", "label": "small_shelf", "role": "existing_content", "bbox_xyxy": [295, 425, 335, 500]},
+    ]
+
+    mode, debug = _infer_vlm_bbox_coordinate_space(objects, 1280, 1708)
+
+    assert mode == "normalized_0_1000_with_original_boundary_sentinels"
+    joint = debug["joint_coordinate_inference"]
+    assert joint["policy"] == "joint_2d_pixel_grid_hypothesis_with_semantic_layout_quorum_v5"
+    assert joint["accepted"] is True
+    assert joint["selected"] == "grid_boundary_x__grid_boundary_y"
+    assert joint["score_margin"] >= joint["minimum_score_margin"]
+    winner = joint["evidence"][joint["selected"]]
+    runner = joint["evidence"][joint["runner_up"]]
+    assert winner["semantic_layout_evidence"]["available"] is True
+    assert winner["semantic_layout_evidence"]["front_straddles_image_center"] is True
+    assert winner["semantic_layout_score"] > runner["semantic_layout_score"]
+
+
+def test_v14_single_or_incomplete_wall_name_cannot_break_coordinate_tie():
+    # One self-declared front wall is not an evidence quorum.  This protects
+    # against a hallucinated object_id silently overriding numeric ambiguity.
+    objects = [
+        {"object_id": "wall_front_01", "label": "wall", "role": "wall", "bbox_xyxy": [0, 200, 500, 600]},
+        {"object_id": "floor_01", "label": "floor", "role": "support", "bbox_xyxy": [0, 600, 1280, 1708]},
+    ]
+
+    mode, debug = _infer_vlm_bbox_coordinate_space(objects, 1280, 1708)
+
+    assert mode is None
+    joint = debug["joint_coordinate_inference"]
+    assert joint["accepted"] is False
+    for item in joint["evidence"].values():
+        assert item["semantic_layout_score"] == 0.0
+        assert item["semantic_layout_evidence"]["available"] is False
 
 
 def test_regression_mixed_original_x_and_low_extent_grid_y_with_bottom_sentinel():

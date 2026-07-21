@@ -24,7 +24,7 @@ API_KEY = os.getenv("API_KEY", "")
 ALLOW_UNAUTH_LOCAL = os.getenv("ALLOW_UNAUTH_LOCAL", "").strip().lower() in {"1", "true", "yes", "on"}
 
 app = FastAPI(title="semantic-mvp-bbox-api")
-SEMANTIC_PIPELINE_BUILD_ID = "2026-07-21-joint-bbox-coordinate-evidence-guard-v13"
+SEMANTIC_PIPELINE_BUILD_ID = "2026-07-21-semantic-layout-coordinate-quorum-v14"
 
 ROLE_BY_LABEL = {
     "wall": "wall",
@@ -544,6 +544,12 @@ def _joint_bbox_image_edge_score(objects, x_mode, y_mode, width, height, image_n
         return float(value)
 
     samples = []
+    # A wall and its window can legitimately share the same coarse bbox.  They
+    # are one geometric observation, not two independent votes.  v13 counted
+    # both records and also averaged vertical/horizontal borders together,
+    # which diluted the exact x evidence needed by an x-only tie.  Deduplicate
+    # identical rectangles and keep directional supports separate.
+    sampled_boxes = set()
     preferred = {"window", "door", "opening", "arch", "floor", "roof", "ceiling"}
     for obj in objects or []:
         vals = _valid_vlm_bbox_values(obj.get("bbox_xyxy") or obj.get("bbox") or [])
@@ -561,32 +567,49 @@ def _joint_bbox_image_edge_score(objects, x_mode, y_mode, width, height, image_n
         y1, y2 = sorted((max(0, min(height - 1, y1)), max(0, min(height - 1, y2))))
         if x2 - x1 < 4 or y2 - y1 < 4:
             continue
+        signature = (x1, y1, x2, y2)
+        if signature in sampled_boxes:
+            continue
+        sampled_boxes.add(signature)
         pad_x = max(1, min(4, int(round(width * 0.002))))
         pad_y = max(1, min(4, int(round(height * 0.002))))
         vertical = [gx[y1:y2 + 1, max(0, x - pad_x):min(width, x + pad_x + 1)] for x in (x1, x2)]
         horizontal = [gy[max(0, y - pad_y):min(height, y + pad_y + 1), x1:x2 + 1] for y in (y1, y2)]
-        edge_values = [float(np.mean(v)) for v in vertical + horizontal if v.size]
-        if not edge_values:
+        vertical_values = [float(np.mean(v)) for v in vertical if v.size]
+        horizontal_values = [float(np.mean(v)) for v in horizontal if v.size]
+        if not vertical_values and not horizontal_values:
             continue
         weight = 1.0 if label in preferred or role == "forbidden" else 0.35
+        vertical_support = min(2.0, float(np.mean(vertical_values)) / reference) if vertical_values else 0.0
+        horizontal_support = min(2.0, float(np.mean(horizontal_values)) / reference) if horizontal_values else 0.0
         samples.append({
             "label": label,
             "weight": weight,
-            "normalized_edge_support": min(2.0, float(np.mean(edge_values)) / reference),
+            "normalized_vertical_edge_support": vertical_support,
+            "normalized_horizontal_edge_support": horizontal_support,
+            "normalized_edge_support": 0.5 * (vertical_support + horizontal_support),
         })
     if not samples:
         return 0.0, {"available": False, "reason": "no_structural_bbox_edges"}
-    weighted = sum(item["weight"] * item["normalized_edge_support"] for item in samples)
+    weighted_x = sum(item["weight"] * item["normalized_vertical_edge_support"] for item in samples)
+    weighted_y = sum(item["weight"] * item["normalized_horizontal_edge_support"] for item in samples)
     total_weight = sum(item["weight"] for item in samples)
-    normalized = weighted / max(1e-6, total_weight)
+    normalized_x = weighted_x / max(1e-6, total_weight)
+    normalized_y = weighted_y / max(1e-6, total_weight)
+    normalized = 0.5 * (normalized_x + normalized_y)
     # Cap the contribution so texture-heavy images cannot overrule impossible
-    # semantic topology or a declared boundary-sentinel inconsistency.
-    score = min(2.20, 1.35 * normalized)
+    # semantic topology or a declared boundary-sentinel inconsistency.  Keeping
+    # the two directions explicit also allows diagnostics to prove whether an
+    # x-only winner came from vertical structure, rather than unrelated floor
+    # or ceiling texture.
+    score = min(2.20, 0.85 * normalized_x + 0.85 * normalized_y)
     return float(score), {
         "available": True,
         "reference_p90": reference,
         "sample_count": len(samples),
         "normalized_support": float(normalized),
+        "normalized_vertical_edge_support": float(normalized_x),
+        "normalized_horizontal_edge_support": float(normalized_y),
         "score": float(score),
         "samples": samples,
     }
@@ -608,6 +631,21 @@ def _score_joint_boundary_coordinate_hypotheses(objects, original_w, original_h,
     compare pixel/pixel, grid/grid and both mixed-axis hypotheses as complete
     2-D scenes.  If the joint winner lacks a safe margin, return selected=None
     and fail closed with the scores and repair hint.
+
+    ROOT CAUSE / DO-NOT-REGRESS (2026-07-21, v14): v13 still discarded the
+    provider's *relational* wall identities.  A production response contained
+    an auditable left/front/right triplet in ``object_id``.  Under grid-x the
+    front wall was centred at x=0.47; under pixel-x it drifted to x=0.367, but
+    both hypotheses had wall-union coverage 1.0 and therefore tied on the old
+    topology features.  The grid winner was rejected by a 0.78 margin even
+    though the scene itself resolved the ambiguity.
+
+    Never fix that incident by lowering ``minimum_score_margin`` or blindly
+    trusting an ``object_id``.  The semantic-layout contribution below is only
+    enabled when all three independent identities (left/front/right) exist,
+    their centres are strictly ordered, and their boxes form one contiguous
+    multi-wall layout.  A single label, free-form note, or provider's claimed
+    coordinate_space receives no tie-breaking authority.
     """
     if x_debug is None and y_debug is None:
         return None
@@ -651,6 +689,7 @@ def _score_joint_boundary_coordinate_hypotheses(objects, original_w, original_h,
                     invalid += 1
                 transformed.append({
                     "index": index,
+                    "object_id": str(obj.get("object_id") or "").lower(),
                     "label": str(obj.get("label") or "").lower(),
                     "role": str(obj.get("role") or "").lower(),
                     "box": box,
@@ -680,6 +719,69 @@ def _score_joint_boundary_coordinate_hypotheses(objects, original_w, original_h,
                         topology -= min(1.0, abs(gap) * 1.5)
                 if gaps:
                     reasons.append("multiwall_horizontal_continuity")
+
+            # Strong-but-guarded relational evidence.  VLM instances commonly
+            # preserve the requested wall_left/wall_front/wall_right identity
+            # even when their numeric coordinate convention is inconsistent.
+            # The identity is useful only as a *set*: requiring a complete,
+            # ordered, contiguous triplet prevents one hallucinated name from
+            # silently rescaling a whole response.
+            layout_score = 0.0
+            layout_debug = {
+                "available": False,
+                "reason": "complete_left_front_right_wall_triplet_not_found",
+            }
+            positioned = {}
+            duplicate_position = False
+            for wall in walls:
+                identity = f"{wall.get('object_id', '')} {wall.get('label', '')}"
+                matched = [name for name in ("left", "front", "right") if re.search(rf"(?:^|[_\-\s]){name}(?:$|[_\-\s0-9])", identity)]
+                if len(matched) != 1:
+                    continue
+                name = matched[0]
+                if name in positioned:
+                    duplicate_position = True
+                    continue
+                positioned[name] = wall
+            if not duplicate_position and all(name in positioned for name in ("left", "front", "right")):
+                left = positioned["left"]["box"]
+                front = positioned["front"]["box"]
+                right = positioned["right"]["box"]
+                centers = [0.5 * (box[0] + box[2]) for box in (left, front, right)]
+                gaps = [front[0] - left[2], right[0] - front[2]]
+                ordered_triplet = bool(centers[0] < centers[1] < centers[2])
+                contiguous_triplet = bool(all(abs(gap) <= 0.12 for gap in gaps))
+                nondegenerate_triplet = bool(all((box[2] - box[0]) >= 0.075 for box in (left, front, right)))
+                if ordered_triplet and contiguous_triplet and nondegenerate_triplet:
+                    front_center = centers[1]
+                    front_center_alignment = max(0.0, 1.0 - abs(front_center - 0.5) / 0.25)
+                    front_straddles_center = bool(front[0] <= 0.5 <= front[2])
+                    # Cap at 0.90: this evidence can resolve a close numerical
+                    # tie, but cannot overrule impossible boxes or a material
+                    # edge/topology conflict on its own.
+                    layout_score = min(0.90, 0.65 * front_center_alignment + (0.25 if front_straddles_center else 0.0))
+                    topology += layout_score
+                    reasons.append("complete_left_front_right_semantic_layout")
+                    layout_debug = {
+                        "available": True,
+                        "reason": "complete_ordered_contiguous_wall_triplet",
+                        "centers": [float(value) for value in centers],
+                        "gaps": [float(value) for value in gaps],
+                        "front_center": float(front_center),
+                        "front_center_alignment": float(front_center_alignment),
+                        "front_straddles_image_center": front_straddles_center,
+                        "score": float(layout_score),
+                    }
+                else:
+                    layout_debug = {
+                        "available": False,
+                        "reason": "wall_triplet_failed_order_continuity_or_size_gate",
+                        "centers": [float(value) for value in centers],
+                        "gaps": [float(value) for value in gaps],
+                        "ordered": ordered_triplet,
+                        "contiguous": contiguous_triplet,
+                        "nondegenerate": nondegenerate_triplet,
+                    }
 
             # Structural objects should be explained by a wall plane in 2-D.
             # This catches the production pixel-x interpretation where the
@@ -747,6 +849,8 @@ def _score_joint_boundary_coordinate_hypotheses(objects, original_w, original_h,
                 "structural_wall_coverages": structural_coverages,
                 "wall_floor_alignment": alignment,
                 "roof_wall_alignment": roof_alignment,
+                "semantic_layout_score": float(layout_score),
+                "semantic_layout_evidence": layout_debug,
                 "reasons": reasons,
                 "image_edge_evidence": edge_debug,
             }
@@ -760,7 +864,7 @@ def _score_joint_boundary_coordinate_hypotheses(objects, original_w, original_h,
     min_margin = 0.65 if is_native else 1.05
     accepted = bool(np.isfinite(winner_score) and margin >= min_margin)
     return {
-        "policy": "joint_2d_pixel_grid_hypothesis_with_scene_evidence_v4",
+        "policy": "joint_2d_pixel_grid_hypothesis_with_semantic_layout_quorum_v5",
         "selected": winner if accepted else None,
         "winner": winner,
         "runner_up": runner,
@@ -867,6 +971,21 @@ def _infer_vlm_bbox_coordinate_space(objects, original_w, original_h, vlm_image_
         winner = str(joint.get("selected"))
         x_axis = (joint.get("evidence", {}).get(winner) or {}).get("x_mode", "original")
         y_axis = (joint.get("evidence", {}).get(winner) or {}).get("y_mode", "original")
+        # Per-axis scores remain diagnostics and may correctly say "ambiguous".
+        # Record how the complete 2-D quorum resolved that axis instead of
+        # mutating the local accepted flag or leaving operators to infer it.
+        for axis_name, axis_debug, resolved_mode in (
+            ("x", x_dynamic, x_axis),
+            ("y", y_dynamic, y_axis),
+        ):
+            if isinstance(axis_debug, dict):
+                axis_debug["joint_resolution"] = {
+                    "resolved": True,
+                    "mode": resolved_mode,
+                    "joint_policy": joint.get("policy"),
+                    "joint_score_margin": joint.get("score_margin"),
+                    "local_axis_was_ambiguous": not bool(axis_debug.get("accepted")),
+                }
         if x_axis == "grid_boundary" and y_axis == "grid_boundary":
             debug.update({
                 "source_coordinate_space": "normalized_0_1000_with_original_boundary_sentinels",

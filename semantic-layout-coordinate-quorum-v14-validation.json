@@ -1,0 +1,28 @@
+{
+  "pipeline_build": "2026-07-21-semantic-layout-coordinate-quorum-v14",
+  "source_baseline": "2026-07-21-joint-bbox-coordinate-evidence-guard-v13",
+  "production_regression": {
+    "image_sha256": "fb4e36bacd2d37c013b745f5728d24f864c5a92c334b9d04d770d6f1907be389",
+    "vlm_response_sha256": "f6c0c6ec1fc938c789ae95d64079426776c65919833b3f2633efdcafec791501",
+    "object_count": 16,
+    "selected_coordinate_space": "normalized_0_1000_with_original_boundary_sentinels",
+    "joint_winner": "grid_boundary_x__grid_boundary_y",
+    "runner_up": "original_x__grid_boundary_y",
+    "score_margin_without_image_evidence": 1.217312500000002,
+    "minimum_score_margin": 1.05,
+    "accepted": true
+  },
+  "checks": {
+    "python_ast_files": 83,
+    "python_compileall": "passed",
+    "json_files": 3,
+    "shell_syntax": "passed",
+    "coordinate_contract_function_tests": 9,
+    "coordinate_contract_function_tests_status": "passed"
+  },
+  "environment_limitations": [
+    "pytest is not installed in this workspace",
+    "opencv-python is not installed, so the uploaded room image edge path was not replayed",
+    "fastapi is not installed, so the complete HTTP endpoint was not started"
+  ]
+}
