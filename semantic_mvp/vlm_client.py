@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import colorsys
+import hashlib
 import io
 import json
 import os
@@ -135,6 +136,18 @@ def call_openai_compatible_with_prompts(
     result = extract_json(text)
     if isinstance(result, dict):
         result["_vlm_image_meta"] = vlm_image_meta
+        # Bind diagnostics to the exact provider call.  Do not regenerate a
+        # "raw VLM response" later: the model is non-deterministic and a retry
+        # can return a different object count (the production 422 had 18
+        # objects, while the later diagnostic retry returned a 2-object mock).
+        # These fields contain no authorization data.
+        result["_vlm_call_audit"] = {
+            "provider": "openai_compatible",
+            "model": model,
+            "provider_request_id": data.get("id") or resp.headers.get("x-request-id") or resp.headers.get("request-id"),
+            "prompt_sha256": hashlib.sha256((system_text + "\n" + user_text).encode("utf-8")).hexdigest(),
+            "provider_message_sha256": hashlib.sha256(str(text).encode("utf-8")).hexdigest(),
+        }
     return result
 
 
@@ -478,7 +491,9 @@ def parse_artwork_frame_with_vlm(image_bytes: bytes, mode: str, width: int, heig
 
 def parse_with_vlm(image_bytes: bytes, scene_profile: str, mode: str, width: int, height: int) -> Dict[str, Any]:
     if mode == "mock":
-        return mock_objects(width, height, scene_profile)
+        result = mock_objects(width, height, scene_profile)
+        result["_vlm_call_audit"] = {"provider": "mock", "model": None, "provider_request_id": None}
+        return result
     if mode == "openai_compatible":
         return call_openai_compatible(image_bytes, scene_profile, width, height)
     # auto
@@ -486,11 +501,15 @@ def parse_with_vlm(image_bytes: bytes, scene_profile: str, mode: str, width: int
         try:
             return call_openai_compatible(image_bytes, scene_profile, width, height)
         except Exception as e:
-            return {
+            result = {
                 **mock_objects(width, height, scene_profile),
                 "warning": f"vlm_failed_fallback_to_mock: {e}"
             }
-    return {
+            result["_vlm_call_audit"] = {"provider": "mock_fallback", "model": None, "provider_request_id": None}
+            return result
+    result = {
         **mock_objects(width, height, scene_profile),
         "warning": "no_vlm_provider_configured_fallback_to_mock"
     }
+    result["_vlm_call_audit"] = {"provider": "mock_fallback", "model": None, "provider_request_id": None}
+    return result

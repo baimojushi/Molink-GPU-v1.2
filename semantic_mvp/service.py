@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import hashlib
 import json
 import os
 import re
@@ -23,6 +24,7 @@ API_KEY = os.getenv("API_KEY", "")
 ALLOW_UNAUTH_LOCAL = os.getenv("ALLOW_UNAUTH_LOCAL", "").strip().lower() in {"1", "true", "yes", "on"}
 
 app = FastAPI(title="semantic-mvp-bbox-api")
+SEMANTIC_PIPELINE_BUILD_ID = "2026-07-21-joint-bbox-coordinate-evidence-guard-v13"
 
 ROLE_BY_LABEL = {
     "wall": "wall",
@@ -319,6 +321,29 @@ def _valid_vlm_bbox_values(bbox):
     return vals
 
 
+def _build_vlm_response_binding(raw, image_bytes):
+    """Create an immutable diagnostic binding for the exact VLM call result."""
+    raw = raw if isinstance(raw, dict) else {}
+    # Provider/runtime metadata is useful in the binding but is not part of the
+    # model-authored response snapshot.  Keep the snapshot JSON-safe and free of
+    # credentials; parse_with_vlm never stores request headers or API keys.
+    snapshot = {key: value for key, value in raw.items() if not str(key).startswith("_")}
+    canonical = json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    audit = raw.get("_vlm_call_audit") if isinstance(raw.get("_vlm_call_audit"), dict) else {}
+    return {
+        "binding_version": "same_call_vlm_snapshot_v1",
+        "image_sha256": hashlib.sha256(image_bytes or b"").hexdigest(),
+        "response_sha256": hashlib.sha256(canonical).hexdigest(),
+        "object_count": len(snapshot.get("objects") or []) if isinstance(snapshot.get("objects"), list) else 0,
+        "provider": audit.get("provider"),
+        "model": audit.get("model"),
+        "provider_request_id": audit.get("provider_request_id"),
+        "prompt_sha256": audit.get("prompt_sha256"),
+        "provider_message_sha256": audit.get("provider_message_sha256"),
+        "raw_response_snapshot": snapshot,
+    }
+
+
 def _score_boundary_mixed_axis_hypotheses(objects, axis, extent):
     """Score original-pixel vs 0..1000-grid coordinates for one axis.
 
@@ -468,7 +493,10 @@ def _score_boundary_mixed_axis_hypotheses(objects, axis, extent):
     # the decision ambiguous for diagnostics rather than silently rescaling.
     min_margin = 0.85 if winner == "grid_boundary" else 0.45
     accepted = bool(margin >= min_margin)
-    selected = winner if accepted else "original"
+    # Never publish a guessed coordinate mode.  In v12 an ambiguous grid win
+    # was reported as selected="original" even though no hypothesis had been
+    # accepted; that made 422 diagnostics look as if pixels were authoritative.
+    selected = winner if accepted else None
     return {
         "axis": axis,
         "selected": selected,
@@ -485,7 +513,268 @@ def _score_boundary_mixed_axis_hypotheses(objects, axis, extent):
         "policy": "per_object_per_axis_multi_hypothesis_v3",
     }
 
-def _infer_vlm_bbox_coordinate_space(objects, original_w, original_h, vlm_image_meta: Optional[Dict[str, Any]] = None):
+
+def _joint_bbox_image_edge_score(objects, x_mode, y_mode, width, height, image_np):
+    """Return image-edge agreement for one complete x/y coordinate hypothesis.
+
+    This evidence is deliberately secondary.  A VLM bbox is often coarse, but
+    windows, doors, floor boundaries and wall plane boundaries should still be
+    closer to real intensity edges under the correct transform.  Computing the
+    score for the *complete 2-D hypothesis* is important: scoring x and y in
+    isolation caused the v12 portrait-image false 422.
+    """
+    if image_np is None or not isinstance(image_np, np.ndarray) or image_np.ndim < 2:
+        return 0.0, {"available": False, "reason": "image_not_supplied"}
+    try:
+        gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY) if image_np.ndim == 3 else image_np
+        gray = np.asarray(gray, dtype=np.float32)
+        gx = np.abs(cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3))
+        gy = np.abs(cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3))
+        reference = float(np.percentile(np.concatenate([gx.ravel(), gy.ravel()]), 90))
+    except Exception as exc:
+        return 0.0, {"available": False, "reason": f"edge_extraction_failed:{exc}"}
+    if not np.isfinite(reference) or reference < 1.0:
+        return 0.0, {"available": False, "reason": "image_has_insufficient_edge_energy"}
+
+    def axis_value(value, extent, mode):
+        extent = float(extent)
+        tolerance = max(2.0, extent * 0.008)
+        if mode == "grid_boundary" and abs(float(value) - extent) > tolerance:
+            return float(value) / 1000.0 * extent
+        return float(value)
+
+    samples = []
+    preferred = {"window", "door", "opening", "arch", "floor", "roof", "ceiling"}
+    for obj in objects or []:
+        vals = _valid_vlm_bbox_values(obj.get("bbox_xyxy") or obj.get("bbox") or [])
+        if vals is None:
+            continue
+        label = str(obj.get("label") or "").lower().split("_")[0]
+        role = str(obj.get("role") or "").lower()
+        if label not in preferred and role not in {"wall", "forbidden"}:
+            continue
+        x1 = int(round(axis_value(vals[0], width, x_mode)))
+        y1 = int(round(axis_value(vals[1], height, y_mode)))
+        x2 = int(round(axis_value(vals[2], width, x_mode)))
+        y2 = int(round(axis_value(vals[3], height, y_mode)))
+        x1, x2 = sorted((max(0, min(width - 1, x1)), max(0, min(width - 1, x2))))
+        y1, y2 = sorted((max(0, min(height - 1, y1)), max(0, min(height - 1, y2))))
+        if x2 - x1 < 4 or y2 - y1 < 4:
+            continue
+        pad_x = max(1, min(4, int(round(width * 0.002))))
+        pad_y = max(1, min(4, int(round(height * 0.002))))
+        vertical = [gx[y1:y2 + 1, max(0, x - pad_x):min(width, x + pad_x + 1)] for x in (x1, x2)]
+        horizontal = [gy[max(0, y - pad_y):min(height, y + pad_y + 1), x1:x2 + 1] for y in (y1, y2)]
+        edge_values = [float(np.mean(v)) for v in vertical + horizontal if v.size]
+        if not edge_values:
+            continue
+        weight = 1.0 if label in preferred or role == "forbidden" else 0.35
+        samples.append({
+            "label": label,
+            "weight": weight,
+            "normalized_edge_support": min(2.0, float(np.mean(edge_values)) / reference),
+        })
+    if not samples:
+        return 0.0, {"available": False, "reason": "no_structural_bbox_edges"}
+    weighted = sum(item["weight"] * item["normalized_edge_support"] for item in samples)
+    total_weight = sum(item["weight"] for item in samples)
+    normalized = weighted / max(1e-6, total_weight)
+    # Cap the contribution so texture-heavy images cannot overrule impossible
+    # semantic topology or a declared boundary-sentinel inconsistency.
+    score = min(2.20, 1.35 * normalized)
+    return float(score), {
+        "available": True,
+        "reference_p90": reference,
+        "sample_count": len(samples),
+        "normalized_support": float(normalized),
+        "score": float(score),
+        "samples": samples,
+    }
+
+
+def _score_joint_boundary_coordinate_hypotheses(objects, original_w, original_h, x_debug, y_debug, image_np=None):
+    """Rank the four complete pixel/grid coordinate interpretations.
+
+    ROOT CAUSE / DO-NOT-REGRESS (2026-07-21): the failing production response
+    used a 0..1000 grid for ordinary x/y values but copied 1280/1708 for boxes
+    touching the original image boundary.  v12 made two independent axis
+    decisions.  The x-only features saturated (wall union coverage was 1.0 in
+    both interpretations), so the correct grid x won by only 0.60 and was
+    rejected even though grid/grid was unambiguous when scene topology and the
+    actual image were considered together.
+
+    Do not lower the old per-axis margin and do not restore an ``internal_max``
+    threshold.  Both changes turn a false 422 into silent bbox drift.  Always
+    compare pixel/pixel, grid/grid and both mixed-axis hypotheses as complete
+    2-D scenes.  If the joint winner lacks a safe margin, return selected=None
+    and fail closed with the scores and repair hint.
+    """
+    if x_debug is None and y_debug is None:
+        return None
+    x_modes = ["original"] if x_debug is None else ["original", "grid_boundary"]
+    y_modes = ["original"] if y_debug is None else ["original", "grid_boundary"]
+    extent_x, extent_y = float(original_w), float(original_h)
+
+    def axis_norm(value, extent, mode):
+        tolerance = max(2.0, extent * 0.008)
+        if mode == "grid_boundary" and abs(float(value) - extent) > tolerance:
+            return float(value) / 1000.0
+        return float(value) / extent
+
+    def overlap_1d(a, b):
+        return max(0.0, min(a[1], b[1]) - max(a[0], b[0]))
+
+    scores = {}
+    evidence = {}
+    for x_mode in x_modes:
+        for y_mode in y_modes:
+            key = f"{x_mode}_x__{y_mode}_y"
+            base = 0.0
+            if x_debug is not None:
+                base += float((x_debug.get("scores") or {}).get(x_mode, -100.0))
+            if y_debug is not None:
+                base += float((y_debug.get("scores") or {}).get(y_mode, -100.0))
+            transformed = []
+            invalid = 0
+            for index, obj in enumerate(objects or []):
+                vals = _valid_vlm_bbox_values(obj.get("bbox_xyxy") or obj.get("bbox") or [])
+                if vals is None:
+                    continue
+                box = [
+                    axis_norm(vals[0], extent_x, x_mode),
+                    axis_norm(vals[1], extent_y, y_mode),
+                    axis_norm(vals[2], extent_x, x_mode),
+                    axis_norm(vals[3], extent_y, y_mode),
+                ]
+                box = [float(v) for v in box]
+                if box[2] <= box[0] or box[3] <= box[1] or min(box) < -0.025 or max(box) > 1.025:
+                    invalid += 1
+                transformed.append({
+                    "index": index,
+                    "label": str(obj.get("label") or "").lower(),
+                    "role": str(obj.get("role") or "").lower(),
+                    "box": box,
+                })
+
+            topology = -12.0 * invalid
+            reasons = []
+            walls = [item for item in transformed if item["role"] == "wall" or item["label"].startswith("wall")]
+            floors = [item for item in transformed if item["label"] == "floor"]
+            roofs = [item for item in transformed if item["label"] in {"roof", "ceiling"}]
+            forbidden = [item for item in transformed if item["role"] == "forbidden" or item["label"].split("_")[0] in {"window", "door", "opening", "arch"}]
+
+            if walls:
+                spans = [max(0.0, item["box"][2] - item["box"][0]) for item in walls]
+                narrow = sum(span < 0.075 for span in spans)
+                topology -= 1.25 * narrow
+                if narrow:
+                    reasons.append("implausibly_narrow_wall_component")
+                ordered = sorted(walls, key=lambda item: (item["box"][0] + item["box"][2]) * 0.5)
+                gaps = []
+                for left, right in zip(ordered, ordered[1:]):
+                    gap = right["box"][0] - left["box"][2]
+                    gaps.append(gap)
+                    if gap > 0.10:
+                        topology -= min(1.5, gap * 5.0)
+                    elif gap < -0.40:
+                        topology -= min(1.0, abs(gap) * 1.5)
+                if gaps:
+                    reasons.append("multiwall_horizontal_continuity")
+
+            # Structural objects should be explained by a wall plane in 2-D.
+            # This catches the production pixel-x interpretation where the
+            # right window intruded deeply into the center wall / unexplained
+            # right strip after original-boundary sentinels were preserved.
+            structural_coverages = []
+            for item in forbidden:
+                ib = item["box"]
+                area = max(1e-6, (ib[2] - ib[0]) * (ib[3] - ib[1]))
+                best = 0.0
+                for wall in walls:
+                    wb = wall["box"]
+                    inter = overlap_1d((ib[0], ib[2]), (wb[0], wb[2])) * overlap_1d((ib[1], ib[3]), (wb[1], wb[3]))
+                    best = max(best, inter / area)
+                structural_coverages.append(best)
+            if structural_coverages:
+                mean_coverage = float(np.mean(structural_coverages))
+                topology += 1.60 * mean_coverage
+                topology -= 1.20 * sum(value < 0.20 for value in structural_coverages)
+                reasons.append("structural_object_wall_explanation")
+            else:
+                mean_coverage = None
+
+            if floors and walls:
+                floor_top = min(item["box"][1] for item in floors)
+                wall_bottom = float(np.median([item["box"][3] for item in walls]))
+                alignment = max(0.0, 1.0 - abs(floor_top - wall_bottom) / 0.25)
+                topology += 1.15 * alignment
+                reasons.append("wall_floor_vertical_topology")
+            else:
+                alignment = None
+            if roofs and walls:
+                roof_bottom = max(item["box"][3] for item in roofs)
+                wall_top = float(np.median([item["box"][1] for item in walls]))
+                roof_alignment = max(0.0, 1.0 - abs(roof_bottom - wall_top) / 0.28)
+                topology += 0.75 * roof_alignment
+                reasons.append("roof_wall_vertical_topology")
+            else:
+                roof_alignment = None
+
+            # Same-grid is a weak batch-level signal only.  It may never decide
+            # the result by itself because genuine x-pixel/y-grid responses are
+            # known to exist and are covered by regression tests.
+            coherence = 0.0
+            if (
+                x_debug is not None and y_debug is not None
+                and x_mode == y_mode == "grid_boundary"
+                and x_debug.get("boundary_sentinel_count") and y_debug.get("boundary_sentinel_count")
+            ):
+                coherence = 0.10
+
+            edge_score, edge_debug = _joint_bbox_image_edge_score(
+                objects, x_mode, y_mode, int(original_w), int(original_h), image_np
+            )
+            total = base + topology + coherence + edge_score
+            scores[key] = float(total)
+            evidence[key] = {
+                "x_mode": x_mode,
+                "y_mode": y_mode,
+                "base_axis_score": float(base),
+                "topology_score": float(topology),
+                "batch_coherence_score": float(coherence),
+                "image_edge_score": float(edge_score),
+                "invalid_box_count": int(invalid),
+                "structural_wall_coverages": structural_coverages,
+                "wall_floor_alignment": alignment,
+                "roof_wall_alignment": roof_alignment,
+                "reasons": reasons,
+                "image_edge_evidence": edge_debug,
+            }
+
+    ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+    winner, winner_score = ranked[0]
+    runner, runner_score = ranked[1] if len(ranked) > 1 else (None, float("-inf"))
+    margin = float(winner_score - runner_score) if runner is not None else float("inf")
+    winner_evidence = evidence[winner]
+    is_native = winner_evidence["x_mode"] == "original" and winner_evidence["y_mode"] == "original"
+    min_margin = 0.65 if is_native else 1.05
+    accepted = bool(np.isfinite(winner_score) and margin >= min_margin)
+    return {
+        "policy": "joint_2d_pixel_grid_hypothesis_with_scene_evidence_v4",
+        "selected": winner if accepted else None,
+        "winner": winner,
+        "runner_up": runner,
+        "accepted": accepted,
+        "ambiguous": not accepted,
+        "score_margin": margin,
+        "minimum_score_margin": min_margin,
+        "scores": scores,
+        "evidence": evidence,
+        "fail_closed": not accepted,
+        "fail_closed_reason": None if accepted else "joint_coordinate_hypotheses_have_insufficient_evidence_margin",
+    }
+
+def _infer_vlm_bbox_coordinate_space(objects, original_w, original_h, vlm_image_meta: Optional[Dict[str, Any]] = None, image_np=None):
     """Infer whether VLM boxes are original pixels, sent-image pixels, or normalized coordinates.
 
     The OpenAI-compatible client may resize large images before sending them to
@@ -550,31 +839,38 @@ def _infer_vlm_bbox_coordinate_space(objects, original_w, original_h, vlm_image_
     # Evaluate the known mixed-sentinel failure family before the legacy
     # max-coordinate heuristics below.  A global maximum cannot identify a
     # coordinate system when the maximum itself may be an original-image edge
-    # sentinel.  Each axis therefore chooses between original pixels and a
-    # 0..1000 grid independently, based on transformed per-object evidence.
+    # sentinel.  v13 ranks all complete x/y combinations jointly; independent
+    # axis scores remain diagnostic inputs, not final decisions.
     x_dynamic = _score_boundary_mixed_axis_hypotheses(objects, "x", original_w)
     y_dynamic = _score_boundary_mixed_axis_hypotheses(objects, "y", original_h)
     if x_dynamic is not None or y_dynamic is not None:
-        x_axis = (x_dynamic or {}).get("selected", "original")
-        y_axis = (y_dynamic or {}).get("selected", "original")
-        unresolved_grid_ambiguity = any(
-            item is not None
-            and item.get("winner") == "grid_boundary"
-            and not item.get("accepted")
-            for item in (x_dynamic, y_dynamic)
+        joint = _score_joint_boundary_coordinate_hypotheses(
+            objects, original_w, original_h, x_dynamic, y_dynamic, image_np=image_np
         )
         dynamic_debug = {
-            "policy": "per_object_per_axis_multi_hypothesis_v3",
+            "policy": "axis_scores_are_diagnostic_inputs_to_joint_2d_v4",
             "x": x_dynamic,
             "y": y_dynamic,
-            "fail_closed": bool(unresolved_grid_ambiguity),
-            "fail_closed_reason": "nonnative_grid_transform_has_insufficient_score_margin" if unresolved_grid_ambiguity else None,
+            "fail_closed": bool((joint or {}).get("fail_closed")),
+            "fail_closed_reason": (joint or {}).get("fail_closed_reason"),
         }
         debug["dynamic_axis_coordinate_inference"] = dynamic_debug
+        debug["joint_coordinate_inference"] = joint
+        if not joint or not joint.get("accepted"):
+            debug.update({
+                "source_coordinate_space": None,
+                "reason": "joint_coordinate_hypothesis_ambiguous_fail_closed",
+                "scale_x_to_original": None,
+                "scale_y_to_original": None,
+            })
+            return None, debug
+        winner = str(joint.get("selected"))
+        x_axis = (joint.get("evidence", {}).get(winner) or {}).get("x_mode", "original")
+        y_axis = (joint.get("evidence", {}).get(winner) or {}).get("y_mode", "original")
         if x_axis == "grid_boundary" and y_axis == "grid_boundary":
             debug.update({
                 "source_coordinate_space": "normalized_0_1000_with_original_boundary_sentinels",
-                "reason": "dynamic_per_axis_scores_select_1000_grid_with_original_edge_sentinels",
+                "reason": "joint_2d_scores_select_1000_grid_with_original_edge_sentinels",
                 "scale_x_to_original": float(original_w) / 1000.0,
                 "scale_y_to_original": float(original_h) / 1000.0,
                 "preserve_original_boundary_sentinels": True,
@@ -583,7 +879,7 @@ def _infer_vlm_bbox_coordinate_space(objects, original_w, original_h, vlm_image_
         if x_axis == "grid_boundary" and y_axis == "original":
             debug.update({
                 "source_coordinate_space": "mixed_x_1000_boundary_y_original",
-                "reason": "dynamic_per_axis_scores_select_x_grid_boundary_y_original",
+                "reason": "joint_2d_scores_select_x_grid_boundary_y_original",
                 "scale_x_to_original": float(original_w) / 1000.0,
                 "scale_y_to_original": 1.0,
                 "preserve_original_boundary_sentinels": True,
@@ -592,7 +888,7 @@ def _infer_vlm_bbox_coordinate_space(objects, original_w, original_h, vlm_image_
         if x_axis == "original" and y_axis == "grid_boundary":
             debug.update({
                 "source_coordinate_space": "mixed_x_original_y_1000_boundary",
-                "reason": "dynamic_per_axis_scores_select_x_original_y_grid_boundary",
+                "reason": "joint_2d_scores_select_x_original_y_grid_boundary",
                 "scale_x_to_original": 1.0,
                 "scale_y_to_original": float(original_h) / 1000.0,
                 "preserve_original_boundary_sentinels": True,
@@ -603,7 +899,7 @@ def _infer_vlm_bbox_coordinate_space(objects, original_w, original_h, vlm_image_
         # sentinel evidence would reintroduce the production drift.
         debug.update({
             "source_coordinate_space": "original_pixels",
-            "reason": "dynamic_per_axis_scores_preserve_explicit_original_pixel_contract",
+            "reason": "joint_2d_scores_select_original_pixel_contract",
             "scale_x_to_original": 1.0,
             "scale_y_to_original": 1.0,
         })
@@ -1834,6 +2130,7 @@ def health():
     return {
         "status": "ok",
         "api": "semantic-mvp-bbox-api",
+        "pipeline_build": SEMANTIC_PIPELINE_BUILD_ID,
         "mode": os.getenv("VLM_PROVIDER", "mock_or_auto"),
         "sam": get_sam_runtime_status(),
     }
@@ -1878,6 +2175,12 @@ async def parse_semantics_mvp(
 
     seed_payload = None
     raw = {}
+    coordinate_inference_meta: Dict[str, Any] = {}
+    vlm_response_binding: Dict[str, Any] = {
+        "binding_version": "same_call_vlm_snapshot_v1",
+        "source": "semantic_seed_json",
+        "raw_response_snapshot": None,
+    }
     bbox_coordinate_debug = {"enabled": True, "source_coordinate_space": "seed_payload"}
     sam_debug: Dict[str, Any] = {"enabled": False, "reason": "semantic_seed_json_supplied_skip_sam"}
     pipeline_stage = "final_metric_aligned" if metric_zip_bytes else "raw_original"
@@ -1929,6 +2232,7 @@ async def parse_semantics_mvp(
         # VLM sees the original image. Some providers still return normalized
         # visual coordinates, so normalize before any SAM or Metric3D alignment.
         raw = parse_with_vlm(image_bytes, scene_profile, vlm_mode, original_w, original_h)
+        vlm_response_binding = _build_vlm_response_binding(raw, image_bytes)
         objs = raw.get("objects", [])
         vlm_image_meta = raw.get("_vlm_image_meta") if isinstance(raw, dict) else None
         coordinate_inference_meta = dict(vlm_image_meta or {})
@@ -1938,7 +2242,7 @@ async def parse_semantics_mvp(
         coordinate_inference_meta["provider_reported_coordinate_space"] = raw.get("coordinate_space")
         coordinate_inference_meta["provider_reported_image_size_px"] = raw.get("image_size_px")
         bbox_coordinate_space, bbox_coordinate_debug = _infer_vlm_bbox_coordinate_space(
-            objs, original_w, original_h, coordinate_inference_meta
+            objs, original_w, original_h, coordinate_inference_meta, image_np=image_np
         )
         dynamic_axis_debug = bbox_coordinate_debug.get("dynamic_axis_coordinate_inference") or {}
         if dynamic_axis_debug.get("fail_closed"):
@@ -1948,7 +2252,8 @@ async def parse_semantics_mvp(
                     "error": "ambiguous_vlm_bbox_coordinate_space",
                     "reason": dynamic_axis_debug.get("fail_closed_reason"),
                     "coordinate_debug": bbox_coordinate_debug,
-                    "repair_hint": "rerun semantic parsing with exact image_size_px/pixel coordinates; do not reuse ambiguous boxes",
+                    "vlm_response_binding": vlm_response_binding,
+                    "repair_hint": "do not lower coordinate margins or reuse cached boxes; inspect the same-call raw snapshot and rerun only after the provider returns one auditable canvas",
                 },
             )
         original_space_objects = _build_vlm_objects_in_original_space(raw, original_w, original_h, bbox_coordinate_space, vlm_image_meta)
@@ -2010,30 +2315,10 @@ async def parse_semantics_mvp(
 
     light_payload = _normalize_light_payload((seed_payload or raw or {}).get("light"))
 
-    semantic_payload = {
-        "status": "ok",
-        "coordinate_space": "processed" if metric_zip_bytes else "original",
-        "semantic_pipeline_stage": pipeline_stage,
-        "geometry_deferred": not bool(metric_zip_bytes),
-        "scene_profile": scene_profile,
-        "processed_size": [processed_w, processed_h],
-        "original_size": [meta_original_w, meta_original_h],
-        "objects": out,
-        "object_inventory": object_inventory,
-        "semantic_object_inventory_status": object_inventory.get("status"),
-        "vlm_bbox_coordinate_debug": bbox_coordinate_debug,
-        "image_transform_debug": image_transform_diag,
-        "bbox_coordinate_guard_debug": bbox_guard_diag,
-        "multiwall_split_debug": multiwall_split_debug,
-        "sam_debug": sam_debug,
-        "semantic_seed_debug": seed_debug,
-        "artwork_analysis": artwork_analysis,
-        "warnings": warnings
-    }
-    if light_payload:
-        semantic_payload["light"] = light_payload
-
     # --- diagnostic artifacts: image_transform + bbox_coordinate_guard ---
+    # Build these before semantic_payload.  v12 referenced both variables first,
+    # so a successful non-422 request could fail with UnboundLocalError while
+    # the failure path appeared healthy.
     image_transform_diag = {
         "original_size": [int(meta_original_w), int(meta_original_h)],
         "processed_size": [int(processed_w), int(processed_h)],
@@ -2043,7 +2328,9 @@ async def parse_semantics_mvp(
         "provider_reported_image_size_px": coordinate_inference_meta.get("provider_reported_image_size_px"),
         "provider_reported_coordinate_space": coordinate_inference_meta.get("provider_reported_coordinate_space"),
         "chosen_coordinate_space": bbox_coordinate_debug.get("source_coordinate_space"),
+        "vlm_response_binding": {key: value for key, value in vlm_response_binding.items() if key != "raw_response_snapshot"},
     }
+    joint_coordinate_debug = bbox_coordinate_debug.get("joint_coordinate_inference") or {}
     bbox_guard_diag = {
         "enabled": bbox_coordinate_debug.get("enabled", False),
         "source_coordinate_space": bbox_coordinate_debug.get("source_coordinate_space"),
@@ -2057,11 +2344,38 @@ async def parse_semantics_mvp(
             "max_y": bbox_coordinate_debug.get("raw_max_y"),
         },
         "dynamic_axis_coordinate_inference": bbox_coordinate_debug.get("dynamic_axis_coordinate_inference"),
-        "fail_closed": (bbox_coordinate_debug.get("dynamic_axis_coordinate_inference") or {}).get("fail_closed", False),
-        "fail_closed_reason": (bbox_coordinate_debug.get("dynamic_axis_coordinate_inference") or {}).get("fail_closed_reason"),
+        "joint_coordinate_inference": joint_coordinate_debug,
+        "fail_closed": joint_coordinate_debug.get("fail_closed", (bbox_coordinate_debug.get("dynamic_axis_coordinate_inference") or {}).get("fail_closed", False)),
+        "fail_closed_reason": joint_coordinate_debug.get("fail_closed_reason", (bbox_coordinate_debug.get("dynamic_axis_coordinate_inference") or {}).get("fail_closed_reason")),
         "scale_x_to_original": bbox_coordinate_debug.get("scale_x_to_original"),
         "scale_y_to_original": bbox_coordinate_debug.get("scale_y_to_original"),
+        "vlm_response_binding": {key: value for key, value in vlm_response_binding.items() if key != "raw_response_snapshot"},
     }
+
+    semantic_payload = {
+        "status": "ok",
+        "pipeline_build": SEMANTIC_PIPELINE_BUILD_ID,
+        "coordinate_space": "processed" if metric_zip_bytes else "original",
+        "semantic_pipeline_stage": pipeline_stage,
+        "geometry_deferred": not bool(metric_zip_bytes),
+        "scene_profile": scene_profile,
+        "processed_size": [processed_w, processed_h],
+        "original_size": [meta_original_w, meta_original_h],
+        "objects": out,
+        "object_inventory": object_inventory,
+        "semantic_object_inventory_status": object_inventory.get("status"),
+        "vlm_bbox_coordinate_debug": bbox_coordinate_debug,
+        "vlm_response_binding": {key: value for key, value in vlm_response_binding.items() if key != "raw_response_snapshot"},
+        "image_transform_debug": image_transform_diag,
+        "bbox_coordinate_guard_debug": bbox_guard_diag,
+        "multiwall_split_debug": multiwall_split_debug,
+        "sam_debug": sam_debug,
+        "semantic_seed_debug": seed_debug,
+        "artwork_analysis": artwork_analysis,
+        "warnings": warnings
+    }
+    if light_payload:
+        semantic_payload["light"] = light_payload
 
     if return_debug_assets:
         debug_img = draw_semantic_wall_debug(image_np, out, multiwall_split_debug, target_space="original")
@@ -2070,6 +2384,8 @@ async def parse_semantics_mvp(
             "semantic_wall_debug.png": png_bytes(debug_img),
             "image_transform.json": json.dumps(image_transform_diag, ensure_ascii=False, indent=2).encode("utf-8"),
             "bbox_coordinate_guard.json": json.dumps(bbox_guard_diag, ensure_ascii=False, indent=2).encode("utf-8"),
+            "vlm_raw_response.json": json.dumps(vlm_response_binding.get("raw_response_snapshot"), ensure_ascii=False, indent=2).encode("utf-8"),
+            "vlm_response_binding.json": json.dumps({key: value for key, value in vlm_response_binding.items() if key != "raw_response_snapshot"}, ensure_ascii=False, indent=2).encode("utf-8"),
         }
         return _zip_response(files, filename="semantics_mvp_debug.zip")
 

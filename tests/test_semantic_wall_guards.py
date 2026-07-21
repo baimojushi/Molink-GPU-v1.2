@@ -4,6 +4,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from semantic_mvp.service import (
+    _build_vlm_response_binding,
     _infer_vlm_bbox_coordinate_space,
     _normalize_vlm_bbox_to_original_pixels,
     _semantic_multiwall_postprocess,
@@ -140,6 +141,63 @@ def test_regression_83f8bf2e_internal_1000_grid_with_original_edge_sentinels():
     assert all(abs(a - b) < 1e-6 for a, b in zip(floor, [0.0, 1058.96, 1279.0, 1707.0]))
 
 
+def test_v13_joint_hypothesis_accepts_grid_xy_when_axis_x_alone_is_weak():
+    # Production family: ordinary values are 0..1000 grid values, while boxes
+    # touching the right/bottom edge copy 1280/1708.  The v12 x-only scorer can
+    # be much less decisive than y; the complete 2-D scene must decide once.
+    objects = [
+        {"label": "wall", "role": "wall", "bbox_xyxy": [0, 220, 341, 640]},
+        {"label": "wall", "role": "wall", "bbox_xyxy": [342, 257, 600, 487]},
+        {"label": "wall", "role": "wall", "bbox_xyxy": [600, 210, 1000, 650]},
+        {"label": "window", "role": "forbidden", "bbox_xyxy": [600, 205, 1280, 690]},
+        {"label": "floor", "role": "support", "bbox_xyxy": [0, 620, 1280, 1708]},
+        {"label": "roof", "role": "support", "bbox_xyxy": [0, 0, 1280, 280]},
+        {"label": "door", "role": "forbidden", "bbox_xyxy": [45, 260, 190, 650]},
+        {"label": "opening", "role": "forbidden", "bbox_xyxy": [600, 230, 1280, 640]},
+        {"label": "painting", "role": "existing_content", "bbox_xyxy": [405, 315, 465, 405]},
+        {"label": "painting", "role": "existing_content", "bbox_xyxy": [480, 320, 540, 410]},
+        {"label": "person", "role": "foreground", "bbox_xyxy": [250, 410, 330, 720]},
+        {"label": "person", "role": "foreground", "bbox_xyxy": [720, 405, 810, 715]},
+        {"label": "lamp", "role": "forbidden", "bbox_xyxy": [290, 110, 330, 190]},
+        {"label": "lamp", "role": "forbidden", "bbox_xyxy": [650, 100, 700, 185]},
+        {"label": "cabinet", "role": "support", "bbox_xyxy": [370, 500, 580, 670]},
+        {"label": "chair", "role": "foreground", "bbox_xyxy": [200, 520, 300, 720]},
+        {"label": "curtain", "role": "forbidden", "bbox_xyxy": [900, 220, 1280, 690]},
+        {"label": "track_lighting", "role": "forbidden", "bbox_xyxy": [200, 80, 800, 145]},
+    ]
+
+    mode, debug = _infer_vlm_bbox_coordinate_space(objects, 1280, 1708)
+
+    assert mode == "normalized_0_1000_with_original_boundary_sentinels"
+    joint = debug["joint_coordinate_inference"]
+    assert joint["accepted"] is True
+    assert joint["selected"] == "grid_boundary_x__grid_boundary_y"
+    assert joint["score_margin"] >= joint["minimum_score_margin"]
+    assert joint["policy"] == "joint_2d_pixel_grid_hypothesis_with_scene_evidence_v4"
+
+
+def test_v13_ambiguous_joint_hypothesis_exposes_no_selected_coordinate_space():
+    objects = [
+        {"label": "wall", "role": "wall", "bbox_xyxy": [0, 200, 500, 600]},
+        {"label": "floor", "role": "support", "bbox_xyxy": [0, 600, 1280, 1708]},
+    ]
+
+    mode, debug = _infer_vlm_bbox_coordinate_space(objects, 1280, 1708)
+
+    assert mode is None
+    assert debug["source_coordinate_space"] is None
+    joint = debug["joint_coordinate_inference"]
+    assert joint["accepted"] is False
+    assert joint["selected"] is None
+    assert joint["fail_closed"] is True
+    # Per-axis diagnostics also must not invent a selected mode when their own
+    # acceptance threshold was not met.
+    for axis in ("x", "y"):
+        item = debug["dynamic_axis_coordinate_inference"].get(axis)
+        if item is not None and not item["accepted"]:
+            assert item["selected"] is None
+
+
 def test_regression_mixed_original_x_and_low_extent_grid_y_with_bottom_sentinel():
     # Production regression: x is already in 1280-pixel space, while ordinary
     # y values use a 0..1000 grid and only bottom-touching boxes emit y2=1708.
@@ -182,6 +240,27 @@ def test_dynamic_axis_scoring_does_not_rescale_true_original_pixel_boxes():
     assert debug["dynamic_axis_coordinate_inference"]["x"]["selected"] == "original"
     # y has values >1024, so it is not eligible for the grid-sentinel family.
     assert debug["dynamic_axis_coordinate_inference"]["y"] is None
+
+
+def test_same_call_vlm_binding_preserves_exact_object_snapshot_and_hashes():
+    raw = {
+        "coordinate_space": "pixels",
+        "image_size_px": [1280, 1708],
+        "objects": [{"label": "wall", "bbox_xyxy": [1, 2, 3, 4]}],
+        "_vlm_call_audit": {
+            "provider": "openai_compatible",
+            "model": "vision-model",
+            "provider_request_id": "req-123",
+            "prompt_sha256": "prompt-hash",
+        },
+    }
+    binding = _build_vlm_response_binding(raw, b"same-image")
+    assert binding["object_count"] == 1
+    assert binding["provider_request_id"] == "req-123"
+    assert binding["raw_response_snapshot"]["objects"] == raw["objects"]
+    assert "_vlm_call_audit" not in binding["raw_response_snapshot"]
+    assert len(binding["image_sha256"]) == 64
+    assert len(binding["response_sha256"]) == 64
 
 from semantic_mvp.service import _canonical_label_and_role, _build_object_inventory
 
