@@ -2022,6 +2022,8 @@ async def parse_semantics_mvp(
         "object_inventory": object_inventory,
         "semantic_object_inventory_status": object_inventory.get("status"),
         "vlm_bbox_coordinate_debug": bbox_coordinate_debug,
+        "image_transform_debug": image_transform_diag,
+        "bbox_coordinate_guard_debug": bbox_guard_diag,
         "multiwall_split_debug": multiwall_split_debug,
         "sam_debug": sam_debug,
         "semantic_seed_debug": seed_debug,
@@ -2031,11 +2033,43 @@ async def parse_semantics_mvp(
     if light_payload:
         semantic_payload["light"] = light_payload
 
+    # --- diagnostic artifacts: image_transform + bbox_coordinate_guard ---
+    image_transform_diag = {
+        "original_size": [int(meta_original_w), int(meta_original_h)],
+        "processed_size": [int(processed_w), int(processed_h)],
+        "scale_x": float(sx),
+        "scale_y": float(sy),
+        "vlm_image_meta": coordinate_inference_meta,
+        "provider_reported_image_size_px": coordinate_inference_meta.get("provider_reported_image_size_px"),
+        "provider_reported_coordinate_space": coordinate_inference_meta.get("provider_reported_coordinate_space"),
+        "chosen_coordinate_space": bbox_coordinate_debug.get("source_coordinate_space"),
+    }
+    bbox_guard_diag = {
+        "enabled": bbox_coordinate_debug.get("enabled", False),
+        "source_coordinate_space": bbox_coordinate_debug.get("source_coordinate_space"),
+        "sample_count": bbox_coordinate_debug.get("sample_count", 0),
+        "original_size": bbox_coordinate_debug.get("original_size"),
+        "sent_size": bbox_coordinate_debug.get("sent_size"),
+        "raw_bounds": {
+            "min_x": bbox_coordinate_debug.get("raw_min_x"),
+            "max_x": bbox_coordinate_debug.get("raw_max_x"),
+            "min_y": bbox_coordinate_debug.get("raw_min_y"),
+            "max_y": bbox_coordinate_debug.get("raw_max_y"),
+        },
+        "dynamic_axis_coordinate_inference": bbox_coordinate_debug.get("dynamic_axis_coordinate_inference"),
+        "fail_closed": (bbox_coordinate_debug.get("dynamic_axis_coordinate_inference") or {}).get("fail_closed", False),
+        "fail_closed_reason": (bbox_coordinate_debug.get("dynamic_axis_coordinate_inference") or {}).get("fail_closed_reason"),
+        "scale_x_to_original": bbox_coordinate_debug.get("scale_x_to_original"),
+        "scale_y_to_original": bbox_coordinate_debug.get("scale_y_to_original"),
+    }
+
     if return_debug_assets:
         debug_img = draw_semantic_wall_debug(image_np, out, multiwall_split_debug, target_space="original")
         files = {
             "semantics.json": json.dumps(semantic_payload, ensure_ascii=False, indent=2).encode("utf-8"),
             "semantic_wall_debug.png": png_bytes(debug_img),
+            "image_transform.json": json.dumps(image_transform_diag, ensure_ascii=False, indent=2).encode("utf-8"),
+            "bbox_coordinate_guard.json": json.dumps(bbox_guard_diag, ensure_ascii=False, indent=2).encode("utf-8"),
         }
         return _zip_response(files, filename="semantics_mvp_debug.zip")
 
