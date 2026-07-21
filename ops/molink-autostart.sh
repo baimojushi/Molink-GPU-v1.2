@@ -49,6 +49,7 @@ start() {
   (
     source /root/miniconda3/etc/profile.d/conda.sh && conda activate metric3d
     cd /opt/molink/hanging
+    [ -f .env.bfl ] && source .env.bfl
     [ -f .env ] && source .env
     export ALLOW_UNAUTH_LOCAL="${ALLOW_UNAUTH_LOCAL:-1}"
     [ -z "${API_KEY:-}" ] && [ -n "${VLM_API_KEY:-}" ] && export API_KEY="$VLM_API_KEY"
