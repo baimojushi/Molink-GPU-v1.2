@@ -55,6 +55,7 @@ Detect large surfaces and objects needed for hanging geometry.
 Return an object:
 {
   "coordinate_space": "pixels",
+  "image_size_px": [width, height],
   "objects": [
     {
       "object_id": "stable instance id, e.g. wall_front_01",
@@ -70,6 +71,8 @@ Return an object:
 Coordinate system: pixels of the image attached in this request.
 Use the exact width and height stated by the user. Do not normalize either axis
 to 0..1 or 0..1000, and never mix normalized x values with pixel y values.
+Echo those exact dimensions in image_size_px. This field is an audit signal;
+all bbox_xyxy values must still use the same declared pixel canvas.
 Prioritize high-recall boxes. Coarse bbox is acceptable for MVP.
 Required labels when visible:
 wall, floor, roof, sofa, table, cabinet, bar, window, door, tv, mirror, lamp,
@@ -140,6 +143,8 @@ Image size: {width}x{height}
 
 Detect wall, floor, roof, table, support, forbidden, existing_content and foreground/non_support objects.
 Return JSON only.
+Return image_size_px=[{width},{height}] and coordinate_space="pixels" exactly;
+never report coordinates from a provider-internal resize or visual grid.
 
 Also enforce:
 - vlm_first_multiwall: output every visible wall plane separately

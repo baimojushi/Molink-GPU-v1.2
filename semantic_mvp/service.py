@@ -318,6 +318,173 @@ def _valid_vlm_bbox_values(bbox):
         return None
     return vals
 
+
+def _score_boundary_mixed_axis_hypotheses(objects, axis, extent):
+    """Score original-pixel vs 0..1000-grid coordinates for one axis.
+
+    IMPORTANT REGRESSION NOTE (2026-07-21): a production VLM response used
+    original pixels on x, a 0..1000 visual grid on y, and copied the original
+    image height only for boxes touching the bottom edge.  The old detector
+    required an internal coordinate >= 850 before accepting a grid.  Because
+    the highest non-boundary y was only ~500--600, every y value was treated as
+    an original pixel and the semantic boxes were compressed into the upper
+    half of the image.
+
+    Do not restore a fixed ``internal_max >= N`` rule here.  Edge sentinels are
+    ambiguous by definition, so both hypotheses are transformed and scored
+    object-by-object using range, scene-role and coverage evidence.  The x and
+    y axes are intentionally independent because several gateways have mixed
+    conventions in one response.
+    """
+    extent = float(extent)
+    tolerance = max(2.0, extent * 0.008)
+    entries = []
+    for index, obj in enumerate(objects or []):
+        vals = _valid_vlm_bbox_values(obj.get("bbox_xyxy") or obj.get("bbox") or [])
+        if vals is None:
+            continue
+        lo, hi = (vals[0], vals[2]) if axis == "x" else (vals[1], vals[3])
+        entries.append({
+            "index": int(index),
+            "lo": float(min(lo, hi)),
+            "hi": float(max(lo, hi)),
+            "label": str(obj.get("label") or "").lower(),
+            "role": str(obj.get("role") or "").lower(),
+        })
+    # When an axis is close to 1000 pixels (for example 1080), the two
+    # hypotheses differ by too little for role priors to justify rescaling.
+    # Leave that case to the explicit sent/original contract and the legacy
+    # cross-axis evidence; the production drift cases are materially larger
+    # portrait/wide extents (1280/1708/1920).
+    if not entries or abs(extent - 1000.0) < 120.0:
+        return None
+
+    all_values = [value for entry in entries for value in (entry["lo"], entry["hi"])]
+    boundary_count = sum(abs(value - extent) <= tolerance for value in all_values)
+    internal_values = [value for value in all_values if abs(value - extent) > tolerance]
+    if not boundary_count or not internal_values:
+        return None
+    if min(internal_values) < -20.0 or max(internal_values) > 1024.0:
+        return None
+
+    def transform(value, hypothesis):
+        if abs(float(value) - extent) <= tolerance:
+            return 1.0
+        if hypothesis == "grid_boundary":
+            return float(value) / 1000.0
+        return float(value) / extent
+
+    def proximity(value, target, radius):
+        return max(0.0, 1.0 - abs(float(value) - float(target)) / max(1e-6, float(radius)))
+
+    scores = {}
+    per_object = {}
+    for hypothesis in ("original", "grid_boundary"):
+        # The request explicitly asks for sent-image pixels, so original pixels
+        # get a modest prior.  Grid coordinates must win on actual scene
+        # consistency rather than merely being numerically <= 1000.
+        score = 1.20 if hypothesis == "original" else 0.0
+        object_debug = []
+        wall_intervals = []
+        for entry in entries:
+            lo = transform(entry["lo"], hypothesis)
+            hi = transform(entry["hi"], hypothesis)
+            contribution = 0.0
+            reasons = []
+            if lo < -0.025 or hi > 1.025 or hi <= lo:
+                contribution -= 12.0
+                reasons.append("out_of_range_or_degenerate")
+            else:
+                contribution += 0.20
+                label = entry["label"]
+                role = entry["role"]
+                span = hi - lo
+                if axis == "x":
+                    if role == "wall" or label.startswith("wall"):
+                        wall_intervals.append((max(0.0, lo), min(1.0, hi)))
+                    if label in {"floor", "roof", "ceiling"}:
+                        contribution += 0.35 * min(1.0, span / 0.55)
+                else:
+                    if label == "floor":
+                        # Floors normally start in the lower half and reach the
+                        # bottom.  This is strong evidence in the exact failure
+                        # mode, but is evaluated per object instead of assumed.
+                        contribution += 1.75 * proximity(lo, 0.64, 0.42)
+                        contribution += 0.75 * proximity(hi, 1.0, 0.18)
+                        reasons.append("floor_vertical_position")
+                    elif label in {"roof", "ceiling"}:
+                        contribution += 0.55 * proximity(lo, 0.0, 0.16)
+                        contribution += 0.55 * proximity(hi, 0.27, 0.30)
+                        reasons.append("ceiling_vertical_position")
+                    elif role == "wall" or label.startswith("wall"):
+                        contribution += 0.90 * proximity(span, 0.46, 0.38)
+                        contribution += 0.55 * proximity(hi, 0.68, 0.48)
+                        if span < 0.15:
+                            contribution -= 0.80
+                            reasons.append("implausibly_short_wall")
+                        reasons.append("wall_vertical_extent")
+            score += contribution
+            object_debug.append({
+                "object_index": entry["index"],
+                "label": entry["label"],
+                "role": entry["role"],
+                "normalized_interval": [float(lo), float(hi)],
+                "score": float(contribution),
+                "reasons": reasons,
+            })
+        if axis == "x" and wall_intervals:
+            wall_intervals.sort()
+            merged = []
+            for lo, hi in wall_intervals:
+                if not merged or lo > merged[-1][1]:
+                    merged.append([lo, hi])
+                else:
+                    merged[-1][1] = max(merged[-1][1], hi)
+            coverage = sum(hi - lo for lo, hi in merged)
+            score += 2.60 * min(1.0, coverage)
+        else:
+            coverage = None
+
+        # A non-sentinel endpoint close to 1000 is direct grid-boundary
+        # evidence.  It is deliberately only one signal; it is not required.
+        near_grid_edge_count = sum(850.0 <= value <= 1024.0 for value in internal_values)
+        if hypothesis == "grid_boundary":
+            # Reaching the internal grid's right/bottom edge is stronger than
+            # the native-pixel prior.  Keep the cap so repeated overlapping
+            # boxes cannot dominate all semantic-shape evidence.
+            score += min(3.0, 1.80 * near_grid_edge_count)
+        scores[hypothesis] = float(score)
+        per_object[hypothesis] = {
+            "objects": object_debug,
+            "wall_union_coverage": None if coverage is None else float(coverage),
+        }
+
+    ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+    winner, winner_score = ranked[0]
+    runner_score = ranked[1][1]
+    margin = float(winner_score - runner_score)
+    # A non-native transform changes geometry materially.  It must clear a
+    # stronger margin; otherwise preserve the explicit pixel contract and mark
+    # the decision ambiguous for diagnostics rather than silently rescaling.
+    min_margin = 0.85 if winner == "grid_boundary" else 0.45
+    accepted = bool(margin >= min_margin)
+    selected = winner if accepted else "original"
+    return {
+        "axis": axis,
+        "selected": selected,
+        "winner": winner,
+        "accepted": accepted,
+        "ambiguous": not accepted,
+        "score_margin": margin,
+        "scores": scores,
+        "per_object_scores": per_object,
+        "boundary_sentinel_count": int(boundary_count),
+        "internal_min": float(min(internal_values)),
+        "internal_max": float(max(internal_values)),
+        "boundary_tolerance": float(tolerance),
+        "policy": "per_object_per_axis_multi_hypothesis_v3",
+    }
+
 def _infer_vlm_bbox_coordinate_space(objects, original_w, original_h, vlm_image_meta: Optional[Dict[str, Any]] = None):
     """Infer whether VLM boxes are original pixels, sent-image pixels, or normalized coordinates.
 
@@ -379,6 +546,68 @@ def _infer_vlm_bbox_coordinate_space(objects, original_w, original_h, vlm_image_
             'scale_y_to_original': float(original_h),
         })
         return 'normalized_0_1', debug
+
+    # Evaluate the known mixed-sentinel failure family before the legacy
+    # max-coordinate heuristics below.  A global maximum cannot identify a
+    # coordinate system when the maximum itself may be an original-image edge
+    # sentinel.  Each axis therefore chooses between original pixels and a
+    # 0..1000 grid independently, based on transformed per-object evidence.
+    x_dynamic = _score_boundary_mixed_axis_hypotheses(objects, "x", original_w)
+    y_dynamic = _score_boundary_mixed_axis_hypotheses(objects, "y", original_h)
+    if x_dynamic is not None or y_dynamic is not None:
+        x_axis = (x_dynamic or {}).get("selected", "original")
+        y_axis = (y_dynamic or {}).get("selected", "original")
+        unresolved_grid_ambiguity = any(
+            item is not None
+            and item.get("winner") == "grid_boundary"
+            and not item.get("accepted")
+            for item in (x_dynamic, y_dynamic)
+        )
+        dynamic_debug = {
+            "policy": "per_object_per_axis_multi_hypothesis_v3",
+            "x": x_dynamic,
+            "y": y_dynamic,
+            "fail_closed": bool(unresolved_grid_ambiguity),
+            "fail_closed_reason": "nonnative_grid_transform_has_insufficient_score_margin" if unresolved_grid_ambiguity else None,
+        }
+        debug["dynamic_axis_coordinate_inference"] = dynamic_debug
+        if x_axis == "grid_boundary" and y_axis == "grid_boundary":
+            debug.update({
+                "source_coordinate_space": "normalized_0_1000_with_original_boundary_sentinels",
+                "reason": "dynamic_per_axis_scores_select_1000_grid_with_original_edge_sentinels",
+                "scale_x_to_original": float(original_w) / 1000.0,
+                "scale_y_to_original": float(original_h) / 1000.0,
+                "preserve_original_boundary_sentinels": True,
+            })
+            return "normalized_0_1000_with_original_boundary_sentinels", debug
+        if x_axis == "grid_boundary" and y_axis == "original":
+            debug.update({
+                "source_coordinate_space": "mixed_x_1000_boundary_y_original",
+                "reason": "dynamic_per_axis_scores_select_x_grid_boundary_y_original",
+                "scale_x_to_original": float(original_w) / 1000.0,
+                "scale_y_to_original": 1.0,
+                "preserve_original_boundary_sentinels": True,
+            })
+            return "mixed_x_1000_boundary_y_original", debug
+        if x_axis == "original" and y_axis == "grid_boundary":
+            debug.update({
+                "source_coordinate_space": "mixed_x_original_y_1000_boundary",
+                "reason": "dynamic_per_axis_scores_select_x_original_y_grid_boundary",
+                "scale_x_to_original": 1.0,
+                "scale_y_to_original": float(original_h) / 1000.0,
+                "preserve_original_boundary_sentinels": True,
+            })
+            return "mixed_x_original_y_1000_boundary", debug
+        # Both axes selected the explicit pixel contract.  Returning here is
+        # intentional: letting the legacy global-max rule reconsider the same
+        # sentinel evidence would reintroduce the production drift.
+        debug.update({
+            "source_coordinate_space": "original_pixels",
+            "reason": "dynamic_per_axis_scores_preserve_explicit_original_pixel_contract",
+            "scale_x_to_original": 1.0,
+            "scale_y_to_original": 1.0,
+        })
+        return "original_pixels", debug
 
     normalized_1000_like = (min_x >= -20.0 and min_y >= -20.0 and max_x <= 1024.0 and max_y <= 1024.0 and max_coord >= 10.0)
     y_exceeds_original = max_y > float(original_h) * 1.03 and original_h < 980
@@ -622,6 +851,20 @@ def _normalize_vlm_bbox_to_original_pixels(bbox, original_w, original_h, coordin
         box = [x1 / 1000.0 * float(original_w), y1, x2 / 1000.0 * float(original_w), y2]
     elif coordinate_space == 'mixed_x_original_y_1000':
         box = [x1, y1 / 1000.0 * float(original_h), x2, y2 / 1000.0 * float(original_h)]
+    elif coordinate_space == 'mixed_x_1000_boundary_y_original':
+        def _x_grid_or_boundary(value):
+            tolerance = max(2.0, float(original_w) * 0.008)
+            if abs(float(value) - float(original_w)) <= tolerance:
+                return float(original_w)
+            return float(value) / 1000.0 * float(original_w)
+        box = [_x_grid_or_boundary(x1), y1, _x_grid_or_boundary(x2), y2]
+    elif coordinate_space == 'mixed_x_original_y_1000_boundary':
+        def _y_grid_or_boundary(value):
+            tolerance = max(2.0, float(original_h) * 0.008)
+            if abs(float(value) - float(original_h)) <= tolerance:
+                return float(original_h)
+            return float(value) / 1000.0 * float(original_h)
+        box = [x1, _y_grid_or_boundary(y1), x2, _y_grid_or_boundary(y2)]
     elif coordinate_space == 'sent_image_pixels':
         vlm_image_meta = vlm_image_meta or {}
         sent_size = vlm_image_meta.get("sent_size") if isinstance(vlm_image_meta, dict) else None
@@ -1688,7 +1931,26 @@ async def parse_semantics_mvp(
         raw = parse_with_vlm(image_bytes, scene_profile, vlm_mode, original_w, original_h)
         objs = raw.get("objects", [])
         vlm_image_meta = raw.get("_vlm_image_meta") if isinstance(raw, dict) else None
-        bbox_coordinate_space, bbox_coordinate_debug = _infer_vlm_bbox_coordinate_space(objs, original_w, original_h, vlm_image_meta)
+        coordinate_inference_meta = dict(vlm_image_meta or {})
+        # The prompt now asks the provider to echo the coordinate canvas.  Keep
+        # it as audit evidence, but never trust it as the sole transform source:
+        # the production drift happened despite a nominal "pixels" response.
+        coordinate_inference_meta["provider_reported_coordinate_space"] = raw.get("coordinate_space")
+        coordinate_inference_meta["provider_reported_image_size_px"] = raw.get("image_size_px")
+        bbox_coordinate_space, bbox_coordinate_debug = _infer_vlm_bbox_coordinate_space(
+            objs, original_w, original_h, coordinate_inference_meta
+        )
+        dynamic_axis_debug = bbox_coordinate_debug.get("dynamic_axis_coordinate_inference") or {}
+        if dynamic_axis_debug.get("fail_closed"):
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "ambiguous_vlm_bbox_coordinate_space",
+                    "reason": dynamic_axis_debug.get("fail_closed_reason"),
+                    "coordinate_debug": bbox_coordinate_debug,
+                    "repair_hint": "rerun semantic parsing with exact image_size_px/pixel coordinates; do not reuse ambiguous boxes",
+                },
+            )
         original_space_objects = _build_vlm_objects_in_original_space(raw, original_w, original_h, bbox_coordinate_space, vlm_image_meta)
 
         # Optional SAM now runs only in original-image space. This lets callers

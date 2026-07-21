@@ -65,7 +65,7 @@ except Exception:  # pragma: no cover - causal layer is optional at runtime
 API_KEY = os.getenv("API_KEY", "")
 ALLOW_UNAUTH_LOCAL = os.getenv("ALLOW_UNAUTH_LOCAL", "").strip().lower() in {"1", "true", "yes", "on"}
 PORT = int(os.getenv("HANGING_MVP_PORT", "6010"))
-HANGING_PIPELINE_BUILD_ID = "2026-07-21-depth-yaw-preserving-structure-gate-v11"
+HANGING_PIPELINE_BUILD_ID = "2026-07-21-dynamic-bbox-axis-coordinate-guard-v12"
 
 
 def _truthy_env(name: str, default: str = "0") -> bool:
@@ -4028,7 +4028,7 @@ async def analyze_hanging_mvp(
             "height_contract": "metric_height_authoritative_exact_footprint_v3",
             "support_contract": "recognized_support_label_specific_clearance_v5",
             "gravity_contract": "multi_reference_camera_coordinate_consensus_v3",
-            "semantic_coordinate_contract": "internal_1000_grid_with_original_boundary_sentinels_v2",
+            "semantic_coordinate_contract": "per_object_per_axis_multi_hypothesis_with_boundary_sentinels_v3",
             "projection_contract": "project_3d_wall_corners_once_no_2d_rectification_v4",
             "metric3d_orientation_contract": "depth_yaw_preserved_direct_normal_validation_structure_vanishing_gate_v2",
             "wall_fragment_contract": "trusted_sam_component_lineage_and_fail_closed_material_review_v1",

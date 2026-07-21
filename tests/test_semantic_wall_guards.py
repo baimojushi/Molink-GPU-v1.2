@@ -139,6 +139,50 @@ def test_regression_83f8bf2e_internal_1000_grid_with_original_edge_sentinels():
     floor = _normalize_vlm_bbox_to_original_pixels([0, 620, 1280, 1708], 1280, 1708, mode)
     assert all(abs(a - b) < 1e-6 for a, b in zip(floor, [0.0, 1058.96, 1279.0, 1707.0]))
 
+
+def test_regression_mixed_original_x_and_low_extent_grid_y_with_bottom_sentinel():
+    # Production regression: x is already in 1280-pixel space, while ordinary
+    # y values use a 0..1000 grid and only bottom-touching boxes emit y2=1708.
+    # The old fixed internal_max>=850 test missed this because internal y stops
+    # near 650, compressing all semantic boxes into the upper image region.
+    objects = [
+        {"label": "wall_left", "role": "wall", "bbox_xyxy": [0, 220, 430, 640]},
+        {"label": "wall_front", "role": "wall", "bbox_xyxy": [430, 257, 770, 487]},
+        {"label": "wall_right", "role": "wall", "bbox_xyxy": [770, 210, 1280, 650]},
+        {"label": "window", "role": "forbidden", "bbox_xyxy": [820, 205, 1280, 690]},
+        {"label": "floor", "role": "support", "bbox_xyxy": [0, 620, 1280, 1708]},
+        {"label": "roof", "role": "support", "bbox_xyxy": [0, 0, 1280, 280]},
+    ]
+
+    mode, debug = _infer_vlm_bbox_coordinate_space(objects, 1280, 1708)
+
+    assert mode == "mixed_x_original_y_1000_boundary"
+    dynamic = debug["dynamic_axis_coordinate_inference"]
+    assert dynamic["x"]["selected"] == "original"
+    assert dynamic["y"]["selected"] == "grid_boundary"
+    assert dynamic["y"]["internal_max"] < 850
+    front = _normalize_vlm_bbox_to_original_pixels([430, 257, 770, 487], 1280, 1708, mode)
+    assert all(abs(a - b) < 1e-6 for a, b in zip(front, [430.0, 438.956, 770.0, 831.796]))
+    floor = _normalize_vlm_bbox_to_original_pixels([0, 620, 1280, 1708], 1280, 1708, mode)
+    assert all(abs(a - b) < 1e-6 for a, b in zip(floor, [0.0, 1058.96, 1279.0, 1707.0]))
+
+
+def test_dynamic_axis_scoring_does_not_rescale_true_original_pixel_boxes():
+    objects = [
+        {"label": "wall_left", "role": "wall", "bbox_xyxy": [0, 280, 430, 1120]},
+        {"label": "wall_front", "role": "wall", "bbox_xyxy": [430, 300, 770, 1050]},
+        {"label": "wall_right", "role": "wall", "bbox_xyxy": [770, 260, 1280, 1110]},
+        {"label": "floor", "role": "support", "bbox_xyxy": [0, 1040, 1280, 1708]},
+        {"label": "roof", "role": "support", "bbox_xyxy": [0, 0, 1280, 330]},
+    ]
+
+    mode, debug = _infer_vlm_bbox_coordinate_space(objects, 1280, 1708)
+
+    assert mode == "original_pixels"
+    assert debug["dynamic_axis_coordinate_inference"]["x"]["selected"] == "original"
+    # y has values >1024, so it is not eligible for the grid-sentinel family.
+    assert debug["dynamic_axis_coordinate_inference"]["y"] is None
+
 from semantic_mvp.service import _canonical_label_and_role, _build_object_inventory
 
 
