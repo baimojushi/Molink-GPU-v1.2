@@ -657,11 +657,21 @@ class Worker:
 
                 await self.progress(ws, job, "semantic", "running", 35, "正在识别墙面与结构信息…")
                 scene_profile = (job.get("rules_overrides") or {}).get("scene_profile", "home")
-                semantics = await asyncio.to_thread(
-                    pipeline.call_semantic,
-                    inputs["room"], metric_zip, inputs["artwork"], scene_profile, work_dir,
-                    styling_masks_requested=bool(soft_furnishing or wallpaper_recolor),
-                )
+                semantics = None
+                try:
+                    semantics = await asyncio.to_thread(
+                        pipeline.call_semantic,
+                        inputs["room"], metric_zip, inputs["artwork"], scene_profile, work_dir,
+                        styling_masks_requested=bool(soft_furnishing or wallpaper_recolor),
+                    )
+                except Exception as sem_exc:
+                    _422_diag = work_dir / "semantic_422_response.json"
+                    if _422_diag.exists():
+                        try:
+                            diag.write_text("03_semantic/semantic_422_response.json", _422_diag.read_text(encoding="utf-8"))
+                        except Exception:
+                            pass
+                    raise
                 diag_later(diag.copy_file, semantics, "03_semantic/semantics.json")
                 _422_diag = work_dir / "semantic_422_response.json"
                 if _422_diag.exists():
