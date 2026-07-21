@@ -17,7 +17,7 @@ from .metric_meta import read_sizes_from_metric3d_zip
 from .polygonize import bbox_to_polygon, scale_bbox, scale_polygon
 from .vlm_client import parse_with_vlm, parse_artwork_frame_with_vlm
 from .debug_assets import draw_semantic_wall_debug, png_bytes
-from .sam_refiner import coerce_optional_bool, get_sam_runtime_status, refine_objects_with_sam
+from .sam_refiner import coerce_optional_bool, get_sam_runtime_status, mask_to_polygon, refine_objects_with_sam
 
 API_KEY = os.getenv("API_KEY", "")
 ALLOW_UNAUTH_LOCAL = os.getenv("ALLOW_UNAUTH_LOCAL", "").strip().lower() in {"1", "true", "yes", "on"}
@@ -754,15 +754,80 @@ def _wall_x_coverage_ratio(walls, processed_w):
     total = sum(x2 - x1 for x1, x2 in merged)
     return float(total / max(1.0, float(processed_w))), merged
 
-def _sanitize_wall_bboxes_against_edge_structures(objects, processed_w, processed_h, sx, sy):
-    """Trim wall rectangles when a door/window/opening occupies a wall edge.
+def _semantic_object_mask(obj, processed_w, processed_h):
+    """Rasterize semantic evidence without manufacturing a new bbox polygon."""
+    mask = np.zeros((processed_h, processed_w), np.uint8)
+    poly = obj.get('polygon') or obj.get('points') or []
+    points = []
+    if isinstance(poly, (list, tuple)):
+        for point in poly:
+            if not isinstance(point, (list, tuple)) or len(point) < 2:
+                continue
+            try:
+                x = max(0.0, min(float(processed_w - 1), float(point[0])))
+                y = max(0.0, min(float(processed_h - 1), float(point[1])))
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(x) and np.isfinite(y):
+                points.append([int(round(x)), int(round(y))])
+    if len(points) >= 3:
+        cv2.fillPoly(mask, [np.asarray(points, dtype=np.int32)], 255)
+        if int(np.count_nonzero(mask)) > 0:
+            return mask, 'polygon'
+    box = obj.get('bbox_xyxy_processed') or obj.get('bbox_xyxy') or []
+    if len(box) == 4:
+        x1, y1, x2, y2 = _clip_box_xyxy(box, processed_w, processed_h)
+        cv2.rectangle(
+            mask,
+            (int(np.floor(x1)), int(np.floor(y1))),
+            (int(np.ceil(x2)), int(np.ceil(y2))),
+            255,
+            -1,
+        )
+        return mask, 'bbox'
+    return mask, 'empty'
 
-    VLM may return a wall bbox that includes a door panel at the edge. The
-    hanging stage subtracts forbidden masks later, but a rectangle that still
-    names the door as a wall is confusing and can seed bad wall proposals. This
-    conservative trim only adjusts left/right edges when the forbidden object is
-    tall and edge-attached; interior windows/openings are left for fine-grained
-    clearance checks.
+
+def _largest_connected_component(mask):
+    binary = (mask > 0).astype(np.uint8)
+    if int(np.count_nonzero(binary)) == 0:
+        return np.zeros_like(mask), 0
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    if count <= 1:
+        return np.zeros_like(mask), 0
+    component_id = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    component = (labels == component_id).astype(np.uint8) * 255
+    return component, int(stats[component_id, cv2.CC_STAT_AREA])
+
+
+def _mask_bbox_xyxy(mask):
+    ys, xs = np.where(mask > 0)
+    if xs.size == 0:
+        return None
+    return [float(xs.min()), float(ys.min()), float(xs.max() + 1), float(ys.max() + 1)]
+
+
+def _trusted_sam_wall_evidence(obj, mask_source):
+    sam = obj.get('sam') if isinstance(obj.get('sam'), dict) else {}
+    semantic_source = str(obj.get('source') or '').lower()
+    return bool(
+        mask_source == 'polygon'
+        and sam.get('enabled') is True
+        and not sam.get('fallback_to_bbox')
+        and 'sam_polygon' in semantic_source
+    )
+
+
+def _sanitize_wall_bboxes_against_edge_structures(objects, processed_w, processed_h, sx, sy):
+    """Subtract edge structures from trusted SAM wall evidence.
+
+    A previous bbox trim rebuilt a rectangular wall polygon after subtracting a
+    window.  When a window occupied most of a VLM wall box, the small strip left
+    beside it was often curtain fabric and became a self-validating pseudo-wall.
+    This implementation never creates wall evidence from the residual bbox.  It
+    computes ``SAM wall mask - dilated forbidden mask``, keeps the largest real
+    connected component, records its lineage, and fails closed when the source
+    wall has no trusted SAM mask or the remainder is a high-coverage fragment.
     """
     structural_labels = {'opening', 'arch', 'door', 'window', 'tv', 'mirror', 'lamp', 'track_lighting', 'curtain', 'drape', 'blind'}
     structures = [o for o in objects if str(o.get('label')) in structural_labels or o.get('role') == 'forbidden']
@@ -781,7 +846,11 @@ def _sanitize_wall_bboxes_against_edge_structures(objects, processed_w, processe
         wall_w = max(1.0, wx2 - wx1)
         wall_h = max(1.0, wy2 - wy1)
         min_keep_w = max(55.0, processed_w * 0.045)
+        wall_mask, wall_mask_source = _semantic_object_mask(obj, processed_w, processed_h)
+        wall_area = int(np.count_nonzero(wall_mask))
+        trusted_sam_wall = _trusted_sam_wall_evidence(obj, wall_mask_source)
         changed_by = []
+        forbidden_union = np.zeros((processed_h, processed_w), np.uint8)
         for st in structures:
             sb = st.get('bbox_xyxy_processed') or st.get('bbox_xyxy') or []
             if len(sb) != 4:
@@ -800,53 +869,119 @@ def _sanitize_wall_bboxes_against_edge_structures(objects, processed_w, processe
             # wall area around small interior decorations.
             if inter_h_ratio < 0.55 or struct_inside_ratio < 0.30 or inter_w_ratio < 0.04:
                 continue
-            margin = 2.0
             center_x = 0.5 * (sx1 + sx2)
             touches_left_edge = ix1 <= wx1 + wall_w * 0.08
             touches_right_edge = ix2 >= wx2 - wall_w * 0.08
-            if touches_right_edge or center_x > wx1 + wall_w * 0.62:
-                new_wx2 = min(wx2, sx1 - margin)
-                if new_wx2 - wx1 >= min_keep_w:
-                    wx2 = new_wx2
-                    changed_by.append({
-                        'object_id': st.get('object_id'),
-                        'label': st.get('label'),
-                        'trim': 'right_edge_to_structure_left',
-                        'structure_box': [sx1, sy1, sx2, sy2],
-                    })
-            elif touches_left_edge or center_x < wx1 + wall_w * 0.38:
-                new_wx1 = max(wx1, sx2 + margin)
-                if wx2 - new_wx1 >= min_keep_w:
-                    wx1 = new_wx1
-                    changed_by.append({
-                        'object_id': st.get('object_id'),
-                        'label': st.get('label'),
-                        'trim': 'left_edge_to_structure_right',
-                        'structure_box': [sx1, sy1, sx2, sy2],
-                    })
+            edge_attached = bool(
+                touches_left_edge
+                or touches_right_edge
+                or center_x > wx1 + wall_w * 0.62
+                or center_x < wx1 + wall_w * 0.38
+            )
+            if not edge_attached:
+                continue
+            structure_mask, structure_mask_source = _semantic_object_mask(st, processed_w, processed_h)
+            overlap_px = int(np.count_nonzero((wall_mask > 0) & (structure_mask > 0)))
+            if overlap_px <= 0:
+                continue
+            forbidden_union = cv2.bitwise_or(forbidden_union, structure_mask)
+            changed_by.append({
+                'object_id': st.get('object_id'),
+                'label': st.get('label'),
+                'trim': 'wall_mask_minus_dilated_forbidden_mask',
+                'structure_box': [sx1, sy1, sx2, sy2],
+                'structure_mask_source': structure_mask_source,
+                'wall_overlap_ratio': float(overlap_px) / max(1, wall_area),
+                'vertical_overlap_ratio': float(inter_h_ratio),
+                'horizontal_overlap_ratio': float(inter_w_ratio),
+            })
         if changed_by:
-            obj2 = dict(obj)
-            new_box = [float(wx1), float(wy1), float(wx2), float(wy2)]
-            obj2['bbox_xyxy_processed'] = new_box
-            new_box_original = [float(new_box[0] / sx), float(new_box[1] / sy), float(new_box[2] / sx), float(new_box[3] / sy)] if sx > 0 and sy > 0 else list(new_box)
-            obj2['bbox_xyxy_original'] = new_box_original
-            # The public semantic payload declares coordinate_space=processed
-            # whenever metric3d_zip is present. Keep polygon in processed
-            # coordinates and retain polygon_original separately for any later
-            # seed/debug reuse. A previous version only updated polygon, which
-            # could leave downstream consumers with mixed coordinate spaces after
-            # wall-edge trimming.
-            obj2['polygon'] = bbox_to_polygon(new_box, processed_w, processed_h)
-            obj2['polygon_original'] = bbox_to_polygon(new_box_original, int(max(1, processed_w / sx)) if sx > 0 else processed_w, int(max(1, processed_h / sy)) if sy > 0 else processed_h)
-            obj2['source'] = str(obj2.get('source', 'vlm_bbox_polygon')) + '+edge_structural_trim'
-            obj2['notes'] = (str(obj2.get('notes', '')) + ' | edge structural trim applied: forbidden door/window/opening clipped from wall bbox').strip()
-            out.append(obj2)
-            trims.append({
+            dilate_px = max(1, int(os.getenv('SEMANTIC_WALL_FORBIDDEN_DILATE_PX', '4') or 4))
+            kernel = np.ones((2 * dilate_px + 1, 2 * dilate_px + 1), np.uint8)
+            forbidden_dilated = cv2.dilate(forbidden_union, kernel, iterations=1)
+            residual = wall_mask.copy()
+            residual[forbidden_dilated > 0] = 0
+            component, component_area = _largest_connected_component(residual)
+            retained_ratio = float(component_area) / max(1, wall_area)
+            new_box = _mask_bbox_xyxy(component)
+            union_structure_coverage = float(np.count_nonzero((wall_mask > 0) & (forbidden_union > 0))) / max(1, wall_area)
+            max_structure_coverage = max(
+                union_structure_coverage,
+                max(float(x.get('wall_overlap_ratio', 0.0)) for x in changed_by),
+            )
+            max_vertical_overlap = max(float(x.get('vertical_overlap_ratio', 0.0)) for x in changed_by)
+            fragment_reject = bool(
+                max_structure_coverage >= 0.70
+                and max_vertical_overlap >= 0.80
+                and retained_ratio <= 0.35
+            )
+            reject_reasons = []
+            if not trusted_sam_wall:
+                reject_reasons.append('structural_residual_missing_trusted_sam_wall_lineage')
+            if fragment_reject:
+                reject_reasons.append('high_coverage_opening_left_narrow_wall_fragment')
+            if not new_box or component_area <= 0:
+                reject_reasons.append('structural_subtraction_left_no_wall_component')
+            elif (new_box[2] - new_box[0]) < min_keep_w:
+                reject_reasons.append('structural_subtraction_component_too_narrow')
+            polygon = mask_to_polygon(component, max_points=int(os.getenv('SAM_MAX_POLYGON_POINTS', '96') or 96))
+            if len(polygon) < 3:
+                reject_reasons.append('structural_subtraction_component_polygon_invalid')
+
+            lineage = {
+                'version': 'sam_wall_minus_dilated_forbidden_v1',
+                'structural_subtraction_applied': True,
+                'source_wall_mask_kind': wall_mask_source,
+                'trusted_sam_wall_evidence': bool(trusted_sam_wall),
+                'source_sam_wall_polygon_processed': [
+                    [float(point[0]), float(point[1])]
+                    for point in (obj.get('polygon') or [])
+                    if isinstance(point, (list, tuple)) and len(point) >= 2
+                ],
+                'source_wall_area_px': int(wall_area),
+                'final_component_area_px': int(component_area),
+                'retained_component_ratio': float(retained_ratio),
+                'final_component_source_wall_coverage_ratio': 1.0 if component_area > 0 else 0.0,
+                'forbidden_dilate_px': int(dilate_px),
+                'max_structure_wall_overlap_ratio': float(max_structure_coverage),
+                'union_structure_wall_overlap_ratio': float(union_structure_coverage),
+                'max_structure_vertical_overlap_ratio': float(max_vertical_overlap),
+                'requires_visual_material_review': True,
+                'review_reasons': [
+                    'wall_component_created_by_window_or_opening_mask_subtraction',
+                    *(['structure_covers_large_fraction_of_source_wall'] if max_structure_coverage >= 0.35 else []),
+                ],
+                'gate_status': 'rejected' if reject_reasons else 'review_required',
+                'reject_reasons': reject_reasons,
+                'changed_by': changed_by,
+            }
+            trim_record = {
                 'wall_id': obj.get('object_id'),
                 'old_bbox_xyxy_processed': orig_box,
                 'new_bbox_xyxy_processed': new_box,
                 'changed_by': changed_by,
-            })
+                'wall_mask_lineage': lineage,
+                'status': 'dropped' if reject_reasons else 'retained_review_required',
+            }
+            trims.append(trim_record)
+            if reject_reasons:
+                continue
+
+            obj2 = dict(obj)
+            obj2['bbox_xyxy_processed'] = new_box
+            new_box_original = [float(new_box[0] / sx), float(new_box[1] / sy), float(new_box[2] / sx), float(new_box[3] / sy)] if sx > 0 and sy > 0 else list(new_box)
+            obj2['bbox_xyxy_original'] = new_box_original
+            obj2['polygon'] = polygon
+            obj2['polygon_original'] = [
+                [float(point[0] / sx), float(point[1] / sy)] if sx > 0 and sy > 0 else [float(point[0]), float(point[1])]
+                for point in polygon
+            ]
+            obj2['source'] = str(obj2.get('source', 'vlm_bbox_polygon')) + '+edge_structural_mask_subtract'
+            obj2['notes'] = (str(obj2.get('notes', '')) + ' | trusted SAM wall component retained after dilated forbidden-mask subtraction; visual material review required').strip()
+            obj2['wall_mask_lineage'] = lineage
+            obj2['requires_wall_material_vlm_review'] = True
+            obj2['wall_material_vlm_review_reasons'] = list(lineage['review_reasons'])
+            out.append(obj2)
         else:
             out.append(obj)
     return out, trims
@@ -1105,8 +1240,20 @@ def _semantic_multiwall_postprocess(objects, processed_w, processed_h, sx, sy, m
         debug['edge_structural_trim'] = trim_debug
     wall_objs = [o for o in objects if _is_wall_obj(o)]
 
+    dropped_structural_fragments = [item for item in trim_debug if item.get('status') == 'dropped']
+    if dropped_structural_fragments:
+        debug['dropped_structural_wall_fragments'] = dropped_structural_fragments
+        debug['geometry_augmentation_suppressed'] = True
+        debug['geometry_augmentation_suppressed_reason'] = 'do_not_recreate_rejected_window_or_opening_residual_as_geometry_wall'
+
     needs_augment, coverage_debug = _should_augment_wall_set(wall_objs, objects, processed_w)
     debug['semantic_wall_coverage_debug'] = coverage_debug
+
+    if dropped_structural_fragments:
+        debug['after_wall_count'] = len(wall_objs)
+        debug['used'] = True
+        debug['reason'] = 'structural_wall_fragment_rejected_fail_closed'
+        return objects, debug
 
     if needs_augment or not wall_objs:
         geometry_walls, geometry_debug = _geometry_wall_candidates_full_scene(objects, processed_w, processed_h, sx, sy, metric_zip_bytes)

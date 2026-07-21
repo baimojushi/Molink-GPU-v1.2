@@ -464,18 +464,33 @@ def build_client_result(
     artwork_w_m: float = 0.0,
     artwork_h_m: float = 0.0,
 ) -> Dict[str, Any]:
-    selected = ranked_candidates[0] if ranked_candidates else None
+    final_manifest_items = plan.get("final_hardpaste_assets")
+    if isinstance(final_manifest_items, list):
+        approved_by_key = {
+            (str(candidate.get("wall_id") or ""), str(candidate.get("candidate_id") or "")): candidate
+            for candidate in ranked_candidates
+            if bool(candidate.get("approved_for_flux_render"))
+        }
+        public_candidates = []
+        for item in final_manifest_items:
+            key = (str(item.get("wall_id") or ""), str(item.get("candidate_id") or ""))
+            candidate = approved_by_key.get(key)
+            if candidate is not None and candidate not in public_candidates:
+                public_candidates.append(candidate)
+    else:
+        # Compatibility for callers that predate the exit-review manifest.
+        public_candidates = list(ranked_candidates)
     image_space = plan.get("image_space") if isinstance(plan.get("image_space"), dict) else {}
     original_size = image_space.get("original_size")
     plans = [
         _candidate_to_plan(c, i + 1, base_asset_prefix=base_asset_prefix,
                            artwork_w_m=artwork_w_m, artwork_h_m=artwork_h_m,
                            original_size=original_size)
-        for i, c in enumerate(ranked_candidates)
+        for i, c in enumerate(public_candidates)
     ]
 
     rejected_grouped = _group_rejected(rejected_candidates)
-    passed_wall_ids = {str(c.get("wall_id", "")) for c in ranked_candidates or [] if c.get("wall_id")}
+    passed_wall_ids = {str(c.get("wall_id", "")) for c in public_candidates if c.get("wall_id")}
     not_recommended = []
     for wall_id, items in rejected_grouped.items():
         if str(wall_id) in passed_wall_ids:
@@ -525,6 +540,7 @@ def build_client_result(
         "status": plan.get("status"),
         "exit_code": plan.get("exit_code"),
         "pipeline_build": plan.get("pipeline_build"),
+        "public_candidate_policy": "final_manifest_approved_for_flux_render_only" if isinstance(final_manifest_items, list) else "legacy_ranked_candidates",
         "best_plan": plans[0] if plans else None,
         "alternative_plans": plans[1:],
         "not_recommended": not_recommended,

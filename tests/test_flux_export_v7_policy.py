@@ -5,7 +5,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from hanging_mvp.flux_export import build_render_prompt, select_flux_manifest_items
+from hanging_mvp.flux_export import (
+    build_render_prompt,
+    select_flux_manifest_items,
+    select_public_candidate_after_exit_gate,
+)
 from hanging_mvp.masks import load_semantic_masks, masks_by_label, masks_by_role
 
 
@@ -32,6 +36,17 @@ def test_select_flux_manifest_items_caps_per_wall_and_global():
     assert sum(1 for x in selected if x["wall_id"] == "right") == 2
     assert sum(1 for x in selected if x["wall_id"] == "front") == 2
     assert summary["dropped_count"] == 1
+
+
+def test_public_candidate_never_falls_back_to_unapproved_wall():
+    candidates = [
+        {"candidate_id": "curtain", "wall_id": "left", "score": 0.99, "approved_for_flux_render": False},
+        {"candidate_id": "front", "wall_id": "front", "score": 0.90, "approved_for_flux_render": True},
+    ]
+    final_items = [{"candidate_id": "front", "wall_id": "front", "asset_id": "front_asset"}]
+    selected = select_public_candidate_after_exit_gate(candidates, final_items)
+    assert selected["candidate_id"] == "front"
+    assert select_public_candidate_after_exit_gate(candidates, []) is None
 
 
 

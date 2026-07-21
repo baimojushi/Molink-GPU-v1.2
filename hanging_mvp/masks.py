@@ -291,8 +291,12 @@ def load_semantic_masks(semantics: Dict[str, Any], size_hw: Tuple[int, int]) -> 
             "bbox_xyxy_original": obj.get("bbox_xyxy_original"),
             "mask_source": mask_source,
             "mask_debug": mask_debug,
+            "source": obj.get("source"),
             "semantic_source": obj.get("source"),
             "sam": obj.get("sam") if isinstance(obj.get("sam"), dict) else None,
+            "wall_mask_lineage": obj.get("wall_mask_lineage") if isinstance(obj.get("wall_mask_lineage"), dict) else None,
+            "requires_wall_material_vlm_review": bool(obj.get("requires_wall_material_vlm_review", False)),
+            "wall_material_vlm_review_reasons": list(obj.get("wall_material_vlm_review_reasons") or []),
         }
         if mask_debug.get("warnings"):
             record["warnings"] = list(mask_debug.get("warnings") or [])

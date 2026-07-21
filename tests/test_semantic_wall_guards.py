@@ -19,6 +19,8 @@ def test_edge_door_is_trimmed_from_wall_bbox_without_metric_zip():
             "bbox_xyxy_processed": [0, 0, 320, 700],
             "bbox_xyxy_original": [0, 0, 320, 700],
             "polygon": [[0, 0], [320, 0], [320, 700], [0, 700]],
+            "source": "vlm_bbox_sam_polygon",
+            "sam": {"enabled": True, "fallback_to_bbox": False},
         },
         {
             "object_id": "door_01",
@@ -40,6 +42,10 @@ def test_edge_door_is_trimmed_from_wall_bbox_without_metric_zip():
     out, debug = _semantic_multiwall_postprocess(objects, 1000, 700, 1.0, 1.0, b"")
     left = next(o for o in out if o["object_id"] == "wall_left_01")
     assert left["bbox_xyxy_processed"][2] < 230
+    assert left["source"].endswith("+edge_structural_mask_subtract")
+    assert left["wall_mask_lineage"]["trusted_sam_wall_evidence"] is True
+    assert left["wall_mask_lineage"]["gate_status"] == "review_required"
+    assert left["requires_wall_material_vlm_review"] is True
     assert debug.get("edge_structural_trim")
 
 

@@ -39,11 +39,12 @@ from .response_assets import _png_bytes, _draw_overlay, _zip_response
 from .exit_review import review_hardpaste_exit
 from .flux_export import (
     build_flux2_edit_mask, build_remove_mask_for_hardpaste, build_render_prompt, resize_mask_to_original,
-    safe_asset_id, select_flux_manifest_items,
+    safe_asset_id, select_flux_manifest_items, select_public_candidate_after_exit_gate,
 )
 from .candidate_safety import (
     choose_flux2_input_policy, compute_edge_corner_support_debug,
-    evaluate_wall_support_gate, semantic_axis_policy,
+    evaluate_wall_mask_lineage, evaluate_wall_support_gate,
+    geometry_gate_review_reasons, semantic_axis_policy,
 )
 from .height_fit_contract import (
     evaluate_semantic_clear_rect_vertical_fit,
@@ -64,7 +65,7 @@ except Exception:  # pragma: no cover - causal layer is optional at runtime
 API_KEY = os.getenv("API_KEY", "")
 ALLOW_UNAUTH_LOCAL = os.getenv("ALLOW_UNAUTH_LOCAL", "").strip().lower() in {"1", "true", "yes", "on"}
 PORT = int(os.getenv("HANGING_MVP_PORT", "6010"))
-HANGING_PIPELINE_BUILD_ID = "2026-07-20-oblique-perspective-curtain-guard-v8"
+HANGING_PIPELINE_BUILD_ID = "2026-07-21-structural-fragment-lineage-guard-v9"
 
 
 def _truthy_env(name: str, default: str = "0") -> bool:
@@ -1859,6 +1860,17 @@ async def analyze_hanging_mvp(
         wall_id = wall_obj["object_id"]
         wall_object_registry[wall_id] = wall_obj
         wall_debug_registry.setdefault(wall_id, {"wall_id": wall_id, "wall_source": wall_obj.get("source"), "wall_mask": wall_obj.get("mask").copy(), "summary": {}})
+        wall_lineage_gate = evaluate_wall_mask_lineage(wall_obj)
+        wall_debug_registry[wall_id]["summary"]["wall_mask_lineage_gate"] = wall_lineage_gate
+        if not wall_lineage_gate.get("passed", False):
+            rejected.append({
+                "wall_id": wall_id,
+                "reason": "structural_wall_fragment_lineage_rejected",
+                "reject_reasons": list(wall_lineage_gate.get("hard_reasons") or []),
+                "wall_has_no_safe_candidate": True,
+                "wall_mask_lineage_gate": wall_lineage_gate,
+            })
+            continue
         if bool(g_debug.get("gravity_consensus_unresolved")):
             rejected.append({
                 "wall_id": wall_id,
@@ -2997,13 +3009,22 @@ async def analyze_hanging_mvp(
                 candidate_risk_level = "medium"
             else:
                 candidate_risk_level = "low"
-            wall_source_text = str(wall_obj.get("source") or "").lower()
+            wall_source_text = str(wall_obj.get("source") or wall_obj.get("semantic_source") or "").lower()
             geometry_proposed_wall = bool("geometry" in wall_source_text or wall_id.startswith("auto_wall_"))
             projection_requires_review = projection_shape_gate.get("status") == "review"
+            geometry_interval_review_reasons = geometry_gate_review_reasons(
+                wall_support_gate=wall_support_gate,
+                edge_corner_support_debug=edge_corner_support_debug,
+                auto_pass_edge_support_ratio=min_edge_support_ratio,
+                auto_pass_corner_support_ratio=min_corner_support_ratio,
+            )
+            wall_material_requires_review = bool(wall_lineage_gate.get("requires_visual_material_review"))
             requires_hardpaste_vlm_review = bool(
                 (vlm_review_for_high_risk and candidate_risk_level == "high")
                 or geometry_proposed_wall
                 or projection_requires_review
+                or geometry_interval_review_reasons
+                or wall_material_requires_review
             )
             hardpaste_review_reasons = []
             if vlm_review_for_high_risk and candidate_risk_level == "high":
@@ -3012,6 +3033,10 @@ async def analyze_hanging_mvp(
                 hardpaste_review_reasons.append("geometry_proposed_wall_requires_visual_material_validation")
             if projection_requires_review:
                 hardpaste_review_reasons.append("projection_foreshortening_requires_visual_validation")
+            hardpaste_review_reasons.extend(geometry_interval_review_reasons)
+            if wall_material_requires_review:
+                hardpaste_review_reasons.extend(wall_lineage_gate.get("review_reasons") or [])
+            hardpaste_review_reasons = list(dict.fromkeys(str(x) for x in hardpaste_review_reasons if str(x)))
 
             hard = {
                 "passed": not reasons,
@@ -3063,6 +3088,7 @@ async def analyze_hanging_mvp(
                     "hardpaste_vlm_review_reasons": hardpaste_review_reasons,
                     "review_input_asset": f"wall_assets/{wall_id}/hard_paste.png",
                 },
+                "wall_mask_lineage_gate": wall_lineage_gate,
                 "existing_content_overlap_ratio": float(existing_overlap_on_candidate_wall),
                 "existing_content_overlap_ratio_all_walls_raw": float(existing_overlap_all_walls_raw),
                 "existing_content_off_candidate_wall_ratio_ignored": float(max(0.0, existing_overlap_all_walls_raw - existing_overlap_on_candidate_wall)),
@@ -3260,7 +3286,9 @@ async def analyze_hanging_mvp(
                 "soft_risk_reasons": soft_risk_reasons,
                 "risk_level": candidate_risk_level,
                 "requires_hardpaste_vlm_review": requires_hardpaste_vlm_review,
+                "hardpaste_vlm_review_fail_closed": bool(wall_material_requires_review),
                 "hardpaste_vlm_review_reasons": hardpaste_review_reasons,
+                "wall_mask_lineage_gate": wall_lineage_gate,
                 "score": float(quality_score),
                 "causal_light_facts": causal_wall_light.get("light_facts") if isinstance(causal_wall_light, dict) else None,
                 "causal_light_semantics": causal_wall_light.get("semantic_light") if isinstance(causal_wall_light, dict) else None,
@@ -3797,14 +3825,19 @@ async def analyze_hanging_mvp(
             review["approved_for_flux_render"] = False
             review["selection_status"] = "approved_but_dropped_by_manifest_cap_or_nms"
 
+    # The public selected candidate is chosen only after exit review and
+    # manifest policy.  Never fall back from a blocked correct wall to an
+    # unreviewed candidate on another wall merely because it has a geometry
+    # score.  Geometrically passed but unapproved candidates remain available
+    # in ranked/debug outputs only.
+    selected_before_exit_gate = selected
+    selected = select_public_candidate_after_exit_gate(candidates, final_hardpaste_assets)
     selected_requires_hardpaste_vlm_review = bool(selected and selected.get("requires_hardpaste_vlm_review"))
-    selected_exit_code = "OK_SELECTED_VLM_REVIEW_REQUIRED" if selected_requires_hardpaste_vlm_review else "OK_SELECTED"
-    if selected and not final_hardpaste_assets:
-        selected_exit_code = "OK_NO_FLUX_APPROVED_HARDPASTE_PENDING_REVIEW"
+    selected_exit_code = "OK_SELECTED_VLM_REVIEWED" if selected_requires_hardpaste_vlm_review else "OK_SELECTED"
 
     plan = {
         "status": "ok" if selected else "partial",
-        "exit_code": selected_exit_code if selected else ("PARTIAL_REVIEW_CANDIDATES_ONLY" if near_miss_candidates else "PARTIAL_ALL_REJECTED_WITH_REASONS"),
+        "exit_code": selected_exit_code if selected else ("PARTIAL_NO_FLUX_APPROVED_CANDIDATE" if candidates else ("PARTIAL_REVIEW_CANDIDATES_ONLY" if near_miss_candidates else "PARTIAL_ALL_REJECTED_WITH_REASONS")),
         "pipeline_build": {
             "build_id": HANGING_PIPELINE_BUILD_ID,
             "height_contract": "metric_height_authoritative_exact_footprint_v3",
@@ -3812,10 +3845,12 @@ async def analyze_hanging_mvp(
             "gravity_contract": "multi_reference_camera_coordinate_consensus_v3",
             "semantic_coordinate_contract": "internal_1000_grid_with_original_boundary_sentinels_v2",
             "projection_contract": "ordered_edge_aspect_and_nonrigid_surface_guard_v2",
+            "wall_fragment_contract": "trusted_sam_component_lineage_and_fail_closed_material_review_v1",
             "render_contract": "fullspace_identity_locked_shadow_v2",
             "worker_result_contract": "render_review_is_completed_review_v1",
         },
         "requires_hardpaste_vlm_review": selected_requires_hardpaste_vlm_review,
+        "selected_candidate_policy": "approved_for_flux_render_only_after_exit_review_and_manifest_selection",
         "image_space": {
             "processed_size": [w, h],
             "original_size": [bundle.original_size[0], bundle.original_size[1]],
@@ -3852,6 +3887,7 @@ async def analyze_hanging_mvp(
                 "details": g_debug,
             },
             "rejected_candidates": rejected,
+            "selected_before_exit_gate_candidate_id": selected_before_exit_gate.get("candidate_id") if selected_before_exit_gate else None,
             "near_miss_candidates": near_miss_candidates,
             "auto_multiwall_debug": auto_multiwall_debug,
             "debug_assets": {

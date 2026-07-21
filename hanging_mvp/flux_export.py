@@ -561,3 +561,21 @@ def select_flux_manifest_items(
         summary["selected_by_wall"].setdefault(str(item.get("wall_id") or "unknown_wall"), 0)
         summary["selected_by_wall"][str(item.get("wall_id") or "unknown_wall")] += 1
     return [dict(x) for x in final], summary
+
+
+def select_public_candidate_after_exit_gate(
+    candidates: Sequence[Mapping[str, Any]],
+    final_manifest_items: Sequence[Mapping[str, Any]],
+) -> dict[str, Any] | None:
+    """Resolve the public winner strictly from final approved manifest items."""
+    for item in final_manifest_items:
+        candidate_id = str(item.get("candidate_id") or "")
+        wall_id = str(item.get("wall_id") or "")
+        for raw in candidates:
+            if (
+                str(raw.get("candidate_id") or "") == candidate_id
+                and str(raw.get("wall_id") or "") == wall_id
+                and bool(raw.get("approved_for_flux_render"))
+            ):
+                return dict(raw)
+    return None

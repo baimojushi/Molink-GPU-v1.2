@@ -153,6 +153,88 @@ def compute_edge_corner_support_debug(
     }
 
 
+def evaluate_wall_mask_lineage(wall: Mapping[str, Any]) -> dict[str, Any]:
+    """Fail closed when a structural wall fragment is not backed by SAM.
+
+    Ordinary semantic walls do not need lineage metadata.  Once a window,
+    opening, door, or other forbidden edge structure has been subtracted,
+    however, the remaining component must be a subset of trusted SAM wall
+    evidence.  A bbox-created residual is not allowed to prove itself is wall.
+    """
+    lineage = wall.get("wall_mask_lineage") if isinstance(wall.get("wall_mask_lineage"), Mapping) else {}
+    structural_subtraction = bool(lineage.get("structural_subtraction_applied"))
+    if not structural_subtraction:
+        return {
+            "status": "not_applicable",
+            "passed": True,
+            "requires_visual_material_review": False,
+            "hard_reasons": [],
+            "review_reasons": [],
+        }
+
+    hard_reasons: list[str] = []
+    if not bool(lineage.get("trusted_sam_wall_evidence")):
+        hard_reasons.append("structural_wall_fragment_missing_trusted_sam_lineage")
+    source_coverage = None
+    final_mask = wall.get("mask")
+    source_polygon = lineage.get("source_sam_wall_polygon_processed")
+    if isinstance(final_mask, np.ndarray) and final_mask.ndim >= 2 and isinstance(source_polygon, (list, tuple)):
+        points = []
+        for point in source_polygon:
+            if not isinstance(point, (list, tuple)) or len(point) < 2:
+                continue
+            try:
+                points.append([int(round(float(point[0]))), int(round(float(point[1])))])
+            except (TypeError, ValueError):
+                continue
+        if len(points) >= 3:
+            source_mask = np.zeros(final_mask.shape[:2], np.uint8)
+            cv2.fillPoly(source_mask, [np.asarray(points, dtype=np.int32)], 255)
+            final_bool = final_mask > 0
+            final_px = int(np.count_nonzero(final_bool))
+            if final_px > 0:
+                source_coverage = float(np.count_nonzero(final_bool & (source_mask > 0))) / final_px
+    if source_coverage is None:
+        hard_reasons.append("structural_wall_fragment_lineage_mask_evidence_unavailable")
+        source_coverage = float(lineage.get("final_component_source_wall_coverage_ratio", 0.0) or 0.0)
+    if source_coverage < 0.98:
+        hard_reasons.append("structural_wall_fragment_not_covered_by_source_sam_wall")
+    if str(lineage.get("gate_status") or "").lower() == "rejected":
+        hard_reasons.extend(str(x) for x in lineage.get("reject_reasons", []) if str(x))
+
+    review_reasons = list(lineage.get("review_reasons") or [])
+    if not review_reasons:
+        review_reasons.append("structural_wall_fragment_requires_visual_material_validation")
+    return {
+        "status": "hard_reject" if hard_reasons else "review_required",
+        "passed": not hard_reasons,
+        "requires_visual_material_review": not hard_reasons,
+        "hard_reasons": list(dict.fromkeys(hard_reasons)),
+        "review_reasons": list(dict.fromkeys(str(x) for x in review_reasons if str(x))),
+        "computed_final_component_source_wall_coverage_ratio": float(source_coverage),
+        "lineage": dict(lineage),
+    }
+
+
+def geometry_gate_review_reasons(
+    *,
+    wall_support_gate: Mapping[str, Any],
+    edge_corner_support_debug: Mapping[str, Any],
+    auto_pass_edge_support_ratio: float,
+    auto_pass_corner_support_ratio: float,
+) -> list[str]:
+    """Return every geometry interval that requires visual review."""
+    reasons: list[str] = []
+    if str(wall_support_gate.get("status") or "").lower() == "review":
+        reasons.append("safe_wall_support_between_hard_reject_and_auto_pass")
+    if str(edge_corner_support_debug.get("status") or "").lower() == "ok":
+        if float(edge_corner_support_debug.get("min_edge_support_ratio", 0.0) or 0.0) < float(auto_pass_edge_support_ratio):
+            reasons.append("artwork_edge_support_between_hard_reject_and_auto_pass")
+        if float(edge_corner_support_debug.get("min_corner_support_ratio", 0.0) or 0.0) < float(auto_pass_corner_support_ratio):
+            reasons.append("artwork_corner_support_between_hard_reject_and_auto_pass")
+    return reasons
+
+
 def choose_flux2_input_policy(
     *,
     cleanup_labels: list[str] | tuple[str, ...],

@@ -56,6 +56,8 @@ def _call_openai_compatible_review(image_rgb, candidate: Mapping[str, Any]) -> d
             "risk_level": candidate.get("risk_level"),
             "score": candidate.get("score"),
             "soft_risk_reasons": candidate.get("soft_risk_reasons", []),
+            "hardpaste_vlm_review_reasons": candidate.get("hardpaste_vlm_review_reasons", []),
+            "wall_mask_lineage_gate": candidate.get("wall_mask_lineage_gate"),
         },
         "approve_when": [
             "artwork is visibly on a solid wall, not on a door, window, mirror, floor, ceiling, person, opening or major obstruction",
@@ -99,16 +101,18 @@ def review_hardpaste_exit(image_rgb, candidate: Mapping[str, Any], rules: Mappin
     an OpenAI-compatible VLM when configured. Unreviewed high-risk candidates are
     blocked by default so the Flux batch script only sees approved hard-pastes.
     """
-    requires_review = bool(candidate.get("requires_hardpaste_vlm_review"))
+    fail_closed_required = bool(candidate.get("hardpaste_vlm_review_fail_closed"))
+    requires_review = bool(candidate.get("requires_hardpaste_vlm_review") or fail_closed_required)
     review_all = bool(rule_value(rules, ["exit_review", "review_all_hardpaste"], False))
     min_conf = float(rule_value(rules, ["exit_review", "min_vlm_confidence"], 0.55))
-    block_unreviewed = bool(rule_value(rules, ["exit_review", "block_unreviewed_required_vlm"], True))
+    block_unreviewed = bool(rule_value(rules, ["exit_review", "block_unreviewed_required_vlm"], True)) or fail_closed_required
     mode = str(rule_value(rules, ["exit_review", "hardpaste_vlm_mode"], os.getenv("HARDPASTE_EXIT_REVIEW_MODE", "auto"))).strip().lower()
 
     if not requires_review and not review_all:
         return {
             "enabled": True,
             "required": False,
+            "fail_closed_required": False,
             "mode": mode,
             "status": "approved_by_geometry_gate",
             "approved": True,
@@ -122,6 +126,7 @@ def review_hardpaste_exit(image_rgb, candidate: Mapping[str, Any], rules: Mappin
         return {
             "enabled": True,
             "required": requires_review,
+            "fail_closed_required": fail_closed_required,
             "mode": mode,
             "status": "blocked_unreviewed" if not approved else "approved_without_vlm_by_rule",
             "approved": approved,
@@ -135,6 +140,7 @@ def review_hardpaste_exit(image_rgb, candidate: Mapping[str, Any], rules: Mappin
         return {
             "enabled": True,
             "required": requires_review,
+            "fail_closed_required": fail_closed_required,
             "mode": mode,
             "status": "pending_vlm_review_not_configured" if not approved else "approved_without_vlm_no_config",
             "approved": approved,
@@ -150,6 +156,7 @@ def review_hardpaste_exit(image_rgb, candidate: Mapping[str, Any], rules: Mappin
         return {
             "enabled": True,
             "required": requires_review,
+            "fail_closed_required": fail_closed_required,
             "mode": "openai_compatible",
             "status": "approved_by_vlm" if approved else "rejected_by_vlm",
             "approved": approved,
@@ -163,6 +170,7 @@ def review_hardpaste_exit(image_rgb, candidate: Mapping[str, Any], rules: Mappin
         return {
             "enabled": True,
             "required": requires_review,
+            "fail_closed_required": fail_closed_required,
             "mode": "openai_compatible",
             "status": "vlm_review_error_blocked",
             "approved": False,
@@ -176,6 +184,7 @@ def review_hardpaste_exit(image_rgb, candidate: Mapping[str, Any], rules: Mappin
         return {
             "enabled": True,
             "required": requires_review,
+            "fail_closed_required": fail_closed_required,
             "mode": "openai_compatible",
             "status": "vlm_review_error_blocked",
             "approved": False,
@@ -189,6 +198,7 @@ def review_hardpaste_exit(image_rgb, candidate: Mapping[str, Any], rules: Mappin
         return {
             "enabled": True,
             "required": requires_review,
+            "fail_closed_required": fail_closed_required,
             "mode": "openai_compatible",
             "status": "vlm_review_error_blocked",
             "approved": False,
