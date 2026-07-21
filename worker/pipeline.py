@@ -89,6 +89,12 @@ def call_semantic(
                 "wall,floor,sofa,table,cabinet,sideboard,chair",
             )
         r = httpx.post(f"{SEMANTIC_URL}/parse_semantics_mvp", files=files, data=data, timeout=HTTP_TIMEOUT, headers=_auth_headers())
+    if r.status_code == 422:
+        diag_path = work_dir / "semantic_422_response.json"
+        try:
+            diag_path.write_text(r.text, encoding="utf-8")
+        except Exception:
+            diag_path.write_text(json.dumps({"raw_text": r.text[:2000]}), encoding="utf-8")
     r.raise_for_status()
     semantics_path = work_dir / "semantics.json"
     semantics_path.write_text(r.text, encoding="utf-8")

@@ -663,6 +663,9 @@ class Worker:
                     styling_masks_requested=bool(soft_furnishing or wallpaper_recolor),
                 )
                 diag_later(diag.copy_file, semantics, "03_semantic/semantics.json")
+                _422_diag = work_dir / "semantic_422_response.json"
+                if _422_diag.exists():
+                    diag_later(diag.copy_file, _422_diag, "03_semantic/semantic_422_response.json")
 
                 semantic_payload = _safe_json_load(semantics)
                 semantic_delta = {"space": _count_semantic_space(semantic_payload)}
