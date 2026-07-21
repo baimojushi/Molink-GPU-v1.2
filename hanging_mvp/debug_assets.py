@@ -55,6 +55,21 @@ def _draw_label(img: np.ndarray, x: int, y: int, text: str, color: Tuple[int, in
 
 def draw_candidate_overlay(room_rgb: np.ndarray, candidate: Dict[str, Any], title: str | None = None) -> np.ndarray:
     img = room_rgb.copy()
+    structure = (
+        candidate.get("hard_constraints", {})
+        .get("wall_filter_debug", {})
+        .get("projection_orientation", {})
+        .get("horizontal_structure", {})
+    )
+    if isinstance(structure, dict):
+        for item in structure.get("line_segments", []) or []:
+            xyxy = item.get("xyxy_original")
+            if not isinstance(xyxy, (list, tuple)) or len(xyxy) != 4:
+                continue
+            p1 = (int(round(float(xyxy[0]))), int(round(float(xyxy[1]))))
+            p2 = (int(round(float(xyxy[2]))), int(round(float(xyxy[3]))))
+            color = (0, 255, 0) if bool(item.get("inlier")) else (255, 180, 0)
+            cv2.line(img, p1, p2, color, 2, cv2.LINE_AA)
     quad = candidate.get("projection", {}).get("projected_quad_px_original")
     if quad:
         pts = np.array(quad, np.int32)

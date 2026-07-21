@@ -19,7 +19,7 @@ from .masks import load_semantic_masks, masks_by_label, masks_by_role, semantic_
 from .geometry import (
     backproject, estimate_g_hat_from_floor_normals, estimate_g_hat_from_global_floor_like_normals,
     estimate_g_hat_from_horizontal_reference_normals, fit_plane_ransac, fit_vertical_plane_ransac, make_wall_basis,
-    orient_vector_to_camera_up, select_gravity_consensus,
+    orient_vector_to_camera_up, resolve_wall_projection_plane, select_gravity_consensus,
     points_from_mask, project_points, project_quad, polygon_mask, ray_plane_depth_for_mask, scale_points_to_original
 )
 from .hardpaste import load_rgba, warp_artwork_mount_to_geometry, warp_artwork_to_quad
@@ -65,7 +65,7 @@ except Exception:  # pragma: no cover - causal layer is optional at runtime
 API_KEY = os.getenv("API_KEY", "")
 ALLOW_UNAUTH_LOCAL = os.getenv("ALLOW_UNAUTH_LOCAL", "").strip().lower() in {"1", "true", "yes", "on"}
 PORT = int(os.getenv("HANGING_MVP_PORT", "6010"))
-HANGING_PIPELINE_BUILD_ID = "2026-07-21-structural-fragment-lineage-guard-v9"
+HANGING_PIPELINE_BUILD_ID = "2026-07-21-depth-yaw-preserving-structure-gate-v11"
 
 
 def _truthy_env(name: str, default: str = "0") -> bool:
@@ -549,6 +549,46 @@ def _jsonable_point(pt) -> list[float]:
 
 def _jsonable_quad(quad) -> list[list[float]]:
     return [_jsonable_point(pt) for pt in list(quad)[:4]]
+
+
+def _projection_quad_trace(quad: np.ndarray) -> Dict[str, Any]:
+    """Describe the untouched ordered 3-D projection for fault localization."""
+    q = np.asarray(quad, dtype=np.float64).reshape(4, 2)
+    top = q[1] - q[0]
+    right = q[2] - q[1]
+    bottom = q[2] - q[3]
+    left = q[3] - q[0]
+
+    def _length(value: np.ndarray) -> float:
+        return float(np.linalg.norm(value))
+
+    def _slope(num: float, den: float) -> Optional[float]:
+        return None if abs(float(den)) < 1e-8 else float(num / den)
+
+    def _angle(a: np.ndarray, b: np.ndarray) -> float:
+        denom = max(1e-8, float(np.linalg.norm(a)) * float(np.linalg.norm(b)))
+        dot = abs(float(np.dot(a, b))) / denom
+        return float(np.degrees(np.arccos(np.clip(dot, 0.0, 1.0))))
+
+    top_len = _length(top)
+    bottom_len = _length(bottom)
+    left_len = _length(left)
+    right_len = _length(right)
+    return {
+        "ordered_corner_contract": "top_left_top_right_bottom_right_bottom_left",
+        "top_edge_length_px": top_len,
+        "bottom_edge_length_px": bottom_len,
+        "left_edge_length_px": left_len,
+        "right_edge_length_px": right_len,
+        "top_edge_dy_dx": _slope(float(top[1]), float(top[0])),
+        "bottom_edge_dy_dx": _slope(float(bottom[1]), float(bottom[0])),
+        "left_edge_dx_dy": _slope(float(left[0]), float(left[1])),
+        "right_edge_dx_dy": _slope(float(right[0]), float(right[1])),
+        "horizontal_opposing_edge_angle_deg": _angle(top, bottom),
+        "vertical_opposing_edge_angle_deg": _angle(left, right),
+        "top_bottom_length_ratio": float(max(top_len, bottom_len) / max(1e-8, min(top_len, bottom_len))),
+        "left_right_length_ratio": float(max(left_len, right_len) / max(1e-8, min(left_len, right_len))),
+    }
 
 
 def _mask_area_for_quad(size_hw: tuple[int, int], quad: list[list[float]]) -> tuple[int, np.ndarray]:
@@ -1307,6 +1347,7 @@ async def analyze_hanging_mvp(
     room_raw = await room_image.read()
     room_pil = ImageOps.exif_transpose(Image.open(io.BytesIO(room_raw))).convert("RGB")
     room_rgb = np.array(room_pil)
+    room_rgb_processed = cv2.resize(room_rgb, (w, h), interpolation=cv2.INTER_AREA)
 
     artwork_raw = await artwork_image.read()
     art_rgba = load_rgba(artwork_raw)
@@ -1986,12 +2027,21 @@ async def analyze_hanging_mvp(
             # For a true vertical wall, wall normal should be roughly perpendicular to gravity.
             plane_n = np.array(plane.n, np.float32)
             fitted_plane_abs_dot_g = float(abs(np.dot(plane_n, g_hat)))
+            fitted_plane_tilt_deg = float(np.degrees(np.arcsin(np.clip(fitted_plane_abs_dot_g, 0.0, 1.0))))
+            max_unconstrained_tilt_deg = float(rule_value(
+                rules,
+                ["wall_plane_fit", "max_unconstrained_depth_tilt_deg"],
+                12.0,
+            ))
+            max_unconstrained_abs_dot_g = float(np.sin(np.radians(max_unconstrained_tilt_deg)))
             wall_filter_debug["unconstrained_plane_inlier_ratio"] = float(inlier_ratio)
             wall_filter_debug["unconstrained_fitted_plane_abs_dot_g"] = fitted_plane_abs_dot_g
+            wall_filter_debug["unconstrained_fitted_plane_tilt_deg"] = fitted_plane_tilt_deg
             wall_filter_debug["fitted_plane_abs_dot_g"] = fitted_plane_abs_dot_g
-            wall_filter_debug["wall_plane_verticality_pass_threshold"] = 0.55
+            wall_filter_debug["wall_plane_verticality_pass_threshold"] = max_unconstrained_abs_dot_g
+            wall_filter_debug["wall_plane_verticality_pass_threshold_deg"] = max_unconstrained_tilt_deg
 
-            if fitted_plane_abs_dot_g > 0.55:
+            if fitted_plane_abs_dot_g > max_unconstrained_abs_dot_g:
                 min_vertical_ratio = float(rule_value(
                     rules,
                     ["wall_plane_fit", "min_constrained_vertical_inlier_ratio"],
@@ -2063,7 +2113,103 @@ async def analyze_hanging_mvp(
             basis_points = plane_inlier_pts if len(plane_inlier_pts) >= 300 else pts
             wall_filter_debug["basis_point_source"] = "plane_inliers" if basis_points is plane_inlier_pts else "all_filtered_wall_points"
             wall_filter_debug["basis_point_count"] = int(len(basis_points))
-            basis = make_wall_basis(plane, basis_points, g_hat)
+            # Keep the depth RANSAC plane for depth/occlusion support checks,
+            # but independently resolve the orientation used by the artwork
+            # homography.  A coherent Metric3D direct-normal field can recover
+            # a depth-gradient plane that is planar yet visibly tilted/skewed.
+            depth_support_plane = plane
+            depth_plane_distance_full = np.abs(
+                np.sum(xyz * np.asarray(depth_support_plane.n, np.float32).reshape(1, 1, 3), axis=-1)
+                + float(depth_support_plane.d)
+            )
+            projection_normal_evidence_mask = (
+                (wall_mask > 0)
+                & np.isfinite(depth_plane_distance_full)
+                & (depth_plane_distance_full < 0.08)
+            ).astype(np.uint8) * 255
+            projection_plane, projection_orientation_debug = resolve_wall_projection_plane(
+                depth_support_plane,
+                basis_points,
+                normal,
+                projection_normal_evidence_mask,
+                g_hat,
+                max_direct_depth_tilt_deg=float(rule_value(
+                    rules, ["wall_plane_fit", "max_direct_depth_tilt_deg"], 2.5
+                )),
+                normal_recovery_angle_deg=float(rule_value(
+                    rules, ["wall_plane_fit", "normal_recovery_angle_deg"], 12.0
+                )),
+                hard_conflict_angle_deg=float(rule_value(
+                    rules, ["wall_plane_fit", "hard_conflict_angle_deg"], 35.0
+                )),
+                normal_min_samples=int(rule_value(
+                    rules, ["wall_plane_fit", "normal_consensus_min_samples"], 1000
+                )),
+                normal_max_p90_spread_deg=float(rule_value(
+                    rules, ["wall_plane_fit", "normal_consensus_max_p90_spread_deg"], 4.0
+                )),
+                normal_max_vertical_tilt_deg=float(rule_value(
+                    rules, ["wall_plane_fit", "normal_consensus_max_vertical_tilt_deg"], 5.0
+                )),
+                image_rgb=room_rgb_processed,
+                wall_mask=wall_mask,
+                intr=bundle.intr,
+                direct_normal_fail_closed_on_quality_failure=bool(rule_value(
+                    rules, ["wall_plane_fit", "direct_normal_fail_closed_on_quality_failure"], True
+                )),
+                horizontal_structure_enabled=bool(rule_value(
+                    rules, ["wall_plane_fit", "horizontal_structure_validation_enabled"], True
+                )),
+                horizontal_structure_angle_threshold_deg=float(rule_value(
+                    rules, ["wall_plane_fit", "horizontal_structure_angle_threshold_deg"], 6.0
+                )),
+                horizontal_structure_max_correction_deg=float(rule_value(
+                    rules, ["wall_plane_fit", "horizontal_structure_max_correction_deg"], 16.0
+                )),
+                horizontal_structure_prefilter_angle_deg=float(rule_value(
+                    rules, ["wall_plane_fit", "horizontal_structure_prefilter_angle_deg"], 24.0
+                )),
+                horizontal_structure_min_unique_lines=int(rule_value(
+                    rules, ["wall_plane_fit", "horizontal_structure_min_unique_lines"], 4
+                )),
+                horizontal_structure_ransac_inlier_angle_deg=float(rule_value(
+                    rules, ["wall_plane_fit", "horizontal_structure_ransac_inlier_angle_deg"], 2.0
+                )),
+                horizontal_structure_max_p90_residual_deg=float(rule_value(
+                    rules, ["wall_plane_fit", "horizontal_structure_max_p90_residual_deg"], 2.5
+                )),
+                horizontal_structure_max_horizontal_tilt_deg=float(rule_value(
+                    rules, ["wall_plane_fit", "horizontal_structure_max_horizontal_tilt_deg"], 12.0
+                )),
+                horizontal_structure_correction_min_inliers=int(rule_value(
+                    rules, ["wall_plane_fit", "horizontal_structure_correction_min_inliers"], 6
+                )),
+                horizontal_structure_correction_max_p90_deg=float(rule_value(
+                    rules, ["wall_plane_fit", "horizontal_structure_correction_max_p90_deg"], 1.5
+                )),
+            )
+            structure_debug = projection_orientation_debug.get("horizontal_structure")
+            if isinstance(structure_debug, dict):
+                for line_item in structure_debug.get("line_segments", []) or []:
+                    xyxy = line_item.get("xyxy_processed")
+                    if isinstance(xyxy, list) and len(xyxy) == 4:
+                        sx, sy = bundle.scale_to_original
+                        line_item["xyxy_original"] = [
+                            float(xyxy[0]) * float(sx),
+                            float(xyxy[1]) * float(sy),
+                            float(xyxy[2]) * float(sx),
+                            float(xyxy[3]) * float(sy),
+                        ]
+            wall_filter_debug["projection_orientation"] = projection_orientation_debug
+            if bool(projection_orientation_debug.get("hard_reject")):
+                rejected.append({
+                    "wall_id": wall_id,
+                    "reason": str(projection_orientation_debug.get("reason") or "projection_orientation_unresolved"),
+                    "wall_has_no_safe_candidate": True,
+                    "wall_filter_debug": wall_filter_debug,
+                })
+                continue
+            basis = make_wall_basis(projection_plane, basis_points, g_hat)
             # All wall-local ranges must come from the selected plane, not from
             # ceiling/cove points that happened to remain in the coarse box.
             pts = basis_points
@@ -2489,7 +2635,7 @@ async def analyze_hanging_mvp(
         floor_wall_estimation = _estimate_floor_wall_intersection(
             floor_mask=floor_mask,
             xyz=xyz,
-            plane=plane,
+            plane=projection_plane,
             basis=basis,
             s_range_m=s_range_for_floor,
             visible_wall_t_vals=t_vals,
@@ -2630,7 +2776,26 @@ async def analyze_hanging_mvp(
 
             candidate_id = f"cand_{candidate_idx:03d}"
             candidate_idx += 1
-            quad = project_quad(basis.origin, basis.u, basis.v, bundle.intr, axis_s, center_t, artwork_w_m, artwork_h_m)
+            raw_projected_quad = project_quad(
+                basis.origin,
+                basis.u,
+                basis.v,
+                bundle.intr,
+                axis_s,
+                center_t,
+                artwork_w_m,
+                artwork_h_m,
+            )
+            # Projection geometry is immutable after the four 3-D wall corners
+            # are projected.  Width recovery, averaged horizontal edges,
+            # minAreaRect and affine rectangle conversion are intentionally
+            # absent from this path.
+            quad = np.asarray(raw_projected_quad, dtype=np.float32).copy()
+            post_projection_delta_max_px = float(np.max(np.abs(quad - raw_projected_quad)))
+            if post_projection_delta_max_px > 1e-6:
+                raise RuntimeError("post_projection_quad_mutation_detected")
+            raw_quad_trace = _projection_quad_trace(raw_projected_quad)
+            final_quad_trace = _projection_quad_trace(quad)
             quad_metrics = _quad_metrics_original(quad, bundle.scale_to_original)
             projection_shape_gate = evaluate_projection_shape_gate(
                 quad_metrics,
@@ -3274,11 +3439,31 @@ async def analyze_hanging_mvp(
                     "g_hat_debug": g_debug,
                 },
                 "projection": {
-                    "quad_stage": "after_height_rule_before_hard_constraints",
+                    "quad_stage": "3d_wall_corners_projected_once_before_hard_constraints",
                     "center_px_processed": [float(np.mean(quad[:,0])), float(np.mean(quad[:,1]))],
                     "center_px_original": [float(np.mean(quad[:,0]) * bundle.scale_to_original[0]), float(np.mean(quad[:,1]) * bundle.scale_to_original[1])],
+                    "raw_projected_quad_px_processed": [[float(x), float(y)] for x, y in raw_projected_quad],
+                    "raw_projected_quad_px_original": scale_points_to_original(raw_projected_quad, bundle.scale_to_original),
+                    "final_projected_quad_px_processed": [[float(x), float(y)] for x, y in quad],
+                    "final_projected_quad_px_original": scale_points_to_original(quad, bundle.scale_to_original),
                     "projected_quad_px_processed": [[float(x), float(y)] for x, y in quad],
                     "projected_quad_px_original": scale_points_to_original(quad, bundle.scale_to_original),
+                    "post_projection_transform_policy": "identity_no_2d_width_recovery_no_edge_averaging_no_min_area_rect_no_affine_rectification",
+                    "post_projection_delta_max_px": post_projection_delta_max_px,
+                    "post_projection_mutation_detected": bool(post_projection_delta_max_px > 1e-6),
+                    "raw_quad_trace": raw_quad_trace,
+                    "final_quad_trace": final_quad_trace,
+                    "fault_localization": {
+                        "raw_projection_shape_status": projection_shape_gate.get("status"),
+                        "post_projection_mutation_detected": bool(post_projection_delta_max_px > 1e-6),
+                        "likely_fault_stage": (
+                            "post_projection_2d_geometry"
+                            if post_projection_delta_max_px > 1e-6
+                            else "raw_projection_basis_or_intrinsics_requires_review"
+                            if projection_shape_gate.get("status") in {"review", "hard_reject"}
+                            else "none_detected"
+                        ),
+                    },
                     "shape_gate": projection_shape_gate,
                 },
                 "hard_constraints": hard,
@@ -3844,7 +4029,8 @@ async def analyze_hanging_mvp(
             "support_contract": "recognized_support_label_specific_clearance_v5",
             "gravity_contract": "multi_reference_camera_coordinate_consensus_v3",
             "semantic_coordinate_contract": "internal_1000_grid_with_original_boundary_sentinels_v2",
-            "projection_contract": "ordered_edge_aspect_and_nonrigid_surface_guard_v2",
+            "projection_contract": "project_3d_wall_corners_once_no_2d_rectification_v4",
+            "metric3d_orientation_contract": "depth_yaw_preserved_direct_normal_validation_structure_vanishing_gate_v2",
             "wall_fragment_contract": "trusted_sam_component_lineage_and_fail_closed_material_review_v1",
             "render_contract": "fullspace_identity_locked_shadow_v2",
             "worker_result_contract": "render_review_is_completed_review_v1",

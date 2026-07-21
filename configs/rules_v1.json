@@ -340,6 +340,10 @@
     }
   },
   "wall_plane_fit": {
+    "max_unconstrained_depth_tilt_deg": {
+      "value": 12.0,
+      "notes": "Above this tilt, unconstrained depth RANSAC is not accepted as a wall model and gravity-constrained RANSAC must succeed. Replaces the former abs(dot)=0.55 (~33 degree) pass threshold."
+    },
     "vertical_ransac_iterations": {
       "value": 700
     },
@@ -352,7 +356,64 @@
     "min_constrained_vertical_inlier_points": {
       "value": 500
     },
-    "notes": "If unconstrained RANSAC selects a horizontal plane from a coarse wall box, retry with a gravity-constrained vertical plane and accept only quantified support."
+    "max_direct_depth_tilt_deg": {
+      "value": 2.5,
+      "notes": "A hangable wall's projection vertical is gravity-locked. Depth planes beyond this tilt may still support distance/occlusion but cannot define artwork orientation directly."
+    },
+    "normal_recovery_angle_deg": {
+      "value": 12.0,
+      "notes": "Deprecated compatibility key. Direct normals no longer replace depth yaw. The disagreement is retained only for diagnostics."
+    },
+    "hard_conflict_angle_deg": {
+      "value": 35.0,
+      "notes": "Deprecated compatibility key. Depth/direct-normal yaw disagreement alone no longer changes the wall heading."
+    },
+    "normal_consensus_min_samples": {
+      "value": 1000
+    },
+    "normal_consensus_max_p90_spread_deg": {
+      "value": 4.0
+    },
+    "normal_consensus_max_vertical_tilt_deg": {
+      "value": 5.0
+    },
+    "direct_normal_fail_closed_on_quality_failure": {
+      "value": true,
+      "notes": "With enough samples, unstable or non-vertical direct normals reject the wall as an unreliable material surface. Direct-normal yaw is never copied into projection geometry."
+    },
+    "horizontal_structure_validation_enabled": {
+      "value": true
+    },
+    "horizontal_structure_angle_threshold_deg": {
+      "value": 6.0,
+      "notes": "Maximum calibrated angular disagreement between the depth-preserving basis_u and the horizontal structure vanishing direction before correction or fail-closed handling."
+    },
+    "horizontal_structure_max_correction_deg": {
+      "value": 16.0,
+      "notes": "A confident structure estimate may correct depth yaw only within this bounded angle. Larger conflicts fail closed."
+    },
+    "horizontal_structure_prefilter_angle_deg": {
+      "value": 24.0
+    },
+    "horizontal_structure_min_unique_lines": {
+      "value": 4
+    },
+    "horizontal_structure_ransac_inlier_angle_deg": {
+      "value": 2.0
+    },
+    "horizontal_structure_max_p90_residual_deg": {
+      "value": 2.5
+    },
+    "horizontal_structure_max_horizontal_tilt_deg": {
+      "value": 12.0
+    },
+    "horizontal_structure_correction_min_inliers": {
+      "value": 6
+    },
+    "horizontal_structure_correction_max_p90_deg": {
+      "value": 1.5
+    },
+    "notes": "Depth RANSAC remains authoritative for distance, occlusion and horizontal wall heading. Projection removes only the depth normal's gravity component. Direct normals validate verticality/material stability. Calibrated wall seams and adjacent trim verify K @ basis_u and may perform a bounded yaw correction or fail closed."
   },
   "existing_art_height_anchor": {
     "enabled": true,
