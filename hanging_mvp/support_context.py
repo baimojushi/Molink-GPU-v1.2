@@ -225,6 +225,33 @@ def _estimate_floor_wall_intersection(
             "reason": "no_floor_mask",
         })
 
+    # Fallback: wall-normal-guided floor line from the wall's own bottom edge.
+    # When floor mask is unavailable (e.g. VLM-only, no SAM refinement) or
+    # contaminated by furniture, estimate the floor height from the bottom-most
+    # wall points projected into wall coordinates.  The wall normal constrains
+    # the floor-line search: the wall-floor intersection must be perpendicular
+    # to the wall normal and gravity.
+    if visible_wall_t_vals is not None and len(visible_wall_t_vals) > 0:
+        visible_t_arr = np.asarray(visible_wall_t_vals, dtype=np.float32)
+        visible_t_arr = visible_t_arr[np.isfinite(visible_t_arr)]
+        attempt = {
+            "source": "wall_normal_guided_bottom_edge",
+            "visible_wall_points": int(visible_t_arr.size),
+            "guided_bottom_percentile": float(solid_bottom_percentile),
+        }
+        debug["attempts"].append(attempt)
+        if visible_t_arr.size >= min_floor_points:
+            t_floor = float(np.percentile(visible_t_arr, solid_bottom_percentile))
+            return _finish(
+                "wall_normal_guided_bottom_edge",
+                t_floor,
+                int(visible_t_arr.size),
+                {
+                    "guided_bottom_percentile": float(solid_bottom_percentile),
+                    "wall_normal_at_intersection": [float(x) for x in n],
+                },
+            )
+
     if solid_wall_mask is not None and np.count_nonzero(solid_wall_mask) > 0:
         solid_pts = points_from_mask(xyz, solid_wall_mask, max_points=50000)
         solid_pts = solid_pts[np.isfinite(solid_pts).all(axis=1)] if solid_pts.size else solid_pts

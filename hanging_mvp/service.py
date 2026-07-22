@@ -2144,18 +2144,37 @@ async def analyze_hanging_mvp(
             # the segmented depth vote.
             local_wall_evidence_mask = wall_mask.copy()
             local_excluded_ids = []
+            evidence_purposes = {"forbidden", "foreground", "support", "existing_content", "non_support"}
             for evidence_obj in objects.values():
                 if evidence_obj.get("object_id") == wall_id:
                     continue
                 evidence_role = str(evidence_obj.get("role") or "").strip().lower()
-                if evidence_role not in {"forbidden", "foreground", "support", "existing_content", "non_support"}:
+                if evidence_role not in evidence_purposes:
                     continue
+                # Prefer SAM mask; fall back to bbox rectangle when mask is
+                # unavailable (e.g. VLM-only mode without SAM refinement).
                 evidence_obj_mask = evidence_obj.get("mask")
+                bbox_available = False
+                if isinstance(evidence_obj_mask, np.ndarray) and evidence_obj_mask.shape[:2] == (h, w):
+                    pass  # use mask as-is below
+                else:
+                    # Try bbox_xyxy_processed as rectangular exclusion.
+                    bbox = evidence_obj.get("bbox_xyxy_processed") or evidence_obj.get("bbox_xyxy") or []
+                    if len(bbox) == 4:
+                        x1, y1, x2, y2 = [int(max(0, bbox[i])) for i in range(4)]
+                        x2, y2 = min(x2, w - 1), min(y2, h - 1)
+                        if x2 > x1 and y2 > y1:
+                            evidence_obj_mask = np.zeros((h, w), dtype=np.uint8)
+                            evidence_obj_mask[y1:y2, x1:x2] = 255
+                            bbox_available = True
                 if isinstance(evidence_obj_mask, np.ndarray) and evidence_obj_mask.shape[:2] == (h, w):
                     overlap = int(np.count_nonzero((local_wall_evidence_mask > 0) & (evidence_obj_mask > 0)))
                     if overlap > 0:
                         local_wall_evidence_mask[evidence_obj_mask > 0] = 0
-                        local_excluded_ids.append(str(evidence_obj.get("object_id") or evidence_obj.get("label") or "unknown"))
+                        tag = str(evidence_obj.get("object_id") or evidence_obj.get("label") or "unknown")
+                        if bbox_available:
+                            tag += "_bbox"
+                        local_excluded_ids.append(tag)
             erosion_px = int(rule_value(rules, ["wall_plane_fit", "segmented_depth_plane", "boundary_erosion_px"], 3))
             if erosion_px > 0 and np.count_nonzero(local_wall_evidence_mask) > 0:
                 kernel = np.ones((2 * erosion_px + 1, 2 * erosion_px + 1), np.uint8)
