@@ -1,0 +1,46 @@
+{
+  "pipeline_build": "2026-07-22-axial-depth-hierarchy-consensus-v19",
+  "source_baseline": "2026-07-21-semantic-provenance-and-local-wall-guard-v18",
+  "root_causes": [
+    "Segmented depth clustered plane-normal yaw on a 360-degree circle even though n and -n are the same physical wall axis.",
+    "An image-line vanishing point inside the authoritative wall body could become reliable when at least six texture lines survived.",
+    "The conflict state machine had no strictly gated recovery for agreement between high-inlier whole-wall depth and high-coverage local segmented depth."
+  ],
+  "policy": {
+    "segmented_depth_orientation_period_deg": 180.0,
+    "inside_wall_vanishing_point_can_vote": false,
+    "direct_normal_used_for_recovered_yaw": false,
+    "direct_normal_role": "material_stability_gate_only",
+    "normal_conflict_threshold_deg_unchanged": 12.0,
+    "hierarchical_depth_gates": {
+      "min_whole_depth_inlier_ratio": 0.75,
+      "max_whole_depth_vertical_tilt_deg": 12.0,
+      "min_segmented_cluster_coverage": 0.75,
+      "max_segmented_cluster_p90_deg": 6.0,
+      "min_segmented_cluster_cells": 8,
+      "max_depth_yaw_disagreement_deg": 6.0
+    }
+  },
+  "diagnostic_replay": {
+    "local_cell_count": 16,
+    "v18_split_cluster_coverage": 0.5,
+    "v19_axial_cluster_coverage": 1.0,
+    "v19_segmented_consensus_yaw_deg": -32.0,
+    "recorded_segmented_p90_deg": 4.03,
+    "inside_wall_texture_line_count": 8,
+    "inside_wall_texture_direction_reliable": false
+  },
+  "validation": {
+    "python_files_compiled": 86,
+    "json_parse": "passed",
+    "shell_syntax": "passed",
+    "axial_sign_invariance_regression": "passed",
+    "hierarchical_depth_positive_regression": "passed",
+    "hierarchical_depth_negative_gate_regressions": "passed",
+    "resolver_integration_regression": "passed",
+    "inside_wall_vanishing_point_regression": "passed",
+    "pytest_framework_available_in_build_container": false,
+    "full_gpu_end_to_end": "requires deployment image"
+  },
+  "cache_policy": "Restart from Hanging geometry. Do not reuse V18 segmented-depth, structure, wall-basis or projected-quad caches."
+}

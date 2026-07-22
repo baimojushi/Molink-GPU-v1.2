@@ -65,7 +65,7 @@ except Exception:  # pragma: no cover - causal layer is optional at runtime
 API_KEY = os.getenv("API_KEY", "")
 ALLOW_UNAUTH_LOCAL = os.getenv("ALLOW_UNAUTH_LOCAL", "").strip().lower() in {"1", "true", "yes", "on"}
 PORT = int(os.getenv("HANGING_MVP_PORT", "6010"))
-HANGING_PIPELINE_BUILD_ID = "2026-07-21-semantic-provenance-and-local-wall-guard-v18"
+HANGING_PIPELINE_BUILD_ID = "2026-07-22-axial-depth-hierarchy-consensus-v19"
 
 
 def _truthy_env(name: str, default: str = "0") -> bool:
@@ -2322,6 +2322,29 @@ async def analyze_hanging_mvp(
                 controlled_structural_quorum_angle_threshold_deg=csq_angle,
                 segmented_depth_plane_yaw=seg_depth_yaw,
                 segmented_depth_plane_confident=seg_depth_confident,
+                segmented_depth_plane_debug=seg_depth_debug,
+                whole_depth_plane_inlier_ratio=float(inlier_ratio),
+                hierarchical_depth_consensus_enabled=bool(rule_value(
+                    rules, ["wall_plane_fit", "hierarchical_depth_consensus", "enabled"], True
+                )),
+                hierarchical_depth_min_whole_inlier_ratio=float(rule_value(
+                    rules, ["wall_plane_fit", "hierarchical_depth_consensus", "min_whole_depth_inlier_ratio"], 0.75
+                )),
+                hierarchical_depth_max_whole_vertical_tilt_deg=float(rule_value(
+                    rules, ["wall_plane_fit", "hierarchical_depth_consensus", "max_whole_depth_vertical_tilt_deg"], 12.0
+                )),
+                hierarchical_depth_min_segmented_coverage=float(rule_value(
+                    rules, ["wall_plane_fit", "hierarchical_depth_consensus", "min_segmented_cluster_coverage"], 0.75
+                )),
+                hierarchical_depth_max_segmented_p90_deg=float(rule_value(
+                    rules, ["wall_plane_fit", "hierarchical_depth_consensus", "max_segmented_cluster_p90_deg"], 6.0
+                )),
+                hierarchical_depth_min_segmented_cells=int(rule_value(
+                    rules, ["wall_plane_fit", "hierarchical_depth_consensus", "min_segmented_cluster_cells"], 8
+                )),
+                hierarchical_depth_max_yaw_disagreement_deg=float(rule_value(
+                    rules, ["wall_plane_fit", "hierarchical_depth_consensus", "max_depth_yaw_disagreement_deg"], 6.0
+                )),
             )
             structure_debug = projection_orientation_debug.get("horizontal_structure")
             if isinstance(structure_debug, dict):

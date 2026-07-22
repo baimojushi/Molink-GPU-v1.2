@@ -12,6 +12,41 @@ from .schemas import Intrinsics, WallPlane, WallBasis
 EPS = 1e-8
 CAMERA_UP = np.array([0.0, -1.0, 0.0], np.float32)
 
+
+def _axial_angle_distance_rad(a: float, b: float) -> float:
+    """Return the distance between two undirected plane headings.
+
+    A wall normal is an axis, not an arrow: ``n`` and ``-n`` describe the
+    same physical plane.  Heading distances therefore have period pi rather
+    than 2*pi.
+    """
+    delta = abs(float(a) - float(b)) % math.pi
+    return float(min(delta, math.pi - delta))
+
+
+def _axial_circular_mean_rad(values: np.ndarray, weights: Optional[np.ndarray] = None) -> float:
+    """Circular mean for pi-periodic (undirected) angles."""
+    angles = np.asarray(values, dtype=np.float64).reshape(-1)
+    if len(angles) == 0:
+        raise ValueError("cannot average an empty axial angle set")
+    if weights is None:
+        weights_arr = np.ones(len(angles), dtype=np.float64)
+    else:
+        weights_arr = np.asarray(weights, dtype=np.float64).reshape(-1)
+        if len(weights_arr) != len(angles):
+            raise ValueError("axial angle weights must match angle count")
+    sin_sum = float(np.sum(weights_arr * np.sin(2.0 * angles)))
+    cos_sum = float(np.sum(weights_arr * np.cos(2.0 * angles)))
+    if abs(sin_sum) < EPS and abs(cos_sum) < EPS:
+        # Degenerate antipodal evidence has no unique axial mean.  Returning a
+        # stable medoid lets the caller's spread/coverage gates fail closed.
+        distances = np.asarray([
+            sum(_axial_angle_distance_rad(value, other) for other in angles)
+            for value in angles
+        ], dtype=np.float64)
+        return float(angles[int(np.argmin(distances))])
+    return float(0.5 * math.atan2(sin_sum, cos_sum))
+
 def normalize(v: np.ndarray) -> np.ndarray:
     n = float(np.linalg.norm(v))
     if n < EPS:
@@ -385,40 +420,52 @@ def estimate_segmented_depth_plane_yaw(
         debug["reason"] = "insufficient_cells_with_valid_yaws"
         return None, False, debug
 
-    # Cluster yaws using angular medoid
+    # ROOT CAUSE / DO NOT REGRESS (2026-07-22, V19): plane normals are axes.
+    # Local RANSAC may return either n or -n, so +146 deg and -30 deg differ by
+    # only 4 deg physically.  V18 clustered them on a 360-degree circle and
+    # split one coherent wall into two 0.50-coverage groups.  All clustering,
+    # averaging and residuals below must remain pi-periodic.
     yaw_arr = np.array(cell_yaws, dtype=np.float64)
     cluster_threshold = float(np.radians(cluster_angle_deg))
 
-    # Simple greedy clustering
+    # Evaluate every observed axis as a candidate medoid.  This avoids the
+    # ordering sensitivity of the old first-match greedy clustering while
+    # keeping cluster membership bounded by the configured angular gate.
     clusters: List[List[int]] = []
-    assigned = [False] * len(yaw_arr)
-    for i in range(len(yaw_arr)):
-        if assigned[i]:
-            continue
-        cluster = [i]
-        assigned[i] = True
-        for j in range(i + 1, len(yaw_arr)):
-            if assigned[j]:
-                continue
-            diff = abs(float(yaw_arr[i]) - float(yaw_arr[j]))
-            diff = min(diff, 2.0 * math.pi - diff)
-            if diff <= cluster_threshold:
-                cluster.append(j)
-                assigned[j] = True
-        clusters.append(cluster)
+    seen_memberships = set()
+    for center in yaw_arr:
+        cluster = [
+            index for index, value in enumerate(yaw_arr)
+            if _axial_angle_distance_rad(float(center), float(value)) <= cluster_threshold
+        ]
+        membership = tuple(cluster)
+        if membership and membership not in seen_memberships:
+            seen_memberships.add(membership)
+            clusters.append(cluster)
 
     # Find majority cluster
-    clusters.sort(key=len, reverse=True)
+    clusters.sort(
+        key=lambda cluster: (
+            len(cluster),
+            -sum(
+                _axial_angle_distance_rad(float(yaw_arr[i]), float(yaw_arr[j]))
+                for i in cluster for j in cluster if i < j
+            ),
+        ),
+        reverse=True,
+    )
     best_cluster = clusters[0]
     cluster_size = len(best_cluster)
     cluster_coverage = cluster_size / len(cell_yaws)
 
     cluster_yaws = yaw_arr[best_cluster]
-    consensus_yaw = float(np.median(cluster_yaws))
+    consensus_yaw = _axial_circular_mean_rad(cluster_yaws)
 
     # Compute cluster spread
-    diffs = np.abs(cluster_yaws - consensus_yaw)
-    diffs = np.minimum(diffs, 2.0 * math.pi - diffs)
+    diffs = np.asarray([
+        _axial_angle_distance_rad(float(value), consensus_yaw)
+        for value in cluster_yaws
+    ], dtype=np.float64)
     cluster_p90 = float(np.degrees(np.percentile(diffs, 90))) if len(diffs) > 0 else 180.0
 
     reliable = bool(
@@ -434,6 +481,9 @@ def estimate_segmented_depth_plane_yaw(
     debug["cluster_p90_deg"] = round(cluster_p90, 2)
     debug["cluster_count"] = len(clusters)
     debug["all_cluster_sizes"] = [len(c) for c in clusters]
+    debug["orientation_period_deg"] = 180.0
+    debug["normal_sign_invariant"] = True
+    debug["clustering_policy"] = "axial_medoid_support_with_doubled_angle_consensus"
 
     if reliable:
         debug["source"] = "segmented_depth_plane_yaw_consensus"
@@ -859,8 +909,11 @@ def estimate_wall_horizontal_structure_direction(
     direction_angle = _undirected_angle_deg(horizontal_direction, expected_u)
     observed_vp = K @ horizontal_direction
     # VP containment guard: if the vanishing point projects inside the wall
-    # body, the detected lines are likely marble texture or furniture edges,
-    # not real structural seams.  This is a strong quality penalty.
+    # body, the detected lines are marble/finish texture or crossing furniture
+    # edges rather than one structural parallel family.  V18 only rejected
+    # this evidence when fewer than six lines survived, so eight marble lines
+    # became a false strong vote.  Count cannot rescue physically invalid VP
+    # geometry: an inside-wall VP never receives directional voting rights.
     vp_inside_wall_body = False
     if abs(float(observed_vp[2])) > 1e-8:
         vp_px = observed_vp[:2] / float(observed_vp[2])
@@ -870,9 +923,7 @@ def estimate_wall_horizontal_structure_direction(
     observed_local = _local_image_direction(observed_vp, center_xy)
     local_image_angle = _undirected_angle_deg(predicted_local, observed_local) if predicted_local is not None and observed_local is not None else None
     min_offset_span = max(20.0, 0.08 * box_h)
-    # VP containment penalty: when VP falls inside the wall body, require
-    # stronger inlier evidence (≥6 lines) to trust the structure direction.
-    vp_penalty = bool(vp_inside_wall_body and inlier_count < 6)
+    vp_penalty = bool(vp_inside_wall_body)
     reliable = bool(
         inlier_count >= int(min_unique_lines)
         and not vp_penalty
@@ -948,7 +999,11 @@ def estimate_wall_horizontal_structure_direction(
         "line_segments": line_debug,
     }
     if not reliable:
-        debug["reason"] = "horizontal_structure_quality_gate_failed"
+        debug["reason"] = (
+            "vanishing_point_inside_wall_body_texture_family"
+            if vp_inside_wall_body
+            else "horizontal_structure_quality_gate_failed"
+        )
     return horizontal_direction.astype(np.float32), debug
 
 
@@ -988,6 +1043,15 @@ def resolve_wall_projection_plane(
     controlled_structural_quorum_angle_threshold_deg: float = 6.0,
     segmented_depth_plane_yaw: Optional[float] = None,
     segmented_depth_plane_confident: bool = False,
+    segmented_depth_plane_debug: Optional[Dict[str, Any]] = None,
+    whole_depth_plane_inlier_ratio: Optional[float] = None,
+    hierarchical_depth_consensus_enabled: bool = False,
+    hierarchical_depth_min_whole_inlier_ratio: float = 0.75,
+    hierarchical_depth_max_whole_vertical_tilt_deg: float = 12.0,
+    hierarchical_depth_min_segmented_coverage: float = 0.75,
+    hierarchical_depth_max_segmented_p90_deg: float = 6.0,
+    hierarchical_depth_min_segmented_cells: int = 8,
+    hierarchical_depth_max_yaw_disagreement_deg: float = 6.0,
 ) -> Tuple[WallPlane, Dict[str, Any]]:
     """Resolve the plane orientation used for artwork perspective.
 
@@ -1102,6 +1166,72 @@ def resolve_wall_projection_plane(
     # unresolved metric geometry.
     if normal_yaw_conflict:
         if not structure_reliable or direct_u is None:
+            # V19 controlled recovery: a stable direct-normal field remains a
+            # material-quality gate, but its disputed yaw is not a vote.  A
+            # high-inlier whole-wall depth plane may recover only when a
+            # cleaned, spatially segmented depth estimate independently
+            # reaches the same undirected heading and every numeric gate
+            # passes.  This is intentionally stricter than generic 2-of-3.
+            hierarchy_debug_final: Optional[Dict[str, Any]] = None
+            if bool(hierarchical_depth_consensus_enabled):
+                whole_depth_yaw = float(np.arctan2(
+                    float(depth_vertical_n[2]), float(depth_vertical_n[0])
+                ))
+                hierarchy_recovered, hierarchy_yaw, hierarchy_debug = evaluate_hierarchical_depth_consensus(
+                    whole_depth_yaw=whole_depth_yaw,
+                    whole_depth_inlier_ratio=whole_depth_plane_inlier_ratio,
+                    whole_depth_vertical_tilt_deg=depth_vertical_tilt,
+                    segmented_depth_yaw=segmented_depth_plane_yaw,
+                    segmented_depth_confident=bool(segmented_depth_plane_confident),
+                    segmented_depth_debug=segmented_depth_plane_debug,
+                    direct_normal_material_reliable=bool(normal_debug.get("reliable")),
+                    min_whole_depth_inlier_ratio=float(hierarchical_depth_min_whole_inlier_ratio),
+                    max_whole_depth_vertical_tilt_deg=float(hierarchical_depth_max_whole_vertical_tilt_deg),
+                    min_segmented_cluster_coverage=float(hierarchical_depth_min_segmented_coverage),
+                    max_segmented_cluster_p90_deg=float(hierarchical_depth_max_segmented_p90_deg),
+                    min_segmented_cluster_cells=int(hierarchical_depth_min_segmented_cells),
+                    max_depth_yaw_disagreement_deg=float(hierarchical_depth_max_yaw_disagreement_deg),
+                )
+                hierarchy_debug_final = hierarchy_debug
+                if hierarchy_recovered and hierarchy_yaw is not None:
+                    gx, gy, gz = [float(x) for x in g_hat]
+                    nx = math.cos(float(hierarchy_yaw))
+                    nz = math.sin(float(hierarchy_yaw))
+                    if abs(gy) < 0.15:
+                        return depth_plane, {
+                            "hard_reject": True,
+                            "reason": "hierarchical_depth_consensus_gravity_basis_degenerate",
+                            "hierarchical_depth_consensus": hierarchy_debug,
+                        }
+                    ny = -(gx * nx + gz * nz) / gy
+                    recovered_n = normalize(np.array([nx, ny, nz], dtype=np.float64))
+                    if float(np.dot(recovered_n, depth_n)) < 0.0:
+                        recovered_n = -recovered_n
+                    corrected_d = -float(np.dot(recovered_n, anchor))
+                    return WallPlane(tuple(map(float, recovered_n)), corrected_d), {
+                        "hard_reject": False,
+                        "policy": "axial_depth_hierarchy_consensus",
+                        "projection_orientation_source": "whole_and_segmented_depth_hierarchy_consensus",
+                        "depth_support_plane_preserved": True,
+                        "depth_horizontal_heading_preserved": True,
+                        "direct_normal_used_for_yaw": False,
+                        "depth_plane_normal": [float(x) for x in depth_n],
+                        "depth_plane_vertical_tilt_deg": depth_vertical_tilt,
+                        "depth_plane_inlier_ratio": whole_depth_plane_inlier_ratio,
+                        "max_direct_depth_tilt_deg": float(max_direct_depth_tilt_deg),
+                        "depth_plane_required_verticalization": bool(depth_vertical_tilt > float(max_direct_depth_tilt_deg)),
+                        "depth_normal_disagreement_deg": disagreement,
+                        "depth_direct_normal_yaw_disagreement_deg": yaw_disagreement,
+                        "normal_yaw_conflict_requires_structure_quorum": True,
+                        "normal_recovery_angle_deg": float(normal_recovery_angle_deg),
+                        "hard_conflict_angle_deg": float(hard_conflict_angle_deg),
+                        "resolved_projection_normal": [float(x) for x in recovered_n],
+                        "resolved_projection_normal_dot_gravity_abs": abs(float(np.dot(recovered_n, g_hat))),
+                        "metric_anchor_m": [float(x) for x in anchor],
+                        "normal_consensus": normal_debug,
+                        "horizontal_structure": structure_debug,
+                        "hierarchical_depth_consensus": hierarchy_debug,
+                    }
             # Controlled structural quorum fallback: when the standard
             # three-evidence quorum cannot form, attempt recovery using
             # segmented depth planes, reliable direct normals, and
@@ -1184,6 +1314,7 @@ def resolve_wall_projection_plane(
                 "normal_consensus": normal_debug,
                 "horizontal_structure": structure_debug,
                 "controlled_structural_quorum": csq_debug_final,
+                "hierarchical_depth_consensus": hierarchy_debug_final,
             }
         structure_to_depth = _undirected_angle_deg(structure_direction, expected_u)
         structure_to_direct = _undirected_angle_deg(structure_direction, direct_u)
@@ -1295,6 +1426,99 @@ def resolve_wall_projection_plane(
         "horizontal_structure": structure_debug,
     }
     return WallPlane(tuple(map(float, chosen_n)), chosen_d), debug
+
+
+def evaluate_hierarchical_depth_consensus(
+    *,
+    whole_depth_yaw: Optional[float],
+    whole_depth_inlier_ratio: Optional[float],
+    whole_depth_vertical_tilt_deg: Optional[float],
+    segmented_depth_yaw: Optional[float],
+    segmented_depth_confident: bool,
+    segmented_depth_debug: Optional[Dict[str, Any]],
+    direct_normal_material_reliable: bool,
+    min_whole_depth_inlier_ratio: float = 0.75,
+    max_whole_depth_vertical_tilt_deg: float = 12.0,
+    min_segmented_cluster_coverage: float = 0.75,
+    max_segmented_cluster_p90_deg: float = 6.0,
+    min_segmented_cluster_cells: int = 8,
+    max_depth_yaw_disagreement_deg: float = 6.0,
+) -> Tuple[bool, Optional[float], Dict[str, Any]]:
+    """Strictly fuse whole-wall and local depth headings.
+
+    This path is used only after a reliable direct-normal field disagrees with
+    depth by more than the normal-recovery threshold.  The direct-normal yaw is
+    deliberately excluded from the average; it proves that the selected wall
+    pixels are one stable material surface.  Two independent depth scales must
+    then agree as undirected axes and pass all quality gates.
+    """
+    segmented = segmented_depth_debug if isinstance(segmented_depth_debug, dict) else {}
+    coverage_value = segmented.get("cluster_coverage", 0.0)
+    p90_value = segmented.get("cluster_p90_deg", 180.0)
+    cluster_size_value = segmented.get("cluster_size", 0)
+    coverage = float(0.0 if coverage_value is None else coverage_value)
+    p90 = float(180.0 if p90_value is None else p90_value)
+    cluster_size = int(0 if cluster_size_value is None else cluster_size_value)
+    whole_ratio = float(whole_depth_inlier_ratio) if whole_depth_inlier_ratio is not None else 0.0
+    whole_tilt = float(whole_depth_vertical_tilt_deg) if whole_depth_vertical_tilt_deg is not None else 180.0
+    yaw_distance_deg = None
+    if whole_depth_yaw is not None and segmented_depth_yaw is not None:
+        yaw_distance_deg = float(np.degrees(_axial_angle_distance_rad(
+            float(whole_depth_yaw), float(segmented_depth_yaw)
+        )))
+
+    gates = {
+        "whole_depth_yaw_available": bool(whole_depth_yaw is not None and np.isfinite(float(whole_depth_yaw))),
+        "whole_depth_inlier_ratio": bool(whole_ratio >= float(min_whole_depth_inlier_ratio)),
+        "whole_depth_vertical_tilt": bool(whole_tilt <= float(max_whole_depth_vertical_tilt_deg)),
+        "segmented_depth_confident": bool(segmented_depth_confident),
+        "segmented_cluster_coverage": bool(coverage >= float(min_segmented_cluster_coverage)),
+        "segmented_cluster_p90": bool(p90 <= float(max_segmented_cluster_p90_deg)),
+        "segmented_cluster_cells": bool(cluster_size >= int(min_segmented_cluster_cells)),
+        "depth_hierarchy_yaw_agreement": bool(
+            yaw_distance_deg is not None
+            and yaw_distance_deg <= float(max_depth_yaw_disagreement_deg)
+        ),
+        "direct_normal_material_stability": bool(direct_normal_material_reliable),
+    }
+    recovered = bool(all(gates.values()))
+    consensus_yaw: Optional[float] = None
+    if recovered:
+        consensus_yaw = _axial_circular_mean_rad(
+            np.asarray([whole_depth_yaw, segmented_depth_yaw], dtype=np.float64),
+            np.asarray([max(whole_ratio, EPS), max(coverage, EPS)], dtype=np.float64),
+        )
+
+    failed_gates = [name for name, passed in gates.items() if not bool(passed)]
+    debug: Dict[str, Any] = {
+        "enabled": True,
+        "policy": "whole_wall_plus_axial_segmented_depth_with_direct_normal_material_gate",
+        "recovered": recovered,
+        "gates": gates,
+        "failed_gates": failed_gates,
+        "whole_depth_yaw_deg": None if whole_depth_yaw is None else float(np.degrees(whole_depth_yaw)),
+        "whole_depth_inlier_ratio": whole_ratio,
+        "min_whole_depth_inlier_ratio": float(min_whole_depth_inlier_ratio),
+        "whole_depth_vertical_tilt_deg": whole_tilt,
+        "max_whole_depth_vertical_tilt_deg": float(max_whole_depth_vertical_tilt_deg),
+        "segmented_depth_yaw_deg": None if segmented_depth_yaw is None else float(np.degrees(segmented_depth_yaw)),
+        "segmented_cluster_coverage": coverage,
+        "min_segmented_cluster_coverage": float(min_segmented_cluster_coverage),
+        "segmented_cluster_p90_deg": p90,
+        "max_segmented_cluster_p90_deg": float(max_segmented_cluster_p90_deg),
+        "segmented_cluster_size": cluster_size,
+        "min_segmented_cluster_cells": int(min_segmented_cluster_cells),
+        "depth_yaw_disagreement_deg": yaw_distance_deg,
+        "max_depth_yaw_disagreement_deg": float(max_depth_yaw_disagreement_deg),
+        "direct_normal_used_as_material_gate_only": True,
+        "direct_normal_used_for_yaw": False,
+        "consensus_yaw_deg": None if consensus_yaw is None else float(np.degrees(consensus_yaw)),
+    }
+    if not recovered:
+        debug["reason"] = "hierarchical_depth_quality_gate_failed"
+    else:
+        debug["source"] = "whole_and_segmented_depth_hierarchy_consensus"
+    return recovered, consensus_yaw, debug
 
 
 def evaluate_controlled_structural_quorum(

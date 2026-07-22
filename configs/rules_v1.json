@@ -448,7 +448,17 @@
       "min_cluster_cells": 4,
       "min_cluster_coverage": 0.30,
       "boundary_erosion_px": 3,
-      "notes": "Local depth plane clustering uses the dense projected xyz image and exact authoritative wall mask after subtracting forbidden, foreground, support, existing-content and non-support masks. It never partitions a shuffled 3-D list by global coordinate ranges."
+      "notes": "Local depth plane clustering uses the dense projected xyz image and exact authoritative wall mask after subtracting forbidden, foreground, support, existing-content and non-support masks. It never partitions a shuffled 3-D list by global coordinate ranges. Plane-normal yaws are 180-degree axes, so n and -n always belong to the same physical heading cluster."
+    },
+    "hierarchical_depth_consensus": {
+      "enabled": true,
+      "min_whole_depth_inlier_ratio": 0.75,
+      "max_whole_depth_vertical_tilt_deg": 12.0,
+      "min_segmented_cluster_coverage": 0.75,
+      "max_segmented_cluster_p90_deg": 6.0,
+      "min_segmented_cluster_cells": 8,
+      "max_depth_yaw_disagreement_deg": 6.0,
+      "notes": "V19 fail-closed recovery for a depth/direct-normal yaw conflict. Whole-wall depth and axial segmented depth must independently pass every gate and agree. Direct normals validate material stability only and never contribute their disputed yaw."
     },
     "notes": "Depth RANSAC remains authoritative for distance and occlusion. Projection removes the depth normal's gravity component. Direct normals validate wall stability. Only authoritative wall-interior seams may validate or correct yaw; post-gravity residuals are recomputed before acceptance. Sensor conflict without a unique three-evidence quorum fails closed."
   },
