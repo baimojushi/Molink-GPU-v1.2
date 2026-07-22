@@ -433,6 +433,22 @@
       "value": 3.0,
       "notes": "During depth/direct-normal conflict arbitration, wall structure must support one heading by at least this angular margin over the other."
     },
+    "controlled_structural_quorum": {
+      "enabled": true,
+      "angle_threshold_deg": 6.0,
+      "notes": "2-of-3 controlled quorum fallback for normal_yaw_conflict when standard three-evidence quorum cannot form. Uses segmented depth planes, reliable direct normals, and enhanced structure direction. Direct normal alone cannot unlock."
+    },
+    "segmented_depth_plane": {
+      "enabled": true,
+      "grid_size": 4,
+      "min_points_per_cell": 50,
+      "min_cell_inlier_ratio": 0.4,
+      "max_cell_tilt_deg": 15.0,
+      "cluster_angle_deg": 6.0,
+      "min_cluster_cells": 4,
+      "min_cluster_coverage": 0.30,
+      "notes": "Local depth plane clustering (4x4 grid) for robust wall heading estimation when whole-wall RANSAC is polluted by occluding furniture."
+    },
     "notes": "Depth RANSAC remains authoritative for distance and occlusion. Projection removes the depth normal's gravity component. Direct normals validate wall stability. Only authoritative wall-interior seams may validate or correct yaw; post-gravity residuals are recomputed before acceptance. Sensor conflict without a unique three-evidence quorum fails closed."
   },
   "existing_art_height_anchor": {

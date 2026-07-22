@@ -220,6 +220,216 @@ def fit_vertical_plane_ransac(
     return WallPlane(tuple(map(float, n)), float(d)), inlier_ratio
 
 
+def estimate_segmented_depth_plane_yaw(
+    points_3d: np.ndarray,
+    wall_mask: np.ndarray,
+    g_hat_cam: np.ndarray,
+    *,
+    grid_size: int = 4,
+    min_points_per_cell: int = 50,
+    min_cell_inlier_ratio: float = 0.4,
+    max_cell_tilt_deg: float = 15.0,
+    cluster_angle_deg: float = 6.0,
+    min_cluster_cells: int = 4,
+    min_cluster_coverage: float = 0.30,
+) -> Tuple[Optional[float], bool, Dict[str, Any]]:
+    """Estimate wall heading from local depth plane clustering.
+
+    Divides the wall into a grid of cells, fits a plane in each cell via
+    RANSAC, and clusters the resulting yaw angles.  The majority-cluster
+    yaw is returned as a more robust alternative to whole-wall RANSAC
+    when the wall contains occluding furniture or depth noise.
+
+    Returns (yaw_rad_or_None, reliable, debug_dict).
+    """
+    pts = np.asarray(points_3d, dtype=np.float32)
+    mask = np.asarray(wall_mask, dtype=np.uint8)
+    g = normalize(np.asarray(g_hat_cam, dtype=np.float32).reshape(3))
+
+    debug: Dict[str, Any] = {
+        "enabled": True,
+        "grid_size": int(grid_size),
+        "total_points": int(len(pts)),
+    }
+
+    if pts.ndim != 2 or pts.shape[1] != 3 or len(pts) < min_points_per_cell * 4:
+        debug["reliable"] = False
+        debug["reason"] = "insufficient_points_for_segmented_depth"
+        return None, False, debug
+
+    # Compute wall bounding box from non-zero mask pixels
+    mask_ys, mask_xs = np.nonzero(mask > 0)
+    if len(mask_ys) < grid_size * grid_size:
+        debug["reliable"] = False
+        debug["reason"] = "insufficient_mask_pixels"
+        return None, False, debug
+
+    y_min, y_max = int(mask_ys.min()), int(mask_ys.max()) + 1
+    x_min, x_max = int(mask_xs.min()), int(mask_xs.max()) + 1
+    cell_h = max(1, (y_max - y_min) // grid_size)
+    cell_w = max(1, (x_max - x_min) // grid_size)
+
+    # Assign each 3D point to a grid cell via its projected pixel coordinate
+    # We need pixel coordinates — derive from mask position heuristic:
+    # points_3d is in camera coords; use x,z as horizontal, y as vertical.
+    # For grid assignment we use the point's index relative to mask ordering.
+    # A simpler approach: use the 3D point's y (vertical) and x (horizontal)
+    # to map into grid cells.
+    finite_mask = np.isfinite(pts).all(axis=1)
+    valid_pts = pts[finite_mask]
+    if len(valid_pts) < min_points_per_cell:
+        debug["reliable"] = False
+        debug["reason"] = "insufficient_finite_points"
+        return None, False, debug
+
+    # Map 3D points to grid cells using camera-projected positions
+    # Use x (horizontal) and -y (vertical, since camera y is down) for grid
+    cell_y_coords = (-valid_pts[:, 1])  # vertical in world
+    cell_x_coords = valid_pts[:, 0]     # horizontal in world
+
+    # Normalize to [0, 1] range
+    y_range = float(cell_y_coords.max() - cell_y_coords.min())
+    x_range = float(cell_x_coords.max() - cell_x_coords.min())
+    if y_range < EPS or x_range < EPS:
+        debug["reliable"] = False
+        debug["reason"] = "degenerate_point_distribution"
+        return None, False, debug
+
+    norm_y = (cell_y_coords - cell_y_coords.min()) / y_range
+    norm_x = (cell_x_coords - cell_x_coords.min()) / x_range
+
+    grid_y = np.clip((norm_y * grid_size).astype(int), 0, grid_size - 1)
+    grid_x = np.clip((norm_x * grid_size).astype(int), 0, grid_size - 1)
+    cell_ids = grid_y * grid_size + grid_x
+
+    cell_yaws: List[float] = []
+    cell_details: List[Dict[str, Any]] = []
+
+    for cell_id in range(grid_size * grid_size):
+        cell_mask = cell_ids == cell_id
+        cell_pts = valid_pts[cell_mask]
+        if len(cell_pts) < min_points_per_cell:
+            cell_details.append({
+                "cell": int(cell_id),
+                "points": int(len(cell_pts)),
+                "skipped": True,
+                "reason": "insufficient_points",
+            })
+            continue
+        try:
+            plane, inlier_ratio = fit_plane_ransac(cell_pts, iterations=300, threshold=0.06)
+        except (ValueError, Exception):
+            cell_details.append({
+                "cell": int(cell_id),
+                "points": int(len(cell_pts)),
+                "skipped": True,
+                "reason": "ransac_failed",
+            })
+            continue
+
+        if inlier_ratio < min_cell_inlier_ratio:
+            cell_details.append({
+                "cell": int(cell_id),
+                "points": int(len(cell_pts)),
+                "inlier_ratio": round(inlier_ratio, 4),
+                "skipped": True,
+                "reason": "low_inlier_ratio",
+            })
+            continue
+
+        n = np.asarray(plane.normal, dtype=np.float32)
+        tilt_deg = float(np.degrees(np.arcsin(np.clip(abs(float(np.dot(n, g))), 0.0, 1.0))))
+        if tilt_deg > max_cell_tilt_deg:
+            cell_details.append({
+                "cell": int(cell_id),
+                "points": int(len(cell_pts)),
+                "tilt_deg": round(tilt_deg, 2),
+                "skipped": True,
+                "reason": "excessive_tilt",
+            })
+            continue
+
+        # Extract horizontal yaw: project normal onto gravity-orthogonal plane
+        horizontal_n = n - float(np.dot(n, g)) * g
+        if float(np.linalg.norm(horizontal_n)) < EPS:
+            continue
+        horizontal_n = normalize(horizontal_n)
+        yaw = float(np.arctan2(float(horizontal_n[2]), float(horizontal_n[0])))
+        cell_yaws.append(yaw)
+        cell_details.append({
+            "cell": int(cell_id),
+            "points": int(len(cell_pts)),
+            "inlier_ratio": round(inlier_ratio, 4),
+            "tilt_deg": round(tilt_deg, 2),
+            "yaw_deg": round(float(np.degrees(yaw)), 2),
+        })
+
+    debug["cells"] = cell_details
+    debug["yaw_count"] = len(cell_yaws)
+
+    if len(cell_yaws) < min_cluster_cells:
+        debug["reliable"] = False
+        debug["reason"] = "insufficient_cells_with_valid_yaws"
+        return None, False, debug
+
+    # Cluster yaws using angular medoid
+    yaw_arr = np.array(cell_yaws, dtype=np.float64)
+    cluster_threshold = float(np.radians(cluster_angle_deg))
+
+    # Simple greedy clustering
+    clusters: List[List[int]] = []
+    assigned = [False] * len(yaw_arr)
+    for i in range(len(yaw_arr)):
+        if assigned[i]:
+            continue
+        cluster = [i]
+        assigned[i] = True
+        for j in range(i + 1, len(yaw_arr)):
+            if assigned[j]:
+                continue
+            diff = abs(float(yaw_arr[i]) - float(yaw_arr[j]))
+            diff = min(diff, 2.0 * math.pi - diff)
+            if diff <= cluster_threshold:
+                cluster.append(j)
+                assigned[j] = True
+        clusters.append(cluster)
+
+    # Find majority cluster
+    clusters.sort(key=len, reverse=True)
+    best_cluster = clusters[0]
+    cluster_size = len(best_cluster)
+    cluster_coverage = cluster_size / len(cell_yaws)
+
+    cluster_yaws = yaw_arr[best_cluster]
+    consensus_yaw = float(np.median(cluster_yaws))
+
+    # Compute cluster spread
+    diffs = np.abs(cluster_yaws - consensus_yaw)
+    diffs = np.minimum(diffs, 2.0 * math.pi - diffs)
+    cluster_p90 = float(np.degrees(np.percentile(diffs, 90))) if len(diffs) > 0 else 180.0
+
+    reliable = bool(
+        cluster_size >= min_cluster_cells
+        and cluster_coverage >= min_cluster_coverage
+        and cluster_p90 <= cluster_angle_deg
+    )
+
+    debug["reliable"] = reliable
+    debug["consensus_yaw_deg"] = round(float(np.degrees(consensus_yaw)), 2)
+    debug["cluster_size"] = cluster_size
+    debug["cluster_coverage"] = round(cluster_coverage, 4)
+    debug["cluster_p90_deg"] = round(cluster_p90, 2)
+    debug["cluster_count"] = len(clusters)
+    debug["all_cluster_sizes"] = [len(c) for c in clusters]
+
+    if reliable:
+        debug["source"] = "segmented_depth_plane_yaw_consensus"
+    else:
+        debug["reason"] = "cluster_quality_gate_failed"
+
+    return consensus_yaw, reliable, debug
+
+
 def estimate_wall_normal_consensus(
     normal_xyz: np.ndarray,
     evidence_mask: np.ndarray,
@@ -477,6 +687,16 @@ def estimate_wall_horizontal_structure_direction(
         if interpretation_length < EPS:
             continue
         interpretation_normal /= interpretation_length
+        # Furniture/texture filter: lines in bottom 30% of wall are likely
+        # furniture edges; very short lines are likely marble texture.
+        wall_height_pixels = max(1, y1 - y0 + 1)
+        midpoint_y_ratio = (midpoint[1] - y0) / wall_height_pixels
+        is_bottom_region = midpoint_y_ratio > 0.70
+        is_short_texture = length < 0.25 * box_w
+        if is_bottom_region:
+            continue  # skip furniture edges in lower wall
+        if is_short_texture:
+            continue  # skip marble texture false positives
         interior_fraction = float(np.mean(mask[sample_y, sample_x] > 0))
         if interior_fraction < float(min_wall_interior_fraction):
             continue
@@ -490,6 +710,7 @@ def estimate_wall_horizontal_structure_direction(
             "gravity_local_angle_deg": gravity_angle,
             "wall_interior_fraction": interior_fraction,
             "wall_interior_length_px": float(length * interior_fraction),
+            "is_bottom_region": is_bottom_region,
         })
 
     # Suppress duplicate Hough fragments from the same physical edge.  Keep
@@ -624,12 +845,24 @@ def estimate_wall_horizontal_structure_direction(
     ])) if inlier_count else 0.0
     direction_angle = _undirected_angle_deg(horizontal_direction, expected_u)
     observed_vp = K @ horizontal_direction
+    # VP containment guard: if the vanishing point projects inside the wall
+    # body, the detected lines are likely marble texture or furniture edges,
+    # not real structural seams.  This is a strong quality penalty.
+    vp_inside_wall_body = False
+    if abs(float(observed_vp[2])) > 1e-8:
+        vp_px = observed_vp[:2] / float(observed_vp[2])
+        if (x0 <= vp_px[0] <= x1 and y0 <= vp_px[1] <= y1):
+            vp_inside_wall_body = True
     predicted_local = _local_image_direction(expected_vp, center_xy)
     observed_local = _local_image_direction(observed_vp, center_xy)
     local_image_angle = _undirected_angle_deg(predicted_local, observed_local) if predicted_local is not None and observed_local is not None else None
     min_offset_span = max(20.0, 0.08 * box_h)
+    # VP containment penalty: when VP falls inside the wall body, require
+    # stronger inlier evidence (≥6 lines) to trust the structure direction.
+    vp_penalty = bool(vp_inside_wall_body and inlier_count < 6)
     reliable = bool(
         inlier_count >= int(min_unique_lines)
+        and not vp_penalty
         and p90 <= float(max_p90_residual_deg)
         and projected_raw_inlier_p90 <= float(max_p90_residual_deg)
         and post_projection_inlier_retention >= float(min_post_projection_inlier_retention)
@@ -662,6 +895,8 @@ def estimate_wall_horizontal_structure_direction(
         "correction_confident": correction_confident,
         "method": "calibrated_image_line_nullspace_ransac_with_gravity_projection",
         "evidence_policy": "authoritative_wall_mask_interior_only_no_ceiling_or_adjacent_trim",
+        "vanishing_point_inside_wall_body": vp_inside_wall_body,
+        "vp_penalty_applied": vp_penalty,
         "raw_line_count": int(len(detected)),
         "filtered_line_count": int(len(candidates)),
         "unique_line_count": int(len(unique)),
@@ -736,6 +971,10 @@ def resolve_wall_projection_plane(
     horizontal_structure_min_inlier_wall_line_fraction: float = 0.75,
     horizontal_structure_min_post_projection_inlier_retention: float = 0.75,
     normal_conflict_structure_support_margin_deg: float = 3.0,
+    controlled_structural_quorum_enabled: bool = False,
+    controlled_structural_quorum_angle_threshold_deg: float = 6.0,
+    segmented_depth_plane_yaw: Optional[float] = None,
+    segmented_depth_plane_confident: bool = False,
 ) -> Tuple[WallPlane, Dict[str, Any]]:
     """Resolve the plane orientation used for artwork perspective.
 
@@ -850,6 +1089,62 @@ def resolve_wall_projection_plane(
     # unresolved metric geometry.
     if normal_yaw_conflict:
         if not structure_reliable or direct_u is None:
+            # Controlled structural quorum fallback: when the standard
+            # three-evidence quorum cannot form, attempt recovery using
+            # segmented depth planes, reliable direct normals, and
+            # enhanced structure direction.
+            if bool(controlled_structural_quorum_enabled):
+                direct_normal_yaw_val = None
+                if direct_u is not None and bool(normal_debug.get("reliable")):
+                    direct_normal_yaw_val = float(np.arctan2(
+                        float(direct_u[2]), float(direct_u[0])
+                    ))
+                structure_yaw_val = None
+                if structure_direction is not None and structure_reliable:
+                    structure_yaw_val = float(np.arctan2(
+                        float(structure_direction[2]), float(structure_direction[0])
+                    ))
+                quorum_recovered, quorum_source, quorum_debug = evaluate_controlled_structural_quorum(
+                    depth_yaw=segmented_depth_plane_yaw,
+                    depth_yaw_confident=bool(segmented_depth_plane_confident),
+                    direct_normal_yaw=direct_normal_yaw_val,
+                    direct_normal_confident=bool(normal_debug.get("reliable")),
+                    structure_yaw=structure_yaw_val,
+                    structure_confident=structure_reliable,
+                    angle_threshold_deg=float(controlled_structural_quorum_angle_threshold_deg),
+                )
+                if quorum_recovered:
+                    consensus_yaw = float(np.radians(quorum_debug.get("consensus_yaw_deg", 0.0)))
+                    recovered_u = np.array([
+                        math.cos(consensus_yaw), 0.0, math.sin(consensus_yaw)
+                    ], dtype=np.float64)
+                    recovered_n = normalize(np.cross(recovered_u, g_hat))
+                    if float(np.dot(recovered_n, depth_n)) < 0.0:
+                        recovered_n = -recovered_n
+                    corrected_d = -float(np.dot(recovered_n, anchor))
+                    return WallPlane(tuple(map(float, recovered_n)), corrected_d), {
+                        "hard_reject": False,
+                        "policy": "controlled_structural_quorum_recovery",
+                        "projection_orientation_source": quorum_source,
+                        "depth_support_plane_preserved": True,
+                        "depth_horizontal_heading_preserved": False,
+                        "direct_normal_used_for_yaw": False,
+                        "depth_plane_normal": [float(x) for x in depth_n],
+                        "depth_plane_vertical_tilt_deg": depth_vertical_tilt,
+                        "max_direct_depth_tilt_deg": float(max_direct_depth_tilt_deg),
+                        "depth_plane_required_verticalization": bool(depth_vertical_tilt > float(max_direct_depth_tilt_deg)),
+                        "depth_normal_disagreement_deg": disagreement,
+                        "depth_direct_normal_yaw_disagreement_deg": yaw_disagreement,
+                        "normal_yaw_conflict_requires_structure_quorum": True,
+                        "normal_recovery_angle_deg": float(normal_recovery_angle_deg),
+                        "hard_conflict_angle_deg": float(hard_conflict_angle_deg),
+                        "resolved_projection_normal": [float(x) for x in recovered_n],
+                        "resolved_projection_normal_dot_gravity_abs": abs(float(np.dot(recovered_n, g_hat))),
+                        "metric_anchor_m": [float(x) for x in anchor],
+                        "normal_consensus": normal_debug,
+                        "horizontal_structure": structure_debug,
+                        "controlled_structural_quorum": quorum_debug,
+                    }
             return depth_plane, {
                 "hard_reject": True,
                 "reason": "depth_direct_normal_yaw_conflict_without_wall_internal_structure_quorum",
@@ -971,6 +1266,115 @@ def resolve_wall_projection_plane(
         "horizontal_structure": structure_debug,
     }
     return WallPlane(tuple(map(float, chosen_n)), chosen_d), debug
+
+
+def evaluate_controlled_structural_quorum(
+    *,
+    depth_yaw: Optional[float],
+    depth_yaw_confident: bool,
+    direct_normal_yaw: Optional[float],
+    direct_normal_confident: bool,
+    structure_yaw: Optional[float],
+    structure_confident: bool,
+    angle_threshold_deg: float = 6.0,
+) -> Tuple[bool, str, Dict[str, Any]]:
+    """Evaluate 2-of-3 controlled structural quorum for wall heading recovery.
+
+    When the normal_yaw_conflict branch in resolve_wall_projection_plane()
+    cannot form a three-evidence quorum, this function attempts recovery using
+    segmented depth planes, reliable direct normals, and enhanced structure
+    direction.
+
+    Recovery conditions:
+    - ≥2 sources agree within angle_threshold_deg
+    - Third source (if available) is low-confidence, not high-confidence opposing
+    - Direct normal alone cannot unlock recovery
+
+    Returns (recovered, source_label, debug_dict).
+    """
+    debug: Dict[str, Any] = {
+        "enabled": True,
+        "angle_threshold_deg": float(angle_threshold_deg),
+        "depth_yaw": round(float(depth_yaw), 4) if depth_yaw is not None else None,
+        "depth_yaw_confident": depth_yaw_confident,
+        "direct_normal_yaw": round(float(direct_normal_yaw), 4) if direct_normal_yaw is not None else None,
+        "direct_normal_confident": direct_normal_confident,
+        "structure_yaw": round(float(structure_yaw), 4) if structure_yaw is not None else None,
+        "structure_confident": structure_confident,
+    }
+
+    sources: List[Tuple[str, float, bool]] = []
+    if depth_yaw is not None:
+        sources.append(("depth", float(depth_yaw), depth_yaw_confident))
+    if direct_normal_yaw is not None:
+        sources.append(("direct_normal", float(direct_normal_yaw), direct_normal_confident))
+    if structure_yaw is not None:
+        sources.append(("structure", float(structure_yaw), structure_confident))
+
+    if len(sources) < 2:
+        debug["recovered"] = False
+        debug["reason"] = "insufficient_sources_for_quorum"
+        return False, "insufficient_sources", debug
+
+    # Check pairwise agreement
+    threshold = float(np.radians(angle_threshold_deg))
+    agreements: List[Tuple[str, str, float]] = []
+    for i in range(len(sources)):
+        for j in range(i + 1, len(sources)):
+            name_i, yaw_i, conf_i = sources[i]
+            name_j, yaw_j, conf_j = sources[j]
+            diff = abs(yaw_i - yaw_j)
+            diff = min(diff, 2.0 * math.pi - diff)
+            if diff <= threshold:
+                agreements.append((name_i, name_j, float(np.degrees(diff))))
+
+    debug["pairwise_agreements"] = [
+        {"sources": [a[0], a[1]], "angle_deg": round(a[2], 2)}
+        for a in agreements
+    ]
+
+    if not agreements:
+        debug["recovered"] = False
+        debug["reason"] = "no_pair_within_threshold"
+        return False, "no_agreement", debug
+
+    # Find the best agreeing pair
+    best_agreement = min(agreements, key=lambda x: x[2])
+    agreeing_sources = {best_agreement[0], best_agreement[1]}
+    agreeing_yaws = [
+        yaw for name, yaw, _ in sources if name in agreeing_sources
+    ]
+    consensus_yaw = float(np.median(agreeing_yaws))
+
+    # Check third source: must not be high-confidence opposing
+    third_sources = [
+        (name, yaw, conf) for name, yaw, conf in sources
+        if name not in agreeing_sources
+    ]
+    for name, yaw, conf in third_sources:
+        diff = abs(yaw - consensus_yaw)
+        diff = min(diff, 2.0 * math.pi - diff)
+        if conf and diff > threshold:
+            # High-confidence opposing source → cannot recover
+            debug["recovered"] = False
+            debug["reason"] = f"third_source_{name}_confidently_opposes"
+            debug["opposing_source"] = name
+            debug["opposing_angle_deg"] = round(float(np.degrees(diff)), 2)
+            return False, "opposed_by_confident_third", debug
+
+    # Direct normal alone cannot unlock
+    if len(agreeing_sources) == 1 and "direct_normal" in agreeing_sources:
+        debug["recovered"] = False
+        debug["reason"] = "direct_normal_alone_cannot_unlock"
+        return False, "direct_normal_only", debug
+
+    source_label = f"controlled_quorum_{'_'.join(sorted(agreeing_sources))}"
+    debug["recovered"] = True
+    debug["consensus_yaw_deg"] = round(float(np.degrees(consensus_yaw)), 2)
+    debug["agreeing_sources"] = sorted(agreeing_sources)
+    debug["source"] = source_label
+    return True, source_label, debug
+
 
 def estimate_g_hat_from_floor_normals(
     normal_xyz: np.ndarray,

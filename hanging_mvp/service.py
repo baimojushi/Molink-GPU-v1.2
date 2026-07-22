@@ -65,7 +65,7 @@ except Exception:  # pragma: no cover - causal layer is optional at runtime
 API_KEY = os.getenv("API_KEY", "")
 ALLOW_UNAUTH_LOCAL = os.getenv("ALLOW_UNAUTH_LOCAL", "").strip().lower() in {"1", "true", "yes", "on"}
 PORT = int(os.getenv("HANGING_MVP_PORT", "6010"))
-HANGING_PIPELINE_BUILD_ID = "2026-07-21-wall-internal-perspective-quorum-v15"
+HANGING_PIPELINE_BUILD_ID = "2026-07-22-controlled-structural-quorum-v17"
 
 
 def _truthy_env(name: str, default: str = "0") -> bool:
@@ -2127,6 +2127,36 @@ async def analyze_hanging_mvp(
                 & np.isfinite(depth_plane_distance_full)
                 & (depth_plane_distance_full < 0.08)
             ).astype(np.uint8) * 255
+
+            # Segmented depth plane yaw: local 4x4 grid clustering for
+            # robust wall heading when whole-wall RANSAC is polluted.
+            seg_depth_yaw = None
+            seg_depth_confident = False
+            seg_depth_debug: dict = {}
+            try:
+                from .geometry import estimate_segmented_depth_plane_yaw
+                sdp_cfg = rules.get("wall_plane_fit", {}).get("segmented_depth_plane", {})
+                if bool(sdp_cfg.get("enabled", False)):
+                    seg_depth_yaw, seg_depth_confident, seg_depth_debug = estimate_segmented_depth_plane_yaw(
+                        basis_points,
+                        wall_mask,
+                        g_hat,
+                        grid_size=int(sdp_cfg.get("grid_size", 4)),
+                        min_points_per_cell=int(sdp_cfg.get("min_points_per_cell", 50)),
+                        min_cell_inlier_ratio=float(sdp_cfg.get("min_cell_inlier_ratio", 0.4)),
+                        max_cell_tilt_deg=float(sdp_cfg.get("max_cell_tilt_deg", 15.0)),
+                        cluster_angle_deg=float(sdp_cfg.get("cluster_angle_deg", 6.0)),
+                        min_cluster_cells=int(sdp_cfg.get("min_cluster_cells", 4)),
+                        min_cluster_coverage=float(sdp_cfg.get("min_cluster_coverage", 0.30)),
+                    )
+            except Exception:
+                pass
+
+            # Controlled structural quorum config
+            csq_cfg = rules.get("wall_plane_fit", {}).get("controlled_structural_quorum", {})
+            csq_enabled = bool(csq_cfg.get("enabled", False))
+            csq_angle = float(csq_cfg.get("angle_threshold_deg", 6.0))
+
             projection_plane, projection_orientation_debug = resolve_wall_projection_plane(
                 depth_support_plane,
                 basis_points,
@@ -2202,6 +2232,10 @@ async def analyze_hanging_mvp(
                 normal_conflict_structure_support_margin_deg=float(rule_value(
                     rules, ["wall_plane_fit", "normal_conflict_structure_support_margin_deg"], 3.0
                 )),
+                controlled_structural_quorum_enabled=csq_enabled,
+                controlled_structural_quorum_angle_threshold_deg=csq_angle,
+                segmented_depth_plane_yaw=seg_depth_yaw,
+                segmented_depth_plane_confident=seg_depth_confident,
             )
             structure_debug = projection_orientation_debug.get("horizontal_structure")
             if isinstance(structure_debug, dict):
@@ -2215,6 +2249,8 @@ async def analyze_hanging_mvp(
                             float(xyxy[2]) * float(sx),
                             float(xyxy[3]) * float(sy),
                         ]
+            if seg_depth_debug:
+                projection_orientation_debug["segmented_depth_plane"] = seg_depth_debug
             wall_filter_debug["projection_orientation"] = projection_orientation_debug
             if bool(projection_orientation_debug.get("hard_reject")):
                 rejected.append({
