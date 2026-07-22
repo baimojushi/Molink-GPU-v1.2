@@ -24,7 +24,7 @@ API_KEY = os.getenv("API_KEY", "")
 ALLOW_UNAUTH_LOCAL = os.getenv("ALLOW_UNAUTH_LOCAL", "").strip().lower() in {"1", "true", "yes", "on"}
 
 app = FastAPI(title="semantic-mvp-bbox-api")
-SEMANTIC_PIPELINE_BUILD_ID = "2026-07-21-semantic-layout-coordinate-quorum-v14"
+SEMANTIC_PIPELINE_BUILD_ID = "2026-07-21-batch-grid-coordinate-quorum-v16"
 
 ROLE_BY_LABEL = {
     "wall": "wall",
@@ -856,6 +856,34 @@ def _score_joint_boundary_coordinate_hypotheses(objects, original_w, original_h,
             }
 
     ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+
+    # Controlled batch quorum for the recurring portrait-image failure mode.
+    # A provider may declare ``pixels`` while emitting ordinary coordinates on
+    # a 0..1000 canvas and copying the original width/height for edge-touching
+    # boxes.  In that case x can be numerically ambiguous (for a 1280px image
+    # the raw values 0..938 are valid in both spaces) even though the *batch*
+    # contains enough independent wall fragments to identify the grid.  Do not
+    # lower the global margin: that would silently mis-scale real
+    # x=pixels/y=grid responses.  Instead, award one bounded, auditable vote
+    # only when all conditions below hold.  Missing any condition keeps the
+    # fail-closed result and exposes the evidence in diagnostics.
+    batch_quorum = _evaluate_batch_grid_quorum(
+        objects,
+        original_w,
+        original_h,
+        x_debug,
+        y_debug,
+        scores,
+        ranked,
+    )
+    if batch_quorum.get("eligible"):
+        grid_key = "grid_boundary_x__grid_boundary_y"
+        # The bonus is deliberately bounded and smaller than the ordinary
+        # topology/edge evidence.  It resolves the known ~0.60 x-only tie but
+        # cannot rescue a materially contradictory scene.
+        scores[grid_key] = float(scores.get(grid_key, -100.0)) + float(batch_quorum["bonus"])
+        ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+
     winner, winner_score = ranked[0]
     runner, runner_score = ranked[1] if len(ranked) > 1 else (None, float("-inf"))
     margin = float(winner_score - runner_score) if runner is not None else float("inf")
@@ -864,7 +892,7 @@ def _score_joint_boundary_coordinate_hypotheses(objects, original_w, original_h,
     min_margin = 0.65 if is_native else 1.05
     accepted = bool(np.isfinite(winner_score) and margin >= min_margin)
     return {
-        "policy": "joint_2d_pixel_grid_hypothesis_with_semantic_layout_quorum_v5",
+        "policy": "joint_2d_pixel_grid_hypothesis_with_batch_grid_quorum_v6",
         "selected": winner if accepted else None,
         "winner": winner,
         "runner_up": runner,
@@ -874,9 +902,136 @@ def _score_joint_boundary_coordinate_hypotheses(objects, original_w, original_h,
         "minimum_score_margin": min_margin,
         "scores": scores,
         "evidence": evidence,
+        "batch_grid_quorum": batch_quorum,
         "fail_closed": not accepted,
         "fail_closed_reason": None if accepted else "joint_coordinate_hypotheses_have_insufficient_evidence_margin",
     }
+
+
+def _evaluate_batch_grid_quorum(objects, original_w, original_h, x_debug, y_debug, scores, ranked):
+    """Return a bounded quorum vote for an ambiguous x-axis grid.
+
+    Root cause (2026-07-21): the same provider repeatedly returned a portrait
+    image's x values on a 0..1000 grid, but used ``width`` for right-edge
+    sentinels.  With only a few objects, pixel and grid explanations are
+    genuinely indistinguishable; with the production batch (many wall
+    fragments spanning the scene) the layout is not.  This helper intentionally
+    requires *independent* evidence: strong y-grid agreement, multiple x edge
+    sentinels, high internal grid coverage, enough objects/wall fragments, and
+    a contiguous multi-segment wall layout.  It must never become a generic
+    fallback or a replacement for the 1.05 non-native margin.
+
+    Never use ``sent_size == original_size`` as a deciding prior.  That metadata
+    describes the image canvas, not the provider's coordinate convention.
+    """
+    result = {
+        "eligible": False,
+        "bonus": 0.0,
+        "policy": "strict_batch_grid_quorum_v1",
+        "conditions": {},
+        "reason": "conditions_not_met",
+    }
+    if not isinstance(x_debug, dict) or not isinstance(y_debug, dict):
+        result["reason"] = "axis_diagnostics_missing"
+        return result
+
+    grid_key = "grid_boundary_x__grid_boundary_y"
+    pixel_x_grid_y = "original_x__grid_boundary_y"
+    score_grid = float((scores or {}).get(grid_key, -100.0))
+    score_runner = float((scores or {}).get(pixel_x_grid_y, -100.0))
+    x_margin = float(x_debug.get("score_margin", -1.0))
+    y_margin = float(y_debug.get("score_margin", -1.0))
+
+    valid = []
+    x_values = []
+    wall_centers = []
+    wall_spans = []
+    for index, obj in enumerate(objects or []):
+        vals = _valid_vlm_bbox_values(obj.get("bbox_xyxy") or obj.get("bbox") or [])
+        if vals is None:
+            continue
+        x1, y1, x2, y2 = vals
+        valid.append(index)
+        x_values.extend((float(x1), float(x2)))
+        label = str(obj.get("label") or "").lower()
+        role = str(obj.get("role") or "").lower()
+        if role == "wall" or label.startswith("wall") or label == "wall":
+            lo, hi = sorted((float(x1), float(x2)))
+            # Original-image edge sentinels are not evidence of wall span.
+            tol = max(2.0, float(original_w) * 0.008)
+            if abs(lo - float(original_w)) <= tol:
+                lo = 1000.0
+            if abs(hi - float(original_w)) <= tol:
+                hi = 1000.0
+            lo = max(0.0, min(1000.0, lo))
+            hi = max(0.0, min(1000.0, hi))
+            if hi - lo >= 45.0:
+                wall_centers.append(0.5 * (lo + hi) / 1000.0)
+                wall_spans.append((lo, hi))
+
+    boundary_count = int(x_debug.get("boundary_sentinel_count") or 0)
+    y_boundary_count = int(y_debug.get("boundary_sentinel_count") or 0)
+    internal_max = float(x_debug.get("internal_max", -1.0))
+    internal_min = float(x_debug.get("internal_min", 10_000.0))
+    # Distinct 25%-wide bins prevent five overlapping edge boxes from looking
+    # like scene coverage.  Require at least three bins and a broad span.
+    bins = {min(3, max(0, int((center * 4.0)))) for center in wall_centers}
+    broad_span = (max(wall_centers) - min(wall_centers)) if wall_centers else 0.0
+    merged = []
+    for lo, hi in sorted(wall_spans):
+        if not merged or lo > merged[-1][1] + 12.0:
+            merged.append([lo, hi])
+        else:
+            merged[-1][1] = max(merged[-1][1], hi)
+    union_coverage = sum(hi - lo for lo, hi in merged) / 1000.0
+    conditions = {
+        "y_grid_strongly_confirmed": bool(
+            y_debug.get("winner") == "grid_boundary"
+            and y_debug.get("accepted")
+            and y_margin >= 1.50
+        ),
+        "x_grid_is_narrow_runner_up": bool(
+            x_debug.get("winner") == "grid_boundary"
+            and 0.45 <= x_margin < 1.05
+            and not x_debug.get("accepted")
+        ),
+        "only_x_mode_is_competing": bool(
+            ranked
+            and ranked[0][0] == grid_key
+            and any(key == pixel_x_grid_y for key, _ in ranked[1:2])
+            and score_grid >= score_runner
+        ),
+        "x_boundary_sentinels": bool(boundary_count >= 3),
+        "y_boundary_sentinel": bool(y_boundary_count >= 1),
+        "internal_x_reaches_grid_high": bool(850.0 <= internal_max <= 1001.0),
+        "internal_x_values_are_grid_bounded": bool(-1.0 <= internal_min and internal_max <= 1001.0),
+        "sufficient_object_batch": bool(len(valid) >= 12),
+        "sufficient_wall_fragments": bool(len(wall_centers) >= 4),
+        "wall_fragments_span_multiple_regions": bool(len(bins) >= 3 and broad_span >= 0.62),
+        "wall_union_coverage": bool(union_coverage >= 0.55),
+    }
+    result["conditions"] = conditions
+    result.update({
+        "object_count": len(valid),
+        "wall_fragment_count": len(wall_centers),
+        "wall_region_bins": sorted(bins),
+        "wall_center_span": float(broad_span),
+        "wall_union_coverage": float(union_coverage),
+        "x_score_margin": x_margin,
+        "y_score_margin": y_margin,
+        "grid_score": score_grid,
+        "pixel_x_grid_y_score": score_runner,
+        "bonus": 0.60,
+    })
+    if all(conditions.values()):
+        result.update({
+            "eligible": True,
+            "reason": "all_independent_batch_grid_quorum_conditions_met",
+        })
+    else:
+        failed = [name for name, passed in conditions.items() if not passed]
+        result["reason"] = "missing_conditions:" + ",".join(failed)
+    return result
 
 def _infer_vlm_bbox_coordinate_space(objects, original_w, original_h, vlm_image_meta: Optional[Dict[str, Any]] = None, image_np=None):
     """Infer whether VLM boxes are original pixels, sent-image pixels, or normalized coordinates.
@@ -952,7 +1107,7 @@ def _infer_vlm_bbox_coordinate_space(objects, original_w, original_h, vlm_image_
             objects, original_w, original_h, x_dynamic, y_dynamic, image_np=image_np
         )
         dynamic_debug = {
-            "policy": "axis_scores_are_diagnostic_inputs_to_joint_2d_v4",
+            "policy": "axis_scores_are_diagnostic_inputs_to_joint_2d_batch_quorum_v6",
             "x": x_dynamic,
             "y": y_dynamic,
             "fail_closed": bool((joint or {}).get("fail_closed")),

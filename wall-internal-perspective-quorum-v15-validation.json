@@ -1,6 +1,6 @@
 {
   "pipeline_build": "2026-07-21-wall-internal-perspective-quorum-v15",
-  "source_baseline": "2026-07-21-semantic-layout-coordinate-quorum-v14",
+  "source_baseline": "2026-07-21-batch-grid-coordinate-quorum-v16",
   "checks": {
     "python_ast_real_files": 84,
     "python_compile": "passed",

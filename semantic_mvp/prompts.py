@@ -74,6 +74,12 @@ to 0..1 or 0..1000, and never mix normalized x values with pixel y values.
 Echo those exact dimensions in image_size_px. This field is an audit signal;
 all bbox_xyxy values must still use the same declared pixel canvas.
 Prioritize high-recall boxes. Coarse bbox is acceptable for MVP.
+
+Coordinate consistency is mandatory: use one coordinate convention for every
+object in this response. Do not copy the original image width/height into a
+grid-coordinate box merely because the box touches an image edge. If the
+provider cannot emit the requested pixel canvas, return an explicit
+coordinate_space declaration and keep all coordinates on that same canvas.
 Required labels when visible:
 wall, floor, roof, sofa, table, cabinet, bar, window, door, tv, mirror, lamp,
 track_lighting, arch, opening, curtain, drape, blind, existing_art, painting, poster, framed_art,
@@ -87,6 +93,9 @@ VLM-first wall proposal rules:
 - Typical cases include left wall, front wall, right wall, and inner wall beyond an opening.
 - If the model is uncertain, still propose separate wall bboxes for visually distinct wall planes instead of one scene-wide wall.
 - If a large wall bbox spans multiple differently oriented wall planes, output the coarsest separate wall proposals you can infer.
+- Do not fragment one continuous wall into many overlapping slivers. Adjacent
+  wall observations that belong to the same plane must be merged into one
+  wall bbox; reserve separate objects for genuinely different planes.
 - Existing displayed artworks, posters, frames, green boards, labels and wall-mounted clutter must be returned separately as existing_content objects, not merged into wall.
 - Opening, arch, door and window must be separate forbidden objects, not merged into wall.
 - Curtains, drapes, sheer curtains and blinds are forbidden non-rigid/window-covering surfaces. Return them separately even when Metric3D makes them look planar; never label them as wall.
@@ -148,6 +157,8 @@ never report coordinates from a provider-internal resize or visual grid.
 
 Also enforce:
 - vlm_first_multiwall: output every visible wall plane separately
+- merge adjacent observations of the same wall plane instead of emitting
+  fragmented overlapping wall slivers
 - do not merge left/front/right walls into one box
 - if visible, include opening/arch/window/door as separate forbidden objects
 - include existing wall artworks as existing_art / painting / poster / framed_art objects

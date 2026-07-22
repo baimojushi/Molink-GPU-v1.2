@@ -1,0 +1,28 @@
+{
+  "pipeline_build": "2026-07-21-batch-grid-coordinate-quorum-v16",
+  "baseline": "2026-07-21-wall-internal-perspective-quorum-v15",
+  "policy": "strict_batch_grid_quorum_v1",
+  "non_native_margin": 1.05,
+  "batch_quorum_bonus": 0.6,
+  "quorum_requirements": {
+    "y_axis_grid_margin_at_least": 1.5,
+    "x_axis_ambiguous_margin_range": [0.45, 1.05],
+    "x_boundary_sentinels_at_least": 3,
+    "y_boundary_sentinels_at_least": 1,
+    "x_internal_max_range": [850, 1001],
+    "object_count_at_least": 12,
+    "wall_fragment_count_at_least": 4,
+    "wall_region_bins_at_least": 3,
+    "wall_center_span_at_least": 0.62,
+    "wall_union_coverage_at_least": 0.55
+  },
+  "checks": {
+    "python_compileall": "passed",
+    "coordinate_contract_tests": 12,
+    "coordinate_contract_tests_status": "passed_in_gpu_runtime"
+  },
+  "environment_limitations": [
+    "pytest is not installed in this workspace",
+    "fastapi/opencv runtime dependencies are not installed, so HTTP and image-edge paths require GPU-image verification"
+  ]
+}

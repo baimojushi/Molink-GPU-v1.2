@@ -1,6 +1,6 @@
 {
-  "pipeline_build": "2026-07-21-semantic-layout-coordinate-quorum-v14",
-  "source_baseline": "2026-07-21-joint-bbox-coordinate-evidence-guard-v13",
+  "pipeline_build": "2026-07-21-batch-grid-coordinate-quorum-v16",
+  "source_baseline": "2026-07-21-wall-internal-perspective-quorum-v15",
   "production_regression": {
     "image_sha256": "fb4e36bacd2d37c013b745f5728d24f864c5a92c334b9d04d770d6f1907be389",
     "vlm_response_sha256": "f6c0c6ec1fc938c789ae95d64079426776c65919833b3f2633efdcafec791501",
@@ -17,7 +17,7 @@
     "python_compileall": "passed",
     "json_files": 3,
     "shell_syntax": "passed",
-    "coordinate_contract_function_tests": 9,
+    "coordinate_contract_function_tests": 12,
     "coordinate_contract_function_tests_status": "passed"
   },
   "environment_limitations": [

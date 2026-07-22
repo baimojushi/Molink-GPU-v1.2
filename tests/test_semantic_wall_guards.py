@@ -5,6 +5,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from semantic_mvp.service import (
     _build_vlm_response_binding,
+    _evaluate_batch_grid_quorum,
     _infer_vlm_bbox_coordinate_space,
     _normalize_vlm_bbox_to_original_pixels,
     _semantic_multiwall_postprocess,
@@ -173,7 +174,7 @@ def test_v13_joint_hypothesis_accepts_grid_xy_when_axis_x_alone_is_weak():
     assert joint["accepted"] is True
     assert joint["selected"] == "grid_boundary_x__grid_boundary_y"
     assert joint["score_margin"] >= joint["minimum_score_margin"]
-    assert joint["policy"] == "joint_2d_pixel_grid_hypothesis_with_semantic_layout_quorum_v5"
+    assert joint["policy"] == "joint_2d_pixel_grid_hypothesis_with_batch_grid_quorum_v6"
 
 
 def test_v13_ambiguous_joint_hypothesis_exposes_no_selected_coordinate_space():
@@ -227,7 +228,7 @@ def test_v14_same_call_regression_resolves_complete_left_front_right_grid_layout
 
     assert mode == "normalized_0_1000_with_original_boundary_sentinels"
     joint = debug["joint_coordinate_inference"]
-    assert joint["policy"] == "joint_2d_pixel_grid_hypothesis_with_semantic_layout_quorum_v5"
+    assert joint["policy"] == "joint_2d_pixel_grid_hypothesis_with_batch_grid_quorum_v6"
     assert joint["accepted"] is True
     assert joint["selected"] == "grid_boundary_x__grid_boundary_y"
     assert joint["score_margin"] >= joint["minimum_score_margin"]
@@ -236,6 +237,74 @@ def test_v14_same_call_regression_resolves_complete_left_front_right_grid_layout
     assert winner["semantic_layout_evidence"]["available"] is True
     assert winner["semantic_layout_evidence"]["front_straddles_image_center"] is True
     assert winner["semantic_layout_score"] > runner["semantic_layout_score"]
+
+
+def test_v16_batch_grid_quorum_resolves_ambiguous_x_without_lowering_margin():
+    """A fragmented, edge-sentinel batch is resolved only by independent quorum.
+
+    This reproduces the 1280x1708 production family: y is strongly grid,
+    x's local margin is 0.60, and many wall fragments span the full scene.
+    The bounded batch vote may unlock grid/grid; a small two-object scene must
+    remain fail-closed.
+    """
+    objects = []
+    # Ten non-overlapping wall fragments across four horizontal regions.  The
+    # raw x values are internal 0..1000 values; the last fragment uses the
+    # original width as an edge sentinel.
+    for i, (x1, x2) in enumerate(((0, 92), (94, 185), (187, 278), (280, 372),
+                                  (374, 470), (472, 570), (572, 670), (672, 770),
+                                  (772, 860), (862, 938))):
+        objects.append({
+            "object_id": f"wall_fragment_{i:02d}",
+            "label": "wall",
+            "role": "wall",
+            "bbox_xyxy": [x1, 220 + (i % 3) * 12, x2, 700 - (i % 2) * 10],
+        })
+    objects.extend([
+        {"object_id": "wall_edge_01", "label": "wall", "role": "wall", "bbox_xyxy": [938, 230, 1280, 690]},
+        {"object_id": "window_01", "label": "window", "role": "forbidden", "bbox_xyxy": [650, 240, 1280, 560]},
+        {"object_id": "floor_01", "label": "floor", "role": "support", "bbox_xyxy": [0, 650, 1280, 1708]},
+        {"object_id": "roof_01", "label": "roof", "role": "support", "bbox_xyxy": [0, 0, 1280, 240]},
+        {"object_id": "door_01", "label": "door", "role": "forbidden", "bbox_xyxy": [80, 250, 170, 680]},
+        {"object_id": "person_01", "label": "person", "role": "foreground", "bbox_xyxy": [440, 480, 520, 760]},
+    ])
+
+    mode, debug = _infer_vlm_bbox_coordinate_space(objects, 1280, 1708)
+
+    assert mode == "normalized_0_1000_with_original_boundary_sentinels"
+    joint = debug["joint_coordinate_inference"]
+    assert joint["accepted"] is True
+    assert joint["selected"] == "grid_boundary_x__grid_boundary_y"
+    assert joint["minimum_score_margin"] == 1.05
+    # This synthetic set is already decisive from ordinary geometry.  Replay
+    # the production x=0.60 tie through the quorum helper explicitly so the
+    # test remains stable if image-edge scoring changes.
+    x_debug = dict(debug["dynamic_axis_coordinate_inference"]["x"])
+    x_debug.update({"winner": "grid_boundary", "accepted": False, "score_margin": 0.60})
+    quorum = _evaluate_batch_grid_quorum(
+        objects,
+        1280,
+        1708,
+        x_debug,
+        debug["dynamic_axis_coordinate_inference"]["y"],
+        {"grid_boundary_x__grid_boundary_y": 8.30, "original_x__grid_boundary_y": 7.70},
+        [("grid_boundary_x__grid_boundary_y", 8.30), ("original_x__grid_boundary_y", 7.70)],
+    )
+    assert quorum["eligible"] is True
+    assert quorum["bonus"] == 0.60
+    assert all(quorum["conditions"].values())
+
+
+def test_v16_batch_grid_quorum_does_not_unlock_small_ambiguous_batch():
+    objects = [
+        {"label": "wall", "role": "wall", "bbox_xyxy": [0, 220, 500, 600]},
+        {"label": "floor", "role": "support", "bbox_xyxy": [0, 600, 1280, 1708]},
+    ]
+    mode, debug = _infer_vlm_bbox_coordinate_space(objects, 1280, 1708)
+    assert mode is None
+    quorum = debug["joint_coordinate_inference"]["batch_grid_quorum"]
+    assert quorum["eligible"] is False
+    assert "sufficient_object_batch" in quorum["reason"]
 
 
 def test_v14_single_or_incomplete_wall_name_cannot_break_coordinate_tie():
