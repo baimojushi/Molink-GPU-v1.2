@@ -101,6 +101,41 @@ def review_hardpaste_exit(image_rgb, candidate: Mapping[str, Any], rules: Mappin
     an OpenAI-compatible VLM when configured. Unreviewed high-risk candidates are
     blocked by default so the Flux batch script only sees approved hard-pastes.
     """
+    hard_constraints = candidate.get("hard_constraints") if isinstance(candidate.get("hard_constraints"), Mapping) else {}
+    projection_guard = hard_constraints.get("projection_degenerate_guard") if isinstance(hard_constraints.get("projection_degenerate_guard"), Mapping) else {}
+    projection_shape = projection_guard.get("projection_shape_gate") if isinstance(projection_guard.get("projection_shape_gate"), Mapping) else {}
+    if not projection_shape:
+        projection = candidate.get("projection") if isinstance(candidate.get("projection"), Mapping) else {}
+        projection_shape = projection.get("shape_gate") if isinstance(projection.get("shape_gate"), Mapping) else {}
+    numeric_hard_reasons = list(dict.fromkeys(
+        [str(x) for x in candidate.get("reject_reasons", []) or [] if str(x)]
+        + [str(x) for x in hard_constraints.get("hard_gate_reasons", []) or [] if str(x)]
+        + [str(x) for x in projection_shape.get("hard_reasons", []) or [] if str(x)]
+    ))
+    numeric_hard_reject = bool(
+        hard_constraints.get("passed") is False
+        or projection_shape.get("status") == "hard_reject"
+        or numeric_hard_reasons
+    )
+    # ROOT CAUSE / DO NOT REGRESS (2026-07-21): the failed hard-paste had
+    # 1.85x aspect distortion, but the former threshold classified it as a
+    # visual-review item and a free-text VLM approved it.  Deterministic metric
+    # hard gates are one-way: no visual model, configuration mode or confidence
+    # score may turn them back into an approved Flux input.
+    if numeric_hard_reject:
+        return {
+            "enabled": True,
+            "required": False,
+            "fail_closed_required": True,
+            "mode": "numeric_geometry_gate",
+            "status": "blocked_by_numeric_geometry_hard_gate",
+            "approved": False,
+            "approved_for_flux_render": False,
+            "confidence": None,
+            "reasons": numeric_hard_reasons or ["hard_constraints_failed"],
+            "visual_review_can_override": False,
+        }
+
     fail_closed_required = bool(candidate.get("hardpaste_vlm_review_fail_closed"))
     requires_review = bool(candidate.get("requires_hardpaste_vlm_review") or fail_closed_required)
     review_all = bool(rule_value(rules, ["exit_review", "review_all_hardpaste"], False))

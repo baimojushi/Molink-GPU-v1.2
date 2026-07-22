@@ -1,0 +1,24 @@
+{
+  "pipeline_build": "2026-07-21-wall-internal-perspective-quorum-v15",
+  "source_baseline": "2026-07-21-semantic-layout-coordinate-quorum-v14",
+  "checks": {
+    "python_ast_real_files": 84,
+    "python_compile": "passed",
+    "json_parse": "passed",
+    "shell_syntax": "passed",
+    "core_function_regressions": "passed_with_dependency_stubs",
+    "zip_integrity": "verified_during_delivery_packaging"
+  },
+  "targeted_regressions": [
+    "depth/direct-normal yaw conflict without wall structure fails closed",
+    "wall-internal structure can uniquely support the direct-normal heading without copying its normal",
+    "structure that supports neither sensor uniquely fails closed",
+    "1.852x anisotropic projection is a numeric hard reject",
+    "numeric geometry hard reject cannot be overridden by visual review",
+    "ceiling lines outside the authoritative wall mask cannot vote"
+  ],
+  "environment_limits": [
+    "OpenCV, FastAPI, requests and pytest are not installed in this workspace",
+    "the full service and OpenCV-backed pytest suite require the production GPU image"
+  ]
+}

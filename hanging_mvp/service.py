@@ -65,7 +65,7 @@ except Exception:  # pragma: no cover - causal layer is optional at runtime
 API_KEY = os.getenv("API_KEY", "")
 ALLOW_UNAUTH_LOCAL = os.getenv("ALLOW_UNAUTH_LOCAL", "").strip().lower() in {"1", "true", "yes", "on"}
 PORT = int(os.getenv("HANGING_MVP_PORT", "6010"))
-HANGING_PIPELINE_BUILD_ID = "2026-07-21-joint-bbox-coordinate-evidence-guard-v13"
+HANGING_PIPELINE_BUILD_ID = "2026-07-21-wall-internal-perspective-quorum-v15"
 
 
 def _truthy_env(name: str, default: str = "0") -> bool:
@@ -1778,7 +1778,7 @@ async def analyze_hanging_mvp(
     projection_size_gate_enabled = False
     max_quad_aspect_ratio_long_over_short = float(rule_value(rules, ["hard_constraints", "max_quad_aspect_ratio_long_over_short"], 8.0))
     projection_shape_review_ratio = float(rule_value(rules, ["projection_shape_gate", "review_distortion_ratio"], 1.55))
-    projection_shape_hard_ratio = float(rule_value(rules, ["projection_shape_gate", "hard_reject_distortion_ratio"], 2.0))
+    projection_shape_hard_ratio = float(rule_value(rules, ["projection_shape_gate", "hard_reject_distortion_ratio"], 1.75))
     projection_opposing_edge_hard_ratio = float(rule_value(rules, ["projection_shape_gate", "hard_reject_opposing_edge_ratio"], 3.0))
     projection_orientation_margin = float(rule_value(rules, ["projection_shape_gate", "orientation_margin_ratio"], 0.08))
     wall_center_composition_weight = float(rule_value(rules, ["candidate_ranking", "wall_center_composition_weight"], 0.32))
@@ -2186,6 +2186,21 @@ async def analyze_hanging_mvp(
                 )),
                 horizontal_structure_correction_max_p90_deg=float(rule_value(
                     rules, ["wall_plane_fit", "horizontal_structure_correction_max_p90_deg"], 1.5
+                )),
+                horizontal_structure_min_wall_interior_fraction=float(rule_value(
+                    rules, ["wall_plane_fit", "horizontal_structure_min_wall_interior_fraction"], 0.82
+                )),
+                horizontal_structure_min_inlier_wall_length_fraction=float(rule_value(
+                    rules, ["wall_plane_fit", "horizontal_structure_min_inlier_wall_length_fraction"], 0.85
+                )),
+                horizontal_structure_min_inlier_wall_line_fraction=float(rule_value(
+                    rules, ["wall_plane_fit", "horizontal_structure_min_inlier_wall_line_fraction"], 0.75
+                )),
+                horizontal_structure_min_post_projection_inlier_retention=float(rule_value(
+                    rules, ["wall_plane_fit", "horizontal_structure_min_post_projection_inlier_retention"], 0.75
+                )),
+                normal_conflict_structure_support_margin_deg=float(rule_value(
+                    rules, ["wall_plane_fit", "normal_conflict_structure_support_margin_deg"], 3.0
                 )),
             )
             structure_debug = projection_orientation_debug.get("horizontal_structure")
@@ -4030,7 +4045,7 @@ async def analyze_hanging_mvp(
             "gravity_contract": "multi_reference_camera_coordinate_consensus_v3",
             "semantic_coordinate_contract": "joint_2d_pixel_grid_hypotheses_with_scene_and_image_evidence_v4",
             "projection_contract": "project_3d_wall_corners_once_no_2d_rectification_v4",
-            "metric3d_orientation_contract": "depth_yaw_preserved_direct_normal_validation_structure_vanishing_gate_v2",
+            "metric3d_orientation_contract": "wall_internal_structure_three_evidence_quorum_post_gravity_gate_v3",
             "wall_fragment_contract": "trusted_sam_component_lineage_and_fail_closed_material_review_v1",
             "render_contract": "fullspace_identity_locked_shadow_v2",
             "worker_result_contract": "render_review_is_completed_review_v1",

@@ -29,7 +29,7 @@ def _verticalized_depth_normal(depth_normal=DEPTH_N, gravity=G):
     return normalize(result)
 
 
-def test_direct_normal_conflict_does_not_replace_depth_yaw():
+def test_direct_normal_conflict_without_wall_structure_quorum_fails_closed():
     normal_xyz, evidence = _coherent_normal_field(DIRECT_N)
     rng = np.random.default_rng(7)
     anchors = np.array([-0.45, -1.59, 10.76], np.float32) + rng.normal(0, 0.02, size=(3000, 3))
@@ -44,22 +44,16 @@ def test_direct_normal_conflict_does_not_replace_depth_yaw():
         horizontal_structure_enabled=False,
     )
 
-    expected = _verticalized_depth_normal()
-    actual = np.asarray(projection_plane.n, np.float32)
-    if float(np.dot(actual, expected)) < 0.0:
-        actual = -actual
-    assert debug["hard_reject"] is False
-    assert debug["projection_orientation_source"] == "depth_plane_gravity_verticalized"
+    assert projection_plane == depth_plane
+    assert debug["hard_reject"] is True
+    assert debug["reason"] == "depth_direct_normal_yaw_conflict_without_wall_internal_structure_quorum"
     assert debug["direct_normal_used_for_yaw"] is False
-    assert debug["depth_horizontal_heading_preserved"] is True
     assert 20.0 < debug["depth_normal_disagreement_deg"] < 22.0
     assert debug["normal_consensus"]["reliable"] is True
-    assert np.allclose(actual, expected, atol=1e-6)
-    assert abs(float(np.dot(actual, G))) < 1e-6
 
 
-def test_depth_yaw_preservation_only_removes_vertical_shear():
-    normal_xyz, evidence = _coherent_normal_field(DIRECT_N)
+def test_depth_yaw_preservation_only_removes_vertical_shear_when_normals_agree():
+    normal_xyz, evidence = _coherent_normal_field(_verticalized_depth_normal())
     center = np.array([-0.41957, -1.35803, 10.93997], np.float32)
     anchors = np.broadcast_to(center, (3000, 3)).copy()
     depth_plane = WallPlane(tuple(float(x) for x in DEPTH_N), -float(np.dot(DEPTH_N, center)))

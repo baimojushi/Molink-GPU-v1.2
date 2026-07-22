@@ -862,7 +862,7 @@ def evaluate_projection_shape_gate(
     artwork_height_m: float,
     *,
     review_distortion_ratio: float = 1.55,
-    hard_reject_distortion_ratio: float = 2.0,
+    hard_reject_distortion_ratio: float = 1.75,
     hard_reject_opposing_edge_ratio: float = 3.0,
     orientation_margin_ratio: float = 0.08,
 ) -> Dict[str, Any]:

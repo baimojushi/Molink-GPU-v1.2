@@ -28,6 +28,21 @@ def test_moderate_perspective_keeps_landscape_orientation_and_passes():
     assert gate["orientation_flip"] is False
 
 
+def test_185x_anisotropic_distortion_is_numeric_hard_reject():
+    gate = evaluate_projection_shape_gate(
+        {
+            "projected_width_height_ratio_ordered": 0.405,
+            "top_bottom_edge_ratio": 1.08,
+            "left_right_edge_ratio": 1.03,
+        },
+        0.6,
+        0.8,
+    )
+    assert 1.84 < gate["aspect_distortion_ratio"] < 1.86
+    assert gate["status"] == "hard_reject"
+    assert "projected_artwork_aspect_distortion_exceeds_hard_limit" in gate["hard_reasons"]
+
+
 def test_gravity_consensus_preserves_camera_pitch_and_drops_outlier():
     pitched_up = np.array([0.04, -0.993, -0.11], np.float32)
     pitched_up /= np.linalg.norm(pitched_up)

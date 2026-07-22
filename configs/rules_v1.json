@@ -245,10 +245,10 @@
   "projection_shape_gate": {
     "enabled": true,
     "review_distortion_ratio": 1.55,
-    "hard_reject_distortion_ratio": 2.0,
+    "hard_reject_distortion_ratio": 1.75,
     "hard_reject_opposing_edge_ratio": 3.0,
     "orientation_margin_ratio": 0.08,
-    "policy": "Preserve width/height edge identity from the 3D quad. Hard-reject orientation flips and extreme anisotropic foreshortening; review moderate distortion. This is independent of projected pixel size."
+    "policy": "Preserve width/height edge identity from the 3D quad. Hard-reject orientation flips and anisotropic distortion above 1.75x; a VLM cannot override numeric hard rejection. This is independent of projected pixel size."
   },
   "existing_content_classes": [
     "existing_art",
@@ -362,11 +362,11 @@
     },
     "normal_recovery_angle_deg": {
       "value": 12.0,
-      "notes": "Deprecated compatibility key. Direct normals no longer replace depth yaw. The disagreement is retained only for diagnostics."
+      "notes": "Depth/direct-normal horizontal-heading disagreement above this active threshold requires a unique wall-interior structure-line quorum; otherwise projection fails closed."
     },
     "hard_conflict_angle_deg": {
       "value": 35.0,
-      "notes": "Deprecated compatibility key. Depth/direct-normal yaw disagreement alone no longer changes the wall heading."
+      "notes": "Maximum wall-interior structure correction allowed after a unique three-evidence quorum. Larger corrections remain hard conflicts."
     },
     "normal_consensus_min_samples": {
       "value": 1000
@@ -413,7 +413,27 @@
     "horizontal_structure_correction_max_p90_deg": {
       "value": 1.5
     },
-    "notes": "Depth RANSAC remains authoritative for distance, occlusion and horizontal wall heading. Projection removes only the depth normal's gravity component. Direct normals validate verticality/material stability. Calibrated wall seams and adjacent trim verify K @ basis_u and may perform a bounded yaw correction or fail closed."
+    "horizontal_structure_min_wall_interior_fraction": {
+      "value": 0.82,
+      "notes": "Every Hough segment must be supported by the authoritative wall mask for at least this fraction. Ceiling/cove/window-adjacent lines cannot vote."
+    },
+    "horizontal_structure_min_inlier_wall_length_fraction": {
+      "value": 0.85,
+      "notes": "At least this fraction of final RANSAC inlier length must lie inside the authoritative wall mask."
+    },
+    "horizontal_structure_min_inlier_wall_line_fraction": {
+      "value": 0.75,
+      "notes": "At least this fraction of final inlier segments must independently satisfy the wall-interior requirement."
+    },
+    "horizontal_structure_min_post_projection_inlier_retention": {
+      "value": 0.75,
+      "notes": "After enforcing gravity orthogonality, at least this fraction of the raw line-consensus cohort must remain inliers; the old 6.77-degree residual regression fails this gate."
+    },
+    "normal_conflict_structure_support_margin_deg": {
+      "value": 3.0,
+      "notes": "During depth/direct-normal conflict arbitration, wall structure must support one heading by at least this angular margin over the other."
+    },
+    "notes": "Depth RANSAC remains authoritative for distance and occlusion. Projection removes the depth normal's gravity component. Direct normals validate wall stability. Only authoritative wall-interior seams may validate or correct yaw; post-gravity residuals are recomputed before acceptance. Sensor conflict without a unique three-evidence quorum fails closed."
   },
   "existing_art_height_anchor": {
     "enabled": true,

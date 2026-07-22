@@ -343,12 +343,16 @@ def estimate_wall_horizontal_structure_direction(
     max_horizontal_tilt_deg: float = 12.0,
     correction_min_inliers: int = 6,
     correction_max_p90_deg: float = 1.5,
+    min_wall_interior_fraction: float = 0.82,
+    min_inlier_wall_length_fraction: float = 0.85,
+    min_inlier_wall_line_fraction: float = 0.75,
+    min_post_projection_inlier_retention: float = 0.75,
 ) -> Tuple[Optional[np.ndarray], Dict[str, Any]]:
     """Estimate a calibrated wall-horizontal vanishing direction.
 
-    Long straight segments are collected from the wall interior and the
-    wall-adjacent upper structural band, where tile seams and ceiling/wall trim
-    commonly provide repeated horizontal evidence.  Every image line ``l`` is
+    Long straight segments are collected strictly from the wall interior,
+    where tile seams and panel joints provide repeated horizontal evidence.
+    Every image line ``l`` is
     converted to its calibrated interpretation-plane normal ``K.T @ l``.  The
     common null-space direction is the 3-D vanishing direction, including the
     valid point-at-infinity case.  This avoids unstable finite vanishing-point
@@ -385,6 +389,7 @@ def estimate_wall_horizontal_structure_direction(
         255,
         -1,
     )
+    wall_evidence_mask = (mask > 0).astype(np.uint8) * 255
 
     if image.ndim == 2:
         gray = np.clip(image, 0, 255).astype(np.uint8)
@@ -398,7 +403,14 @@ def estimate_wall_horizontal_structure_direction(
     canny_low = int(np.clip(0.55 * median_value, 24, 110))
     canny_high = int(np.clip(1.45 * median_value, canny_low + 30, 235))
     edges = cv2.Canny(gray, canny_low, canny_high, L2gradient=True)
-    edges[context_mask == 0] = 0
+    # ROOT CAUSE / DO NOT REGRESS (2026-07-21): the former implementation
+    # detected lines in a context rectangle extending 55% of the wall height
+    # above the SAM wall.  In the failing room, 29/32 RANSAC inliers were
+    # ceiling light-slot edges and 93.78% of their length was outside the wall.
+    # Those lines produced a numerically coherent but visually false vanishing
+    # direction.  Context pixels may still set Canny thresholds, but only the
+    # authoritative wall mask may contribute Hough evidence.
+    edges[wall_evidence_mask == 0] = 0
     min_line_length = max(24, int(round(0.16 * box_w)))
     hough_threshold = max(18, int(round(0.09 * box_w)))
     max_line_gap = max(8, int(round(0.06 * box_w)))
@@ -466,6 +478,8 @@ def estimate_wall_horizontal_structure_direction(
             continue
         interpretation_normal /= interpretation_length
         interior_fraction = float(np.mean(mask[sample_y, sample_x] > 0))
+        if interior_fraction < float(min_wall_interior_fraction):
+            continue
         candidates.append({
             "xyxy": [x_start, y_start, x_end, y_end],
             "midpoint": midpoint,
@@ -475,6 +489,7 @@ def estimate_wall_horizontal_structure_direction(
             "expected_local_angle_deg": expected_angle,
             "gravity_local_angle_deg": gravity_angle,
             "wall_interior_fraction": interior_fraction,
+            "wall_interior_length_px": float(length * interior_fraction),
         })
 
     # Suppress duplicate Hough fragments from the same physical edge.  Keep
@@ -512,7 +527,7 @@ def estimate_wall_horizontal_structure_direction(
     M = np.stack([item["interpretation_normal"] for item in unique], axis=0)
     lengths = np.asarray([item["length_px"] for item in unique], dtype=np.float64)
     weights = np.sqrt(np.maximum(lengths, 1.0))
-    weights *= np.asarray([1.15 if item["wall_interior_fraction"] >= 0.7 else 1.0 for item in unique], dtype=np.float64)
+    weights *= np.asarray([item["wall_interior_fraction"] for item in unique], dtype=np.float64)
     midpoints = np.stack([item["midpoint"] for item in unique], axis=0)
     rng = np.random.default_rng(20260721)
     pair_count = len(unique) * (len(unique) - 1) // 2
@@ -581,12 +596,32 @@ def estimate_wall_horizontal_structure_direction(
     if float(np.dot(horizontal_direction, expected_u)) < 0.0:
         horizontal_direction = -horizontal_direction
     final_residuals = np.degrees(np.arcsin(np.clip(np.abs(M @ horizontal_direction), 0.0, 1.0)))
-    projected_p90 = float(np.percentile(final_residuals[raw_inliers], 90)) if raw_inlier_count else 180.0
-    inlier_count = raw_inlier_count
-    p50 = raw_p50
-    p90 = raw_p90
-    offset_span = float(np.ptp(cross_coordinates[raw_inliers])) if inlier_count >= 2 else 0.0
-    total_inlier_length = float(np.sum(lengths[raw_inliers]))
+    # ROOT CAUSE / DO NOT REGRESS (2026-07-21): gravity projection changes the
+    # candidate direction.  v14 computed this post-projection residual but then
+    # decided `reliable` from the pre-projection inliers/p90.  The failed task
+    # therefore passed with raw p90=1.68 deg even though the direction actually
+    # used for projection had p90=6.77 deg.  Every quality statistic below must
+    # be recomputed for the final, gravity-orthogonal direction.
+    final_inliers = final_residuals <= residual_threshold
+    projected_raw_inlier_p90 = float(np.percentile(final_residuals[raw_inliers], 90)) if raw_inlier_count else 180.0
+    post_projection_inlier_retention = (
+        float(np.count_nonzero(final_inliers & raw_inliers)) / max(1, raw_inlier_count)
+    )
+    inlier_count = int(np.count_nonzero(final_inliers))
+    final_inlier_residuals = final_residuals[final_inliers]
+    p50 = float(np.percentile(final_inlier_residuals, 50)) if len(final_inlier_residuals) else 180.0
+    p90 = float(np.percentile(final_inlier_residuals, 90)) if len(final_inlier_residuals) else 180.0
+    projected_p90 = p90
+    offset_span = float(np.ptp(cross_coordinates[final_inliers])) if inlier_count >= 2 else 0.0
+    total_inlier_length = float(np.sum(lengths[final_inliers]))
+    inlier_wall_length = float(np.sum([
+        item["wall_interior_length_px"] for index, item in enumerate(unique) if bool(final_inliers[index])
+    ]))
+    inlier_wall_length_fraction = inlier_wall_length / max(total_inlier_length, EPS)
+    inlier_wall_line_fraction = float(np.mean([
+        item["wall_interior_fraction"] >= float(min_wall_interior_fraction)
+        for index, item in enumerate(unique) if bool(final_inliers[index])
+    ])) if inlier_count else 0.0
     direction_angle = _undirected_angle_deg(horizontal_direction, expected_u)
     observed_vp = K @ horizontal_direction
     predicted_local = _local_image_direction(expected_vp, center_xy)
@@ -596,9 +631,13 @@ def estimate_wall_horizontal_structure_direction(
     reliable = bool(
         inlier_count >= int(min_unique_lines)
         and p90 <= float(max_p90_residual_deg)
+        and projected_raw_inlier_p90 <= float(max_p90_residual_deg)
+        and post_projection_inlier_retention >= float(min_post_projection_inlier_retention)
         and horizontal_tilt <= float(max_horizontal_tilt_deg)
         and offset_span >= min_offset_span
         and total_inlier_length >= 0.80 * box_w
+        and inlier_wall_length_fraction >= float(min_inlier_wall_length_fraction)
+        and inlier_wall_line_fraction >= float(min_inlier_wall_line_fraction)
     )
     correction_confident = bool(
         reliable
@@ -615,23 +654,35 @@ def estimate_wall_horizontal_structure_direction(
             "expected_local_angle_deg": float(item["expected_local_angle_deg"]),
             "residual_deg": float(raw_residuals[index]),
             "post_gravity_projection_residual_deg": float(final_residuals[index]),
-            "inlier": bool(raw_inliers[index]),
+            "raw_direction_inlier": bool(raw_inliers[index]),
+            "inlier": bool(final_inliers[index]),
         })
     debug = {
         "reliable": reliable,
         "correction_confident": correction_confident,
         "method": "calibrated_image_line_nullspace_ransac_with_gravity_projection",
-        "evidence_policy": "wall_tile_seams_plus_wall_adjacent_horizontal_trim",
+        "evidence_policy": "authoritative_wall_mask_interior_only_no_ceiling_or_adjacent_trim",
         "raw_line_count": int(len(detected)),
         "filtered_line_count": int(len(candidates)),
         "unique_line_count": int(len(unique)),
         "inlier_count": inlier_count,
         "inlier_total_length_px": total_inlier_length,
+        "inlier_wall_interior_length_px": inlier_wall_length,
+        "inlier_wall_interior_length_fraction": inlier_wall_length_fraction,
+        "inlier_wall_line_fraction": inlier_wall_line_fraction,
+        "min_wall_interior_fraction": float(min_wall_interior_fraction),
+        "min_inlier_wall_length_fraction": float(min_inlier_wall_length_fraction),
+        "min_inlier_wall_line_fraction": float(min_inlier_wall_line_fraction),
         "line_offset_span_px": offset_span,
         "min_line_offset_span_px": min_offset_span,
+        "raw_direction_residual_p50_deg": raw_p50,
+        "raw_direction_residual_p90_deg": raw_p90,
         "residual_p50_deg": p50,
         "residual_p90_deg": p90,
         "post_gravity_projection_residual_p90_deg": projected_p90,
+        "post_gravity_projection_raw_inlier_residual_p90_deg": projected_raw_inlier_p90,
+        "post_gravity_projection_inlier_retention": post_projection_inlier_retention,
+        "min_post_projection_inlier_retention": float(min_post_projection_inlier_retention),
         "max_p90_residual_deg": float(max_p90_residual_deg),
         "raw_direction_horizontal_tilt_deg": horizontal_tilt,
         "max_horizontal_tilt_deg": float(max_horizontal_tilt_deg),
@@ -680,15 +731,21 @@ def resolve_wall_projection_plane(
     horizontal_structure_max_horizontal_tilt_deg: float = 12.0,
     horizontal_structure_correction_min_inliers: int = 6,
     horizontal_structure_correction_max_p90_deg: float = 1.5,
+    horizontal_structure_min_wall_interior_fraction: float = 0.82,
+    horizontal_structure_min_inlier_wall_length_fraction: float = 0.85,
+    horizontal_structure_min_inlier_wall_line_fraction: float = 0.75,
+    horizontal_structure_min_post_projection_inlier_retention: float = 0.75,
+    normal_conflict_structure_support_margin_deg: float = 3.0,
 ) -> Tuple[WallPlane, Dict[str, Any]]:
     """Resolve the plane orientation used for artwork perspective.
 
-    Depth remains authoritative for distance and horizontal wall heading.  Its
-    normal is projected onto the gravity-orthogonal subspace, removing only the
-    impossible vertical tilt while preserving yaw.  Direct normals validate
-    verticality/material stability and never overwrite yaw.  Calibrated
-    horizontal structure lines independently verify ``K @ basis_u``; a strong
-    conflict is corrected from the line vanishing direction or fails closed.
+    Depth remains authoritative for distance.  Its normal is projected onto the
+    gravity-orthogonal subspace, removing impossible vertical tilt.  Direct
+    normals independently validate verticality/material stability.  When their
+    horizontal headings disagree beyond ``normal_recovery_angle_deg``, neither
+    is allowed to win alone: wall-interior structure lines must clearly support
+    one hypothesis or the wall fails closed.  A resolved heading always comes
+    from the calibrated structure direction, never by copying a direct normal.
     """
     depth_n = normalize(np.asarray(depth_plane.n, dtype=np.float32).reshape(3))
     g_hat = normalize(np.asarray(g_hat_cam, dtype=np.float32).reshape(3))
@@ -722,6 +779,9 @@ def resolve_wall_projection_plane(
         max_vertical_tilt_deg=float(normal_max_vertical_tilt_deg),
     )
     disagreement = None
+    yaw_disagreement = None
+    direct_vertical_n = None
+    direct_u = None
     chosen_n = depth_vertical_n
     source = "depth_plane_gravity_verticalized"
     if normal_consensus is not None:
@@ -739,6 +799,16 @@ def resolve_wall_projection_plane(
                 "direct_normal_used_for_yaw": False,
                 "normal_consensus": normal_debug,
             }
+
+        if bool(normal_debug.get("reliable")):
+            direct_vertical_n = np.asarray(normal_consensus, dtype=np.float32).reshape(3)
+            direct_vertical_n = direct_vertical_n - float(np.dot(direct_vertical_n, g_hat)) * g_hat
+            if float(np.linalg.norm(direct_vertical_n)) >= EPS:
+                direct_vertical_n = normalize(direct_vertical_n)
+                if float(np.dot(direct_vertical_n, depth_vertical_n)) < 0.0:
+                    direct_vertical_n = -direct_vertical_n
+                yaw_disagreement = _undirected_angle_deg(depth_vertical_n, direct_vertical_n)
+                direct_u = normalize(np.cross(g_hat, direct_vertical_n))
 
     expected_u = normalize(np.cross(g_hat, chosen_n))
     structure_direction = None
@@ -760,46 +830,138 @@ def resolve_wall_projection_plane(
             max_horizontal_tilt_deg=float(horizontal_structure_max_horizontal_tilt_deg),
             correction_min_inliers=int(horizontal_structure_correction_min_inliers),
             correction_max_p90_deg=float(horizontal_structure_correction_max_p90_deg),
+            min_wall_interior_fraction=float(horizontal_structure_min_wall_interior_fraction),
+            min_inlier_wall_length_fraction=float(horizontal_structure_min_inlier_wall_length_fraction),
+            min_inlier_wall_line_fraction=float(horizontal_structure_min_inlier_wall_line_fraction),
+            min_post_projection_inlier_retention=float(horizontal_structure_min_post_projection_inlier_retention),
         )
-        if structure_direction is not None and bool(structure_debug.get("reliable")):
-            structure_angle = _undirected_angle_deg(structure_direction, expected_u)
-            structure_debug["angle_threshold_deg"] = float(horizontal_structure_angle_threshold_deg)
-            structure_debug["max_correction_deg"] = float(horizontal_structure_max_correction_deg)
-            if structure_angle > float(horizontal_structure_angle_threshold_deg):
-                if bool(structure_debug.get("correction_confident")) and structure_angle <= float(horizontal_structure_max_correction_deg):
-                    corrected_n = normalize(np.cross(structure_direction, g_hat))
-                    if float(np.dot(corrected_n, depth_n)) < 0.0:
-                        corrected_n = -corrected_n
-                    chosen_n = corrected_n
-                    source = "depth_yaw_corrected_by_horizontal_structure_vanishing_point"
-                    structure_debug["action"] = "corrected_horizontal_heading"
-                else:
-                    structure_debug["action"] = "fail_closed"
-                    return depth_plane, {
-                        "hard_reject": True,
-                        "reason": "horizontal_structure_and_depth_yaw_conflict_unresolved",
-                        "depth_plane_vertical_tilt_deg": depth_vertical_tilt,
-                        "depth_normal_disagreement_deg": disagreement,
-                        "direct_normal_used_for_yaw": False,
-                        "normal_consensus": normal_debug,
-                        "horizontal_structure": structure_debug,
-                    }
+    structure_reliable = bool(structure_direction is not None and structure_debug.get("reliable"))
+    normal_yaw_conflict = bool(
+        yaw_disagreement is not None
+        and yaw_disagreement > float(normal_recovery_angle_deg)
+    )
+
+    # ROOT CAUSE / DO NOT REGRESS (2026-07-21): v10-v14 treated
+    # normal_recovery_angle_deg as a diagnostic-only value and preserved depth
+    # yaw even when a coherent direct-normal field disagreed by 20.76 degrees.
+    # A VLM later approved the visibly warped paste.  For a real sensor conflict
+    # (>12 deg by default), wall-internal seams must form a three-way quorum and
+    # clearly support exactly one heading.  Visual review is not an arbiter for
+    # unresolved metric geometry.
+    if normal_yaw_conflict:
+        if not structure_reliable or direct_u is None:
+            return depth_plane, {
+                "hard_reject": True,
+                "reason": "depth_direct_normal_yaw_conflict_without_wall_internal_structure_quorum",
+                "depth_plane_vertical_tilt_deg": depth_vertical_tilt,
+                "depth_normal_disagreement_deg": disagreement,
+                "depth_direct_normal_yaw_disagreement_deg": yaw_disagreement,
+                "normal_recovery_angle_deg": float(normal_recovery_angle_deg),
+                "direct_normal_used_for_yaw": False,
+                "normal_consensus": normal_debug,
+                "horizontal_structure": structure_debug,
+            }
+        structure_to_depth = _undirected_angle_deg(structure_direction, expected_u)
+        structure_to_direct = _undirected_angle_deg(structure_direction, direct_u)
+        support_threshold = float(horizontal_structure_angle_threshold_deg)
+        support_margin = float(normal_conflict_structure_support_margin_deg)
+        supports_depth = bool(
+            structure_to_depth <= support_threshold
+            and structure_to_depth + support_margin <= structure_to_direct
+        )
+        supports_direct = bool(
+            structure_to_direct <= support_threshold
+            and structure_to_direct + support_margin <= structure_to_depth
+        )
+        structure_debug.update({
+            "normal_conflict_arbitration": True,
+            "angle_to_depth_heading_deg": structure_to_depth,
+            "angle_to_direct_normal_heading_deg": structure_to_direct,
+            "support_threshold_deg": support_threshold,
+            "support_margin_deg": support_margin,
+            "supports_depth_heading": supports_depth,
+            "supports_direct_normal_heading": supports_direct,
+        })
+        if supports_depth == supports_direct:
+            structure_debug["action"] = "fail_closed_no_unique_three_evidence_quorum"
+            return depth_plane, {
+                "hard_reject": True,
+                "reason": "depth_direct_normal_yaw_conflict_not_uniquely_resolved_by_wall_structure",
+                "depth_plane_vertical_tilt_deg": depth_vertical_tilt,
+                "depth_normal_disagreement_deg": disagreement,
+                "depth_direct_normal_yaw_disagreement_deg": yaw_disagreement,
+                "direct_normal_used_for_yaw": False,
+                "normal_consensus": normal_debug,
+                "horizontal_structure": structure_debug,
+            }
+        if supports_depth:
+            chosen_n = depth_vertical_n
+            source = "depth_yaw_validated_by_wall_internal_structure_quorum"
+            structure_debug["action"] = "depth_heading_wins_three_evidence_quorum"
+        else:
+            correction_angle = _undirected_angle_deg(structure_direction, expected_u)
+            if correction_angle > float(hard_conflict_angle_deg):
+                structure_debug["action"] = "fail_closed_structure_correction_exceeds_hard_limit"
+                return depth_plane, {
+                    "hard_reject": True,
+                    "reason": "wall_structure_heading_correction_exceeds_hard_conflict_limit",
+                    "depth_plane_vertical_tilt_deg": depth_vertical_tilt,
+                    "depth_normal_disagreement_deg": disagreement,
+                    "depth_direct_normal_yaw_disagreement_deg": yaw_disagreement,
+                    "direct_normal_used_for_yaw": False,
+                    "normal_consensus": normal_debug,
+                    "horizontal_structure": structure_debug,
+                }
+            corrected_n = normalize(np.cross(structure_direction, g_hat))
+            if float(np.dot(corrected_n, depth_n)) < 0.0:
+                corrected_n = -corrected_n
+            chosen_n = corrected_n
+            source = "wall_internal_structure_quorum_supports_direct_normal_heading"
+            structure_debug["action"] = "structure_heading_wins_three_evidence_quorum"
+    elif structure_reliable:
+        structure_angle = _undirected_angle_deg(structure_direction, expected_u)
+        structure_debug["angle_threshold_deg"] = float(horizontal_structure_angle_threshold_deg)
+        structure_debug["max_correction_deg"] = float(horizontal_structure_max_correction_deg)
+        if structure_angle > float(horizontal_structure_angle_threshold_deg):
+            if bool(structure_debug.get("correction_confident")) and structure_angle <= float(horizontal_structure_max_correction_deg):
+                corrected_n = normalize(np.cross(structure_direction, g_hat))
+                if float(np.dot(corrected_n, depth_n)) < 0.0:
+                    corrected_n = -corrected_n
+                chosen_n = corrected_n
+                source = "depth_yaw_corrected_by_horizontal_structure_vanishing_point"
+                structure_debug["action"] = "corrected_horizontal_heading"
             else:
-                structure_debug["action"] = "validated_depth_horizontal_heading"
+                structure_debug["action"] = "fail_closed"
+                return depth_plane, {
+                    "hard_reject": True,
+                    "reason": "horizontal_structure_and_depth_yaw_conflict_unresolved",
+                    "depth_plane_vertical_tilt_deg": depth_vertical_tilt,
+                    "depth_normal_disagreement_deg": disagreement,
+                    "direct_normal_used_for_yaw": False,
+                    "normal_consensus": normal_debug,
+                    "horizontal_structure": structure_debug,
+                }
+        else:
+            structure_debug["action"] = "validated_depth_horizontal_heading"
 
     chosen_d = -float(np.dot(chosen_n, anchor))
     debug = {
         "hard_reject": False,
-        "policy": "depth_yaw_preserved_gravity_verticalized_direct_normal_validation_structure_vanishing_gate",
+        "policy": "gravity_verticalized_three_evidence_wall_internal_structure_quorum",
         "projection_orientation_source": source,
         "depth_support_plane_preserved": True,
-        "depth_horizontal_heading_preserved": source == "depth_plane_gravity_verticalized",
+        "depth_horizontal_heading_preserved": source in {
+            "depth_plane_gravity_verticalized",
+            "depth_yaw_validated_by_wall_internal_structure_quorum",
+        },
         "direct_normal_used_for_yaw": False,
         "depth_plane_normal": [float(x) for x in depth_n],
         "depth_plane_vertical_tilt_deg": depth_vertical_tilt,
         "max_direct_depth_tilt_deg": float(max_direct_depth_tilt_deg),
         "depth_plane_required_verticalization": bool(depth_vertical_tilt > float(max_direct_depth_tilt_deg)),
         "depth_normal_disagreement_deg": disagreement,
+        "depth_direct_normal_yaw_disagreement_deg": yaw_disagreement,
+        "normal_yaw_conflict_requires_structure_quorum": normal_yaw_conflict,
         "normal_recovery_angle_deg": float(normal_recovery_angle_deg),
         "hard_conflict_angle_deg": float(hard_conflict_angle_deg),
         "resolved_projection_normal": [float(x) for x in chosen_n],
