@@ -1,0 +1,42 @@
+{
+  "pipeline_build": "2026-07-22-projection-shape-feedback-consensus-v20",
+  "source_baseline": "2026-07-22-axial-depth-hierarchy-consensus-v19",
+  "root_cause": "V19 returned immediately after depth-hierarchy recovery, so a later 1.67x projection-shape warning could not feed back into the wall basis even when the same wall had an exceptionally stable direct-normal field.",
+  "diagnostic_job": "job_024dceb1-a73b-45bb-87b2-1a9664054c50",
+  "recorded_failure": {
+    "physical_width_height_ratio": 0.75,
+    "projected_width_height_ratio": 0.44855359513075516,
+    "aspect_distortion_ratio": 1.6720409960851432,
+    "hierarchical_depth_consensus_recovered": true,
+    "depth_direct_yaw_disagreement_deg": 20.295319927558527,
+    "direct_normal_p90_spread_deg": 0.6355060935020447
+  },
+  "policy": {
+    "stage": "after_strict_depth_hierarchy_before_wall_basis",
+    "geometry": "compare_two_gravity_orthogonal_3d_planes_through_the_same_metric_anchor",
+    "post_projection_2d_rectification": false,
+    "gates": {
+      "depth_probe_distortion_above": 1.55,
+      "direct_probe_distortion_at_or_below": 1.45,
+      "minimum_distortion_improvement": 0.15,
+      "maximum_depth_direct_yaw_disagreement_deg": 35.0,
+      "direct_normal_material_stability_required": true,
+      "depth_hierarchy_must_first_pass_all_v19_gates": true
+    }
+  },
+  "diagnostic_replay": {
+    "depth_hierarchy_probe_distortion_ratio": 1.73586541716419,
+    "direct_normal_probe_distortion_ratio": 1.2276563132280318,
+    "distortion_improvement": 0.5082091039361583,
+    "selected_source": "direct_normal_shape_feedback_after_depth_hierarchy",
+    "expected_actual_candidate_shape_status": "pass"
+  },
+  "validation": {
+    "positive_diagnostic_replay": "passed",
+    "unsafe_alternative_negative_regression": "passed",
+    "hard_sensor_conflict_negative_regression": "passed",
+    "no_2d_quad_mutation_contract": "passed",
+    "full_gpu_end_to_end": "requires deployment image"
+  },
+  "cache_policy": "Restart from Hanging geometry. Do not reuse V19 wall-basis, projected-quad, hard-paste, exit-review or manifest caches."
+}

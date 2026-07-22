@@ -1660,7 +1660,127 @@ def _trusted_sam_wall_evidence(obj, mask_source):
     )
 
 
-def _sanitize_wall_bboxes_against_edge_structures(objects, processed_w, processed_h, sx, sy):
+def _wall_bbox_curtain_guard(obj, objects, image_np, processed_w, processed_h):
+    """Detect a curtain that a VLM has incorrectly returned as ``role=wall``.
+
+    A SAM mask cannot repair a wrong semantic class: a curtain is often a
+    perfectly coherent, near-vertical surface in depth.  This guard therefore
+    runs before wall geometry and uses only conservative, explainable signals:
+    a narrow edge strip beside/inside a window plus (when pixels are available)
+    the strong vertical-fold texture typical of curtains.  It intentionally
+    does not reject broad interior walls merely because they have texture.
+    """
+    box = obj.get("bbox_xyxy_processed") or obj.get("bbox_xyxy") or []
+    if not isinstance(box, (list, tuple)) or len(box) != 4:
+        return {"status": "not_evaluable", "hard_reject": False, "reasons": []}
+    x1, y1, x2, y2 = _clip_box_xyxy(box, processed_w, processed_h)
+    bw = max(1.0, x2 - x1)
+    bh = max(1.0, y2 - y1)
+    area = max(1.0, bw * bh)
+    edge_touch = bool(x1 <= processed_w * 0.025 or x2 >= processed_w * 0.975)
+    structural = {"window", "opening", "door", "curtain", "drape", "blind"}
+    related = []
+    for other in objects or []:
+        if other is obj or str(other.get("role") or "") != "forbidden":
+            continue
+        label = str(other.get("label") or "").strip().lower()
+        if label not in structural:
+            continue
+        obox = other.get("bbox_xyxy_processed") or other.get("bbox_xyxy") or []
+        if not isinstance(obox, (list, tuple)) or len(obox) != 4:
+            continue
+        ox1, oy1, ox2, oy2 = _clip_box_xyxy(obox, processed_w, processed_h)
+        ix1, iy1, ix2, iy2 = max(x1, ox1), max(y1, oy1), min(x2, ox2), min(y2, oy2)
+        overlap = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+        vertical = max(0.0, min(y2, oy2) - max(y1, oy1)) / bh
+        touches = bool(abs(x1 - ox2) <= max(6.0, processed_w * 0.012) or abs(x2 - ox1) <= max(6.0, processed_w * 0.012))
+        related.append({
+            "object_id": other.get("object_id"),
+            "label": label,
+            "overlap_ratio": float(overlap / area),
+            "vertical_overlap_ratio": float(vertical),
+            "edge_adjacent": touches,
+        })
+
+    max_related_overlap = max((x["overlap_ratio"] for x in related), default=0.0)
+    max_related_vertical = max((x["vertical_overlap_ratio"] for x in related), default=0.0)
+    wall_width_fraction = float(bw / max(1.0, float(processed_w)))
+    wall_aspect = float(bh / bw)
+
+    fold_score = None
+    fold_debug = {"available": False}
+    if isinstance(image_np, np.ndarray) and image_np.ndim >= 2:
+        # The semantic postprocess operates in Metric3D processed pixels while
+        # the endpoint keeps the original RGB image.  Convert the crop rather
+        # than silently sampling the wrong vertical strip on resized inputs.
+        image_h, image_w = image_np.shape[:2]
+        image_sx = float(image_w) / max(1.0, float(processed_w))
+        image_sy = float(image_h) / max(1.0, float(processed_h))
+        ix1, iy1 = max(0, int(np.floor(x1 * image_sx))), max(0, int(np.floor(y1 * image_sy)))
+        ix2, iy2 = min(int(image_w), int(np.ceil(x2 * image_sx))), min(int(image_h), int(np.ceil(y2 * image_sy)))
+        crop = image_np[iy1:iy2, ix1:ix2]
+        if crop.shape[0] >= 32 and crop.shape[1] >= 12:
+            gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY) if crop.ndim == 3 else crop
+            gray = np.asarray(gray, dtype=np.float32)
+            gx = np.abs(cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3))
+            gy = np.abs(cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3))
+            # Curtains have repeated vertical folds: x-gradient dominates and
+            # its column energy varies across the strip.  This is only used in
+            # conjunction with the narrow/edge/window context below.
+            col_energy = np.mean(gx, axis=0)
+            fold_score = float(np.mean(gx) / max(1e-6, float(np.mean(gy))))
+            periodicity = float(np.std(col_energy) / max(1e-6, float(np.mean(col_energy))))
+            fold_debug = {
+                "available": True,
+                "x_gradient_y_gradient_ratio": fold_score,
+                "column_energy_variation": periodicity,
+                "crop_size": [int(crop.shape[1]), int(crop.shape[0])],
+            }
+
+    reasons = []
+    hard = False
+    # A window covering most of a wall bbox leaves exactly the curtain strip
+    # seen in production.  Do not retain that residual as a wall even if SAM
+    # returns a high score.
+    if max_related_overlap >= 0.45 and max_related_vertical >= 0.75 and wall_width_fraction <= 0.42:
+        hard = True
+        reasons.extend([
+            "wall_bbox_mostly_window_covered_curtain_residual",
+            "high_coverage_opening_left_narrow_wall_fragment",
+        ])
+    if related and edge_touch and wall_width_fraction <= 0.22 and max_related_vertical >= 0.55:
+        hard = True
+        reasons.append("narrow_edge_wall_adjacent_to_window_or_opening")
+    if edge_touch and wall_aspect >= 2.4 and wall_width_fraction <= 0.18 and fold_score is not None:
+        if fold_score >= 1.35 and float(fold_debug.get("column_energy_variation", 0.0)) >= 0.16:
+            hard = True
+            reasons.append("vertical_fold_texture_on_narrow_edge_wall_bbox")
+    # A curtain can be inset from the image boundary when it hangs inside a
+    # deep window reveal.  Keep the same strict texture thresholds but remove
+    # the edge requirement only for an extremely narrow, very tall strip.
+    if (not hard and wall_aspect >= 3.0 and wall_width_fraction <= 0.14
+            and fold_score is not None
+            and fold_score >= 1.50
+            and float(fold_debug.get("column_energy_variation", 0.0)) >= 0.20):
+        hard = True
+        reasons.append("vertical_fold_texture_on_narrow_wall_bbox")
+
+    return {
+        "status": "hard_reject" if hard else "pass",
+        "hard_reject": bool(hard),
+        "reasons": reasons,
+        "bbox_xyxy_processed": [float(x1), float(y1), float(x2), float(y2)],
+        "wall_width_fraction": wall_width_fraction,
+        "wall_height_width_ratio": wall_aspect,
+        "edge_touch": edge_touch,
+        "related_forbidden_objects": related,
+        "max_related_overlap_ratio": float(max_related_overlap),
+        "max_related_vertical_overlap_ratio": float(max_related_vertical),
+        "fold_texture": fold_debug,
+    }
+
+
+def _sanitize_wall_bboxes_against_edge_structures(objects, processed_w, processed_h, sx, sy, image_np=None):
     """Subtract edge structures from trusted SAM wall evidence.
 
     A previous bbox trim rebuilt a rectangular wall polygon after subtracting a
@@ -1688,6 +1808,25 @@ def _sanitize_wall_bboxes_against_edge_structures(objects, processed_w, processe
         wall_w = max(1.0, wx2 - wx1)
         wall_h = max(1.0, wy2 - wy1)
         min_keep_w = max(55.0, processed_w * 0.045)
+        curtain_guard = _wall_bbox_curtain_guard(obj, objects, image_np, processed_w, processed_h)
+        if curtain_guard.get("hard_reject"):
+            lineage = {
+                "version": "wall_bbox_curtain_guard_v1",
+                "structural_subtraction_applied": False,
+                "trusted_sam_wall_evidence": False,
+                "gate_status": "rejected",
+                "reject_reasons": list(curtain_guard.get("reasons") or []),
+                "curtain_guard": curtain_guard,
+            }
+            trims.append({
+                "wall_id": obj.get("object_id"),
+                "old_bbox_xyxy_processed": orig_box,
+                "new_bbox_xyxy_processed": None,
+                "changed_by": curtain_guard.get("related_forbidden_objects") or [],
+                "wall_mask_lineage": lineage,
+                "status": "dropped",
+            })
+            continue
         wall_mask, wall_mask_source = _semantic_object_mask(obj, processed_w, processed_h)
         wall_area = int(np.count_nonzero(wall_mask))
         trusted_sam_wall = _trusted_sam_wall_evidence(obj, wall_mask_source)
@@ -1821,11 +1960,14 @@ def _sanitize_wall_bboxes_against_edge_structures(objects, processed_w, processe
             obj2['source'] = str(obj2.get('source', 'vlm_bbox_polygon')) + '+edge_structural_mask_subtract'
             obj2['notes'] = (str(obj2.get('notes', '')) + ' | trusted SAM wall component retained after dilated forbidden-mask subtraction; visual material review required').strip()
             obj2['wall_mask_lineage'] = lineage
+            obj2['wall_bbox_curtain_guard'] = curtain_guard
             obj2['requires_wall_material_vlm_review'] = True
             obj2['wall_material_vlm_review_reasons'] = list(lineage['review_reasons'])
             out.append(obj2)
         else:
-            out.append(obj)
+            obj2 = dict(obj)
+            obj2['wall_bbox_curtain_guard'] = curtain_guard
+            out.append(obj2)
     return out, trims
 
 
@@ -2063,7 +2205,7 @@ def _should_augment_wall_set(walls, objects, processed_w):
     need = bool(cov < 0.70 or max_right < processed_w * 0.82 or (right_third_content and max_right < processed_w * 0.90))
     return need, {'coverage_ratio': cov, 'intervals': intervals, 'max_right_x': max_right, 'right_third_content': right_third_content}
 
-def _semantic_multiwall_postprocess(objects, processed_w, processed_h, sx, sy, metric_zip_bytes):
+def _semantic_multiwall_postprocess(objects, processed_w, processed_h, sx, sy, metric_zip_bytes, image_np=None):
     debug = {
         'enabled': True,
         'method': 'vlm_first_plus_geometry_cropped_wall_proposals',
@@ -2077,7 +2219,7 @@ def _semantic_multiwall_postprocess(objects, processed_w, processed_h, sx, sy, m
     wall_objs = [o for o in objects if _is_wall_obj(o)]
     debug['before_wall_count'] = len(wall_objs)
 
-    objects, trim_debug = _sanitize_wall_bboxes_against_edge_structures(objects, processed_w, processed_h, sx, sy)
+    objects, trim_debug = _sanitize_wall_bboxes_against_edge_structures(objects, processed_w, processed_h, sx, sy, image_np=image_np)
     if trim_debug:
         debug['edge_structural_trim'] = trim_debug
     wall_objs = [o for o in objects if _is_wall_obj(o)]
@@ -2402,6 +2544,14 @@ def _build_vlm_objects_in_original_space(raw, original_w, original_h, bbox_coord
     for i, obj in enumerate(objs):
         raw_label = str(obj.get("label", "foreground_object"))
         label, role = _canonical_label_and_role(raw_label, obj.get("role"))
+        # Some vision gateways obey the bbox schema but put the class in free
+        # text (e.g. ``label=wall, notes='sheer curtain over window'``).  Do
+        # not let the structured wall role win over that explicit material
+        # evidence; curtains are forbidden surfaces even when their depth is
+        # planar and SAM can segment them cleanly.
+        notes_hint = str(obj.get("notes") or "").strip().lower()
+        if role == "wall" and re.search(r"\b(sheer\s+curtain|curtain|drape|blind|window\s+covering)\b", notes_hint):
+            label, role = "curtain", "forbidden"
         bbox = obj.get("bbox_xyxy") or obj.get("bbox") or []
         if len(bbox) != 4:
             continue
@@ -2646,7 +2796,9 @@ async def parse_semantics_mvp(
         }
 
     if metric_zip_bytes:
-        out, multiwall_split_debug = _semantic_multiwall_postprocess(out, processed_w, processed_h, sx, sy, metric_zip_bytes)
+        out, multiwall_split_debug = _semantic_multiwall_postprocess(
+            out, processed_w, processed_h, sx, sy, metric_zip_bytes, image_np=image_np
+        )
     else:
         multiwall_split_debug = {
             "enabled": False,

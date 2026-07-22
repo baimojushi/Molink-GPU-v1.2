@@ -14,7 +14,8 @@ from hanging_mvp.candidate_safety import (
 from hanging_mvp.exit_review import review_hardpaste_exit
 from hanging_mvp.client_result import build_client_result
 from hanging_mvp.masks import load_semantic_masks
-from semantic_mvp.service import _semantic_multiwall_postprocess
+from semantic_mvp.service import _semantic_multiwall_postprocess, _wall_bbox_curtain_guard
+from semantic_mvp.service import _build_vlm_objects_in_original_space
 
 
 def _sam_wall(object_id: str, box: list[float]) -> dict:
@@ -168,3 +169,39 @@ def test_client_result_exposes_only_final_manifest_approved_candidates():
     assert result["best_plan"]["candidate_id"] == "front"
     assert result["alternative_plans"] == []
     assert result["public_candidate_policy"] == "final_manifest_approved_for_flux_render_only"
+
+
+def test_direct_wall_label_on_narrow_edge_curtain_is_rejected_without_curtain_label():
+    # The provider sometimes returns the curtain itself as role=wall and omits
+    # both ``curtain`` and ``window``.  A SAM success must not turn that wrong
+    # class into trusted hanging surface evidence.
+    wall = _sam_wall("wall_right_01", [900, 120, 1000, 700])
+    image = np.zeros((700, 1000, 3), dtype=np.uint8)
+    for x in range(900, 1000, 8):
+        image[:, x:x + 3] = 220
+    guard = _wall_bbox_curtain_guard(wall, [wall], image, 1000, 700)
+    assert guard["hard_reject"] is True
+    assert "vertical_fold_texture_on_narrow_edge_wall_bbox" in guard["reasons"]
+
+
+def test_window_adjacent_residual_is_rejected_before_sam_lineage_can_pass():
+    wall = _sam_wall("wall_right_01", [676, 100, 1150, 700])
+    window = _forbidden("window_right_01", "window", [777, 100, 1150, 700])
+    guard = _wall_bbox_curtain_guard(wall, [wall, window], None, 1280, 800)
+    assert guard["hard_reject"] is True
+    assert "wall_bbox_mostly_window_covered_curtain_residual" in guard["reasons"]
+
+
+def test_free_text_curtain_evidence_overrides_misleading_wall_role():
+    out = _build_vlm_objects_in_original_space(
+        {"objects": [{
+            "object_id": "wall_right_01",
+            "label": "wall",
+            "role": "wall",
+            "bbox_xyxy": [800, 100, 999, 900],
+            "notes": "dark sheer curtain covering the window",
+        }]},
+        1000, 1000, "original_pixels",
+    )
+    assert out[0]["label"] == "curtain"
+    assert out[0]["role"] == "forbidden"

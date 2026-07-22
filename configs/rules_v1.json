@@ -458,7 +458,15 @@
       "max_segmented_cluster_p90_deg": 6.0,
       "min_segmented_cluster_cells": 8,
       "max_depth_yaw_disagreement_deg": 6.0,
-      "notes": "V19 fail-closed recovery for a depth/direct-normal yaw conflict. Whole-wall depth and axial segmented depth must independently pass every gate and agree. Direct normals validate material stability only and never contribute their disputed yaw."
+      "projection_shape_feedback": {
+        "enabled": true,
+        "review_distortion_ratio": 1.55,
+        "max_direct_distortion_ratio": 1.45,
+        "min_distortion_improvement": 0.15,
+        "max_depth_direct_yaw_disagreement_deg": 35.0,
+        "notes": "V20 feedback arbitration after strict depth-hierarchy recovery. If the recovered depth heading still produces review-level anisotropic projection, a high-stability direct-normal heading may replace yaw only when a second physical 3-D reprojection passes all gates. It never stretches or rectifies the 2-D quad."
+      },
+      "notes": "V19 fail-closed depth recovery plus V20 projection-shape feedback. Whole-wall and axial segmented depth must first pass every hierarchy gate. A disputed direct-normal yaw remains unavailable unless its stable 3-D plane fixes independently detected projection anisotropy under the nested strict gates."
     },
     "notes": "Depth RANSAC remains authoritative for distance and occlusion. Projection removes the depth normal's gravity component. Direct normals validate wall stability. Only authoritative wall-interior seams may validate or correct yaw; post-gravity residuals are recomputed before acceptance. Sensor conflict without a unique three-evidence quorum fails closed."
   },

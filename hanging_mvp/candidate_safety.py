@@ -162,6 +162,19 @@ def evaluate_wall_mask_lineage(wall: Mapping[str, Any]) -> dict[str, Any]:
     evidence.  A bbox-created residual is not allowed to prove itself is wall.
     """
     lineage = wall.get("wall_mask_lineage") if isinstance(wall.get("wall_mask_lineage"), Mapping) else {}
+    curtain_guard = wall.get("wall_bbox_curtain_guard") if isinstance(wall.get("wall_bbox_curtain_guard"), Mapping) else {}
+    if bool(curtain_guard.get("hard_reject")) or str(curtain_guard.get("status") or "").lower() == "hard_reject":
+        return {
+            "status": "hard_reject",
+            "passed": False,
+            "requires_visual_material_review": False,
+            "hard_reasons": list(dict.fromkeys([
+                "wall_bbox_curtain_guard_rejected",
+                *[str(x) for x in (curtain_guard.get("reasons") or []) if str(x)],
+            ])),
+            "review_reasons": [],
+            "curtain_guard": dict(curtain_guard),
+        }
     structural_subtraction = bool(lineage.get("structural_subtraction_applied"))
     semantic_source = str(wall.get("source") or wall.get("semantic_source") or "").lower()
     object_id = str(wall.get("object_id") or "").lower()
