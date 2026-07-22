@@ -587,6 +587,131 @@ def _camera_matrix(intr: Intrinsics) -> np.ndarray:
     )
 
 
+def evaluate_projection_orientation_shape_feedback(
+    depth_consensus_normal: np.ndarray,
+    direct_normal: np.ndarray,
+    anchor: np.ndarray,
+    g_hat_cam: np.ndarray,
+    intr: Intrinsics,
+    *,
+    review_distortion_ratio: float = 1.55,
+    max_direct_distortion_ratio: float = 1.45,
+    min_distortion_improvement: float = 0.15,
+    max_depth_direct_yaw_disagreement_deg: float = 35.0,
+    probe_width_m: float = 0.60,
+    probe_height_m: float = 0.80,
+) -> Tuple[bool, Optional[np.ndarray], Dict[str, Any]]:
+    """Choose a stable direct-normal heading when depth recovery still warps.
+
+    This is a projection-*orientation* arbitration, not a 2-D aspect-ratio
+    repair.  Both hypotheses form a gravity-orthogonal 3-D wall plane through
+    the same metric anchor; their physical probe corners are then projected
+    with the calibrated camera.  Direct-normal yaw may win only when the depth
+    hierarchy itself produces review-level anisotropy and the alternative is
+    comfortably inside the pass region with a material improvement.
+
+    The caller is responsible for proving that the direct-normal field is a
+    high-quality, single-material wall estimate.  This helper deliberately
+    cannot recover from an absent/unstable normal field.
+    """
+    debug: Dict[str, Any] = {
+        "enabled": True,
+        "policy": "reproject_two_physical_3d_plane_hypotheses_no_2d_width_recovery",
+        "selected": False,
+        "review_distortion_ratio": float(review_distortion_ratio),
+        "max_direct_distortion_ratio": float(max_direct_distortion_ratio),
+        "min_distortion_improvement": float(min_distortion_improvement),
+        "max_depth_direct_yaw_disagreement_deg": float(max_depth_direct_yaw_disagreement_deg),
+        "probe_width_m": float(probe_width_m),
+        "probe_height_m": float(probe_height_m),
+    }
+    try:
+        g_hat = normalize(np.asarray(g_hat_cam, dtype=np.float64).reshape(3))
+        center = np.asarray(anchor, dtype=np.float64).reshape(3)
+        if not np.isfinite(center).all() or float(center[2]) <= EPS:
+            raise ValueError("projection_shape_feedback_anchor_invalid")
+
+        def verticalize(value: np.ndarray) -> np.ndarray:
+            n = normalize(np.asarray(value, dtype=np.float64).reshape(3))
+            n = n - float(np.dot(n, g_hat)) * g_hat
+            if float(np.linalg.norm(n)) < EPS:
+                raise ValueError("projection_shape_feedback_normal_parallel_to_gravity")
+            return normalize(n)
+
+        depth_n = verticalize(depth_consensus_normal)
+        direct_n = verticalize(direct_normal)
+        if float(np.dot(direct_n, depth_n)) < 0.0:
+            direct_n = -direct_n
+        yaw_disagreement = _undirected_angle_deg(depth_n, direct_n)
+
+        def probe(normal: np.ndarray) -> Dict[str, float]:
+            u_axis = normalize(np.cross(g_hat, normal))
+            v_axis = normalize(np.cross(normal, u_axis))
+            if float(np.dot(v_axis, g_hat)) < 0.0:
+                v_axis = -v_axis
+                u_axis = -u_axis
+            half_w = max(1e-3, float(probe_width_m) * 0.5)
+            half_h = max(1e-3, float(probe_height_m) * 0.5)
+            points = np.stack([
+                center - u_axis * half_w + v_axis * half_h,
+                center + u_axis * half_w + v_axis * half_h,
+                center + u_axis * half_w - v_axis * half_h,
+                center - u_axis * half_w - v_axis * half_h,
+            ], axis=0)
+            if np.any(points[:, 2] <= EPS):
+                raise ValueError("projection_shape_feedback_probe_behind_camera")
+            projected = project_points(points.astype(np.float32), intr).astype(np.float64)
+            edges = [
+                float(np.linalg.norm(projected[(index + 1) % 4] - projected[index]))
+                for index in range(4)
+            ]
+            width_px = 0.5 * (edges[0] + edges[2])
+            height_px = 0.5 * (edges[1] + edges[3])
+            width_scale = width_px / max(float(probe_width_m), EPS)
+            height_scale = height_px / max(float(probe_height_m), EPS)
+            scale_ratio = width_scale / max(height_scale, EPS)
+            distortion = max(scale_ratio, 1.0 / max(scale_ratio, EPS))
+            return {
+                "width_px": width_px,
+                "height_px": height_px,
+                "width_px_per_m": width_scale,
+                "height_px_per_m": height_scale,
+                "scale_ratio": scale_ratio,
+                "distortion_ratio": distortion,
+            }
+
+        depth_probe = probe(depth_n)
+        direct_probe = probe(direct_n)
+        improvement = float(depth_probe["distortion_ratio"] - direct_probe["distortion_ratio"])
+        gates = {
+            "yaw_conflict_below_hard_limit": yaw_disagreement <= float(max_depth_direct_yaw_disagreement_deg),
+            "depth_projection_requires_review": depth_probe["distortion_ratio"] > float(review_distortion_ratio),
+            "direct_projection_inside_safe_region": direct_probe["distortion_ratio"] <= float(max_direct_distortion_ratio),
+            "distortion_improvement": improvement >= float(min_distortion_improvement),
+        }
+        selected = bool(all(gates.values()))
+        debug.update({
+            "selected": selected,
+            "gates": gates,
+            "failed_gates": [name for name, passed in gates.items() if not passed],
+            "depth_direct_yaw_disagreement_deg": float(yaw_disagreement),
+            "depth_hierarchy_probe": depth_probe,
+            "direct_normal_probe": direct_probe,
+            "distortion_improvement": improvement,
+            "selected_source": "direct_normal_3d_plane" if selected else "depth_hierarchy_3d_plane",
+        })
+        return selected, direct_n.astype(np.float32) if selected else None, debug
+    except Exception as exc:
+        debug.update({
+            "selected": False,
+            "failed_gates": ["probe_evaluation"],
+            "reason": "projection_orientation_shape_feedback_unavailable",
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+        })
+        return False, None, debug
+
+
 def _local_image_direction(vanishing_h: np.ndarray, point_xy: np.ndarray) -> Optional[np.ndarray]:
     vp = np.asarray(vanishing_h, dtype=np.float64).reshape(3)
     point = np.asarray(point_xy, dtype=np.float64).reshape(2)
@@ -1052,6 +1177,11 @@ def resolve_wall_projection_plane(
     hierarchical_depth_max_segmented_p90_deg: float = 6.0,
     hierarchical_depth_min_segmented_cells: int = 8,
     hierarchical_depth_max_yaw_disagreement_deg: float = 6.0,
+    projection_shape_feedback_enabled: bool = False,
+    projection_shape_feedback_review_distortion_ratio: float = 1.55,
+    projection_shape_feedback_max_direct_distortion_ratio: float = 1.45,
+    projection_shape_feedback_min_distortion_improvement: float = 0.15,
+    projection_shape_feedback_max_depth_direct_yaw_disagreement_deg: float = 35.0,
 ) -> Tuple[WallPlane, Dict[str, Any]]:
     """Resolve the plane orientation used for artwork perspective.
 
@@ -1060,8 +1190,9 @@ def resolve_wall_projection_plane(
     normals independently validate verticality/material stability.  When their
     horizontal headings disagree beyond ``normal_recovery_angle_deg``, neither
     is allowed to win alone: wall-interior structure lines must clearly support
-    one hypothesis or the wall fails closed.  A resolved heading always comes
-    from the calibrated structure direction, never by copying a direct normal.
+    one hypothesis or the wall fails closed.  After a strict depth-hierarchy
+    recovery, a stable direct-normal heading may replace depth yaw only through
+    the separately gated physical 3-D projection-shape feedback policy.
     """
     depth_n = normalize(np.asarray(depth_plane.n, dtype=np.float32).reshape(3))
     g_hat = normalize(np.asarray(g_hat_cam, dtype=np.float32).reshape(3))
@@ -1207,14 +1338,58 @@ def resolve_wall_projection_plane(
                     recovered_n = normalize(np.array([nx, ny, nz], dtype=np.float64))
                     if float(np.dot(recovered_n, depth_n)) < 0.0:
                         recovered_n = -recovered_n
-                    corrected_d = -float(np.dot(recovered_n, anchor))
-                    return WallPlane(tuple(map(float, recovered_n)), corrected_d), {
+                    # ROOT CAUSE / DO NOT REGRESS (2026-07-22, V20): V19
+                    # returned here immediately.  In job_024dceb1 the two
+                    # depth estimators agreed at -31.8 deg, yet that heading
+                    # compressed a physical 0.75 aspect ratio to 0.449
+                    # (1.67x distortion).  The later shape gate could only
+                    # request VLM review; it could not feed this contradiction
+                    # back into the wall basis.  Compare two real 3-D planes
+                    # through the same metric anchor before committing.  This
+                    # must never become a post-projection 2-D width stretch.
+                    shape_feedback_debug: Dict[str, Any] = {
+                        "enabled": bool(projection_shape_feedback_enabled),
+                        "selected": False,
+                        "reason": "projection_shape_feedback_disabled",
+                    }
+                    selected_n = recovered_n
+                    selected_source = "whole_and_segmented_depth_hierarchy_consensus"
+                    selected_policy = "axial_depth_hierarchy_consensus"
+                    direct_used_for_yaw = False
+                    depth_heading_preserved = True
+                    if (
+                        bool(projection_shape_feedback_enabled)
+                        and direct_vertical_n is not None
+                        and intr is not None
+                        and bool(normal_debug.get("reliable"))
+                    ):
+                        shape_selected, shape_normal, shape_feedback_debug = evaluate_projection_orientation_shape_feedback(
+                            recovered_n,
+                            direct_vertical_n,
+                            anchor,
+                            g_hat,
+                            intr,
+                            review_distortion_ratio=float(projection_shape_feedback_review_distortion_ratio),
+                            max_direct_distortion_ratio=float(projection_shape_feedback_max_direct_distortion_ratio),
+                            min_distortion_improvement=float(projection_shape_feedback_min_distortion_improvement),
+                            max_depth_direct_yaw_disagreement_deg=float(projection_shape_feedback_max_depth_direct_yaw_disagreement_deg),
+                        )
+                        if shape_selected and shape_normal is not None:
+                            selected_n = normalize(np.asarray(shape_normal, dtype=np.float64).reshape(3))
+                            if float(np.dot(selected_n, depth_n)) < 0.0:
+                                selected_n = -selected_n
+                            selected_source = "direct_normal_shape_feedback_after_depth_hierarchy"
+                            selected_policy = "projection_shape_feedback_orientation_recovery"
+                            direct_used_for_yaw = True
+                            depth_heading_preserved = False
+                    corrected_d = -float(np.dot(selected_n, anchor))
+                    return WallPlane(tuple(map(float, selected_n)), corrected_d), {
                         "hard_reject": False,
-                        "policy": "axial_depth_hierarchy_consensus",
-                        "projection_orientation_source": "whole_and_segmented_depth_hierarchy_consensus",
+                        "policy": selected_policy,
+                        "projection_orientation_source": selected_source,
                         "depth_support_plane_preserved": True,
-                        "depth_horizontal_heading_preserved": True,
-                        "direct_normal_used_for_yaw": False,
+                        "depth_horizontal_heading_preserved": depth_heading_preserved,
+                        "direct_normal_used_for_yaw": direct_used_for_yaw,
                         "depth_plane_normal": [float(x) for x in depth_n],
                         "depth_plane_vertical_tilt_deg": depth_vertical_tilt,
                         "depth_plane_inlier_ratio": whole_depth_plane_inlier_ratio,
@@ -1225,12 +1400,13 @@ def resolve_wall_projection_plane(
                         "normal_yaw_conflict_requires_structure_quorum": True,
                         "normal_recovery_angle_deg": float(normal_recovery_angle_deg),
                         "hard_conflict_angle_deg": float(hard_conflict_angle_deg),
-                        "resolved_projection_normal": [float(x) for x in recovered_n],
-                        "resolved_projection_normal_dot_gravity_abs": abs(float(np.dot(recovered_n, g_hat))),
+                        "resolved_projection_normal": [float(x) for x in selected_n],
+                        "resolved_projection_normal_dot_gravity_abs": abs(float(np.dot(selected_n, g_hat))),
                         "metric_anchor_m": [float(x) for x in anchor],
                         "normal_consensus": normal_debug,
                         "horizontal_structure": structure_debug,
                         "hierarchical_depth_consensus": hierarchy_debug,
+                        "projection_shape_feedback": shape_feedback_debug,
                     }
             # Controlled structural quorum fallback: when the standard
             # three-evidence quorum cannot form, attempt recovery using

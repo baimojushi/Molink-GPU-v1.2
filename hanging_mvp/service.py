@@ -65,7 +65,7 @@ except Exception:  # pragma: no cover - causal layer is optional at runtime
 API_KEY = os.getenv("API_KEY", "")
 ALLOW_UNAUTH_LOCAL = os.getenv("ALLOW_UNAUTH_LOCAL", "").strip().lower() in {"1", "true", "yes", "on"}
 PORT = int(os.getenv("HANGING_MVP_PORT", "6010"))
-HANGING_PIPELINE_BUILD_ID = "2026-07-22-axial-depth-hierarchy-consensus-v19"
+HANGING_PIPELINE_BUILD_ID = "2026-07-22-projection-shape-feedback-consensus-v20"
 
 
 def _truthy_env(name: str, default: str = "0") -> bool:
@@ -2345,6 +2345,21 @@ async def analyze_hanging_mvp(
                 hierarchical_depth_max_yaw_disagreement_deg=float(rule_value(
                     rules, ["wall_plane_fit", "hierarchical_depth_consensus", "max_depth_yaw_disagreement_deg"], 6.0
                 )),
+                projection_shape_feedback_enabled=bool(rule_value(
+                    rules, ["wall_plane_fit", "hierarchical_depth_consensus", "projection_shape_feedback", "enabled"], True
+                )),
+                projection_shape_feedback_review_distortion_ratio=float(rule_value(
+                    rules, ["wall_plane_fit", "hierarchical_depth_consensus", "projection_shape_feedback", "review_distortion_ratio"], 1.55
+                )),
+                projection_shape_feedback_max_direct_distortion_ratio=float(rule_value(
+                    rules, ["wall_plane_fit", "hierarchical_depth_consensus", "projection_shape_feedback", "max_direct_distortion_ratio"], 1.45
+                )),
+                projection_shape_feedback_min_distortion_improvement=float(rule_value(
+                    rules, ["wall_plane_fit", "hierarchical_depth_consensus", "projection_shape_feedback", "min_distortion_improvement"], 0.15
+                )),
+                projection_shape_feedback_max_depth_direct_yaw_disagreement_deg=float(rule_value(
+                    rules, ["wall_plane_fit", "hierarchical_depth_consensus", "projection_shape_feedback", "max_depth_direct_yaw_disagreement_deg"], 35.0
+                )),
             )
             structure_debug = projection_orientation_debug.get("horizontal_structure")
             if isinstance(structure_debug, dict):
@@ -4189,8 +4204,8 @@ async def analyze_hanging_mvp(
             "support_contract": "recognized_support_label_specific_clearance_v5",
             "gravity_contract": "multi_reference_camera_coordinate_consensus_v3",
             "semantic_coordinate_contract": "joint_2d_pixel_grid_hypotheses_with_scene_and_image_evidence_v4",
-            "projection_contract": "project_3d_wall_corners_once_no_2d_rectification_v4",
-            "metric3d_orientation_contract": "wall_internal_structure_three_evidence_quorum_post_gravity_gate_v3",
+            "projection_contract": "project_3d_wall_corners_once_with_preprojection_shape_feedback_v5",
+            "metric3d_orientation_contract": "depth_hierarchy_then_stable_direct_normal_shape_feedback_v4",
             "wall_fragment_contract": "trusted_sam_component_lineage_and_fail_closed_material_review_v1",
             "render_contract": "fullspace_identity_locked_shadow_v2",
             "worker_result_contract": "render_review_is_completed_review_v1",

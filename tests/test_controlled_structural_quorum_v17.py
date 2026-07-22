@@ -83,13 +83,10 @@ class TestEvaluateControlledStructuralQuorum:
             structure_confident=False,
             angle_threshold_deg=6.0,
         )
-        # depth and direct_normal agree (both 12°), but only direct_normal
-        # is confident. Since "direct_normal" is in agreeing_sources and
-        # depth is also in agreeing_sources (even though not confident),
-        # the "direct_normal alone" check doesn't trigger. This is correct
-        # because depth still provides geometric evidence.
-        # The quorum should recover.
-        assert recovered is True
+        # A low-confidence depth estimate has no vote.  V18+ must not count it
+        # beside the direct normal merely because their numeric yaws match.
+        assert recovered is False
+        assert debug["reason"] == "insufficient_confident_sources_for_quorum"
 
     def test_insufficient_sources(self):
         """Only one source available → cannot form quorum."""
