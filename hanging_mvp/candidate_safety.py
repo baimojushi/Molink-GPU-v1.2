@@ -163,6 +163,25 @@ def evaluate_wall_mask_lineage(wall: Mapping[str, Any]) -> dict[str, Any]:
     """
     lineage = wall.get("wall_mask_lineage") if isinstance(wall.get("wall_mask_lineage"), Mapping) else {}
     structural_subtraction = bool(lineage.get("structural_subtraction_applied"))
+    semantic_source = str(wall.get("source") or wall.get("semantic_source") or "").lower()
+    object_id = str(wall.get("object_id") or "").lower()
+    geometry_proposal = bool(
+        "geometry_proposal" in semantic_source
+        or "geometry_auto" in semantic_source
+        or object_id.startswith("wall_geometry_auto_")
+    )
+    if geometry_proposal and not bool(lineage.get("trusted_sam_wall_evidence")):
+        # Defense in depth for cached v16/v17 semantics.  Semantic v18 no
+        # longer promotes these records, but Hanging must not trust an older
+        # JSON just because it already contains role=wall.
+        return {
+            "status": "hard_reject",
+            "passed": False,
+            "requires_visual_material_review": False,
+            "hard_reasons": ["geometry_wall_missing_independent_semantic_and_sam_lineage"],
+            "review_reasons": [],
+            "geometry_proposal": True,
+        }
     if not structural_subtraction:
         return {
             "status": "not_applicable",

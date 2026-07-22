@@ -24,7 +24,36 @@ API_KEY = os.getenv("API_KEY", "")
 ALLOW_UNAUTH_LOCAL = os.getenv("ALLOW_UNAUTH_LOCAL", "").strip().lower() in {"1", "true", "yes", "on"}
 
 app = FastAPI(title="semantic-mvp-bbox-api")
-SEMANTIC_PIPELINE_BUILD_ID = "2026-07-21-batch-grid-coordinate-quorum-v16"
+SEMANTIC_PIPELINE_BUILD_ID = "2026-07-21-semantic-provenance-and-local-wall-guard-v18"
+
+
+def _allow_mock_semantics() -> bool:
+    """Return whether deterministic mock semantics may cross the API boundary.
+
+    ROOT CAUSE / DO NOT REGRESS (2026-07-21): production ``auto`` mode used to
+    turn a missing/failed VLM provider into two mock boxes and return
+    ``status=ok``.  The alignment call then accepted that payload as a seed and
+    geometry post-processing split its one coarse wall into four pseudo-walls,
+    including curtains.  Mock data is useful for explicit smoke tests only; it
+    must never masquerade as production semantic evidence.
+    """
+    return os.getenv("SEMANTIC_ALLOW_MOCK_MODE", "").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+
+
+def _semantic_payload_uses_mock(payload: dict[str, Any] | None) -> tuple[bool, str]:
+    payload = payload if isinstance(payload, dict) else {}
+    binding = payload.get("vlm_response_binding")
+    binding = binding if isinstance(binding, dict) else {}
+    provider = str(binding.get("provider") or "").strip().lower()
+    warnings = [str(item).lower() for item in (payload.get("warnings") or [])]
+    raw_warning = str(payload.get("warning") or "").lower()
+    if provider in {"mock", "mock_fallback"}:
+        return True, f"vlm_response_binding.provider={provider}"
+    if "fallback_to_mock" in raw_warning or any("fallback_to_mock" in item for item in warnings):
+        return True, "semantic_warning_reports_mock_fallback"
+    return False, ""
 
 ROLE_BY_LABEL = {
     "wall": "wall",
@@ -2072,23 +2101,22 @@ def _semantic_multiwall_postprocess(objects, processed_w, processed_h, sx, sy, m
         geometry_walls, geometry_debug = _geometry_wall_candidates_full_scene(objects, processed_w, processed_h, sx, sy, metric_zip_bytes)
         debug['full_scene_geometry_augment_debug'] = geometry_debug
         if geometry_walls:
-            objects_aug, added = _append_missing_geometry_walls(objects, geometry_walls, processed_w)
-            if added:
-                objects = objects_aug
-                wall_objs = [o for o in objects if _is_wall_obj(o)]
-                debug['used'] = True
-                debug['reason'] = 'full_scene_geometry_added_missing_wall_planes'
-                debug['created'] = [
-                    {
-                        'object_id': o.get('object_id'),
-                        'bbox_xyxy_processed': o.get('bbox_xyxy_processed'),
-                        'position_hint': o.get('position_hint'),
-                        'source': o.get('source'),
-                    }
-                    for o in added
-                ]
-                debug['after_wall_count'] = len(wall_objs)
-                return objects, debug
+            # ROOT CAUSE / DO NOT REGRESS (2026-07-21): normal buckets can
+            # describe a curtain as a clean vertical plane.  These proposals
+            # have no independent VLM identity and no SAM wall lineage, so they
+            # are diagnostic hints only and may not become hanging walls.
+            debug['diagnostic_geometry_proposals'] = [
+                {
+                    'object_id': o.get('object_id'),
+                    'bbox_xyxy_processed': o.get('bbox_xyxy_processed'),
+                    'position_hint': o.get('position_hint'),
+                    'source': o.get('source'),
+                    'eligible_for_hanging': False,
+                    'reject_reason': 'geometry_proposal_missing_independent_semantic_and_sam_wall_lineage',
+                }
+                for o in geometry_walls
+            ]
+            debug['geometry_proposals_promoted'] = False
         if len(wall_objs) >= 2:
             debug['after_wall_count'] = len(wall_objs)
             debug['used'] = bool(trim_debug)
@@ -2246,11 +2274,27 @@ def _semantic_multiwall_postprocess(objects, processed_w, processed_h, sx, sy, m
             'position_hint': cand.get('position_hint'),
         })
 
-    new_objects = [o for o in objects if o is not coarse_wall]
-    new_objects = split_walls + new_objects
-    debug['used'] = True
-    debug['after_wall_count'] = len(split_walls)
-    return new_objects, debug
+    # Do not replace one coarse semantic wall with geometry-only normal
+    # clusters.  Preserve the original wall and expose the clusters only for
+    # diagnosis/retry planning.  A later real VLM+SAM call must create each
+    # wall independently before Hanging may consume it.
+    debug['diagnostic_geometry_proposals'] = [
+        {
+            'object_id': item.get('object_id'),
+            'bbox_xyxy_processed': item.get('bbox_xyxy_processed'),
+            'position_hint': item.get('position_hint'),
+            'source': item.get('source'),
+            'eligible_for_hanging': False,
+            'reject_reason': 'geometry_split_missing_independent_semantic_and_sam_wall_lineage',
+        }
+        for item in split_walls
+    ]
+    debug['geometry_proposals_promoted'] = False
+    debug['used'] = False
+    debug['reason'] = 'geometry_split_kept_diagnostic_only_missing_independent_wall_lineage'
+    debug['after_wall_count'] = len(wall_objs)
+    debug['created'] = []
+    return objects, debug
 
 
 def _objects_have_original_geometry(objects):
@@ -2475,6 +2519,19 @@ async def parse_semantics_mvp(
         seed_objects = seed_payload.get("objects", [])
         if not isinstance(seed_objects, list):
             raise HTTPException(400, "semantic_seed_json.objects must be a list")
+        seed_is_mock, seed_mock_reason = _semantic_payload_uses_mock(seed_payload)
+        if seed_is_mock and not _allow_mock_semantics():
+            # The parallel alignment call is a trust boundary too.  Rejecting
+            # only the first call is insufficient because a cached v16 mock
+            # seed could otherwise be resubmitted and promoted by geometry.
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "untrusted_mock_semantic_seed",
+                    "reason": seed_mock_reason,
+                    "repair_hint": "configure a real VLM provider and rerun from the first semantic call; do not reuse this seed or its geometry proposals",
+                },
+            )
         out = _remap_objects_to_processed_space(seed_objects, processed_w, processed_h, sx, sy)
         bbox_coordinate_debug = seed_payload.get("vlm_bbox_coordinate_debug") or bbox_coordinate_debug
         sam_debug = seed_payload.get("sam_debug") or sam_debug
@@ -2503,10 +2560,37 @@ async def parse_semantics_mvp(
     else:
         artwork_analysis = _parse_artwork_analysis_for_semantics(artwork_image, artwork_vlm_enable, vlm_mode)
 
+        if str(vlm_mode or "auto").strip().lower() == "mock" and not _allow_mock_semantics():
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "mock_semantics_disabled",
+                    "reason": "explicit mock mode is restricted to deterministic tests",
+                    "repair_hint": "configure VLM_PROVIDER=openai_compatible with VLM_API_URL, VLM_API_KEY and VLM_MODEL",
+                },
+            )
+
         # VLM sees the original image. Some providers still return normalized
         # visual coordinates, so normalize before any SAM or Metric3D alignment.
         raw = parse_with_vlm(image_bytes, scene_profile, vlm_mode, original_w, original_h)
         vlm_response_binding = _build_vlm_response_binding(raw, image_bytes)
+        raw_is_mock, raw_mock_reason = _semantic_payload_uses_mock({
+            "warning": raw.get("warning") if isinstance(raw, dict) else None,
+            "vlm_response_binding": vlm_response_binding,
+        })
+        if raw_is_mock and not _allow_mock_semantics():
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "semantic_vlm_provider_unavailable",
+                    "reason": raw_mock_reason,
+                    "vlm_response_binding": {
+                        key: value for key, value in vlm_response_binding.items()
+                        if key != "raw_response_snapshot"
+                    },
+                    "repair_hint": "restore the real VLM provider and rerun semantic; geometry fallback is not valid wall evidence",
+                },
+            )
         objs = raw.get("objects", [])
         vlm_image_meta = raw.get("_vlm_image_meta") if isinstance(raw, dict) else None
         coordinate_inference_meta = dict(vlm_image_meta or {})

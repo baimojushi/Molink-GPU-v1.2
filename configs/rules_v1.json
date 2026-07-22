@@ -447,7 +447,8 @@
       "cluster_angle_deg": 6.0,
       "min_cluster_cells": 4,
       "min_cluster_coverage": 0.30,
-      "notes": "Local depth plane clustering (4x4 grid) for robust wall heading estimation when whole-wall RANSAC is polluted by occluding furniture."
+      "boundary_erosion_px": 3,
+      "notes": "Local depth plane clustering uses the dense projected xyz image and exact authoritative wall mask after subtracting forbidden, foreground, support, existing-content and non-support masks. It never partitions a shuffled 3-D list by global coordinate ranges."
     },
     "notes": "Depth RANSAC remains authoritative for distance and occlusion. Projection removes the depth normal's gravity component. Direct normals validate wall stability. Only authoritative wall-interior seams may validate or correct yaw; post-gravity residuals are recomputed before acceptance. Sensor conflict without a unique three-evidence quorum fails closed."
   },

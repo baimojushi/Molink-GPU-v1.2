@@ -249,10 +249,17 @@ def estimate_segmented_depth_plane_yaw(
     debug: Dict[str, Any] = {
         "enabled": True,
         "grid_size": int(grid_size),
-        "total_points": int(len(pts)),
+        "total_points": int(np.prod(pts.shape[:2])) if pts.ndim == 3 else int(len(pts)),
     }
 
-    if pts.ndim != 2 or pts.shape[1] != 3 or len(pts) < min_points_per_cell * 4:
+    is_projected_xyz = bool(pts.ndim == 3 and pts.shape[-1] == 3 and pts.shape[:2] == mask.shape[:2])
+    is_point_list = bool(pts.ndim == 2 and pts.shape[1] == 3)
+    if not (is_projected_xyz or is_point_list):
+        debug["reliable"] = False
+        debug["reason"] = "points_and_mask_shape_mismatch"
+        return None, False, debug
+    available_point_count = int(np.count_nonzero(mask > 0)) if is_projected_xyz else int(len(pts))
+    if available_point_count < min_points_per_cell * 4:
         debug["reliable"] = False
         debug["reason"] = "insufficient_points_for_segmented_depth"
         return None, False, debug
@@ -266,48 +273,51 @@ def estimate_segmented_depth_plane_yaw(
 
     y_min, y_max = int(mask_ys.min()), int(mask_ys.max()) + 1
     x_min, x_max = int(mask_xs.min()), int(mask_xs.max()) + 1
-    cell_h = max(1, (y_max - y_min) // grid_size)
-    cell_w = max(1, (x_max - x_min) // grid_size)
-
-    # Assign each 3D point to a grid cell via its projected pixel coordinate
-    # We need pixel coordinates — derive from mask position heuristic:
-    # points_3d is in camera coords; use x,z as horizontal, y as vertical.
-    # For grid assignment we use the point's index relative to mask ordering.
-    # A simpler approach: use the 3D point's y (vertical) and x (horizontal)
-    # to map into grid cells.
-    finite_mask = np.isfinite(pts).all(axis=1)
-    valid_pts = pts[finite_mask]
-    if len(valid_pts) < min_points_per_cell:
-        debug["reliable"] = False
-        debug["reason"] = "insufficient_finite_points"
-        return None, False, debug
-
-    # Map 3D points to grid cells using camera-projected positions
-    # Use x (horizontal) and -y (vertical, since camera y is down) for grid
-    cell_y_coords = (-valid_pts[:, 1])  # vertical in world
-    cell_x_coords = valid_pts[:, 0]     # horizontal in world
-
-    # Normalize to [0, 1] range
-    y_range = float(cell_y_coords.max() - cell_y_coords.min())
-    x_range = float(cell_x_coords.max() - cell_x_coords.min())
-    if y_range < EPS or x_range < EPS:
-        debug["reliable"] = False
-        debug["reason"] = "degenerate_point_distribution"
-        return None, False, debug
-
-    norm_y = (cell_y_coords - cell_y_coords.min()) / y_range
-    norm_x = (cell_x_coords - cell_x_coords.min()) / x_range
-
-    grid_y = np.clip((norm_y * grid_size).astype(int), 0, grid_size - 1)
-    grid_x = np.clip((norm_x * grid_size).astype(int), 0, grid_size - 1)
-    cell_ids = grid_y * grid_size + grid_x
+    cell_point_sets: List[np.ndarray] = []
+    if is_projected_xyz:
+        # ROOT CAUSE / DO NOT REGRESS (2026-07-21): v17 accepted an HxW mask
+        # but discarded its pixel coordinates, then partitioned a shuffled 3-D
+        # point list by global camera x/y ranges.  Sofa, curtain and wall points
+        # were therefore mixed into artificial "image cells".  Production must
+        # partition the dense xyz map with the exact cleaned semantic mask.
+        y_edges = np.linspace(y_min, y_max, grid_size + 1, dtype=np.int32)
+        x_edges = np.linspace(x_min, x_max, grid_size + 1, dtype=np.int32)
+        for gy in range(grid_size):
+            for gx in range(grid_size):
+                cy1, cy2 = int(y_edges[gy]), int(y_edges[gy + 1])
+                cx1, cx2 = int(x_edges[gx]), int(x_edges[gx + 1])
+                local_mask = mask[cy1:cy2, cx1:cx2] > 0
+                local_xyz = pts[cy1:cy2, cx1:cx2]
+                local_valid = local_mask & np.isfinite(local_xyz).all(axis=-1)
+                cell_point_sets.append(local_xyz[local_valid].reshape(-1, 3))
+        debug["partition_space"] = "projected_image_grid_exact_mask"
+    else:
+        # Compatibility path for isolated mathematical tests.  Hanging never
+        # uses this path; it passes the dense xyz image so semantic exclusions
+        # remain spatially auditable.
+        valid_pts = pts[np.isfinite(pts).all(axis=1)]
+        if len(valid_pts) < min_points_per_cell:
+            debug["reliable"] = False
+            debug["reason"] = "insufficient_finite_points"
+            return None, False, debug
+        y_values = -valid_pts[:, 1]
+        x_values = valid_pts[:, 0]
+        y_range = float(np.ptp(y_values))
+        x_range = float(np.ptp(x_values))
+        if y_range < EPS or x_range < EPS:
+            debug["reliable"] = False
+            debug["reason"] = "degenerate_point_distribution"
+            return None, False, debug
+        grid_y = np.clip(((y_values - y_values.min()) / y_range * grid_size).astype(int), 0, grid_size - 1)
+        grid_x = np.clip(((x_values - x_values.min()) / x_range * grid_size).astype(int), 0, grid_size - 1)
+        cell_ids = grid_y * grid_size + grid_x
+        cell_point_sets = [valid_pts[cell_ids == cell_id] for cell_id in range(grid_size * grid_size)]
+        debug["partition_space"] = "legacy_3d_range_test_only"
 
     cell_yaws: List[float] = []
     cell_details: List[Dict[str, Any]] = []
 
-    for cell_id in range(grid_size * grid_size):
-        cell_mask = cell_ids == cell_id
-        cell_pts = valid_pts[cell_mask]
+    for cell_id, cell_pts in enumerate(cell_point_sets):
         if len(cell_pts) < min_points_per_cell:
             cell_details.append({
                 "cell": int(cell_id),
@@ -337,7 +347,10 @@ def estimate_segmented_depth_plane_yaw(
             })
             continue
 
-        n = np.asarray(plane.normal, dtype=np.float32)
+        # WallPlane exposes ``n``.  The v17 draft used ``plane.normal`` here,
+        # so every otherwise-valid local cell raised AttributeError and the
+        # service-level broad exception silently disabled segmented depth.
+        n = np.asarray(plane.n, dtype=np.float32)
         tilt_deg = float(np.degrees(np.arcsin(np.clip(abs(float(np.dot(n, g))), 0.0, 1.0))))
         if tilt_deg > max_cell_tilt_deg:
             cell_details.append({
@@ -1096,14 +1109,17 @@ def resolve_wall_projection_plane(
             csq_debug_final: Optional[Dict[str, Any]] = None
             if bool(controlled_structural_quorum_enabled):
                 direct_normal_yaw_val = None
-                if direct_u is not None and bool(normal_debug.get("reliable")):
+                if direct_vertical_n is not None and bool(normal_debug.get("reliable")):
                     direct_normal_yaw_val = float(np.arctan2(
-                        float(direct_u[2]), float(direct_u[0])
+                        float(direct_vertical_n[2]), float(direct_vertical_n[0])
                     ))
                 structure_yaw_val = None
                 if structure_direction is not None and structure_reliable:
+                    structure_normal = normalize(np.cross(structure_direction, g_hat))
+                    if float(np.dot(structure_normal, depth_vertical_n)) < 0.0:
+                        structure_normal = -structure_normal
                     structure_yaw_val = float(np.arctan2(
-                        float(structure_direction[2]), float(structure_direction[0])
+                        float(structure_normal[2]), float(structure_normal[0])
                     ))
                 quorum_recovered, quorum_source, quorum_debug = evaluate_controlled_structural_quorum(
                     depth_yaw=segmented_depth_plane_yaw,
@@ -1117,10 +1133,20 @@ def resolve_wall_projection_plane(
                 csq_debug_final = quorum_debug
                 if quorum_recovered:
                     consensus_yaw = float(np.radians(quorum_debug.get("consensus_yaw_deg", 0.0)))
-                    recovered_u = np.array([
-                        math.cos(consensus_yaw), 0.0, math.sin(consensus_yaw)
-                    ], dtype=np.float64)
-                    recovered_n = normalize(np.cross(recovered_u, g_hat))
+                    # All quorum yaws describe wall normals. Preserve the real
+                    # camera pitch/roll by solving n dot g = 0 instead of
+                    # assuming camera gravity is exactly [0, +/-1, 0].
+                    gx, gy, gz = [float(x) for x in g_hat]
+                    nx = math.cos(consensus_yaw)
+                    nz = math.sin(consensus_yaw)
+                    if abs(gy) < 0.15:
+                        return depth_plane, {
+                            "hard_reject": True,
+                            "reason": "controlled_quorum_gravity_basis_degenerate",
+                            "controlled_structural_quorum": quorum_debug,
+                        }
+                    ny = -(gx * nx + gz * nz) / gy
+                    recovered_n = normalize(np.array([nx, ny, nz], dtype=np.float64))
                     if float(np.dot(recovered_n, depth_n)) < 0.0:
                         recovered_n = -recovered_n
                     corrected_d = -float(np.dot(recovered_n, anchor))
@@ -1319,15 +1345,28 @@ def evaluate_controlled_structural_quorum(
         debug["reason"] = "insufficient_sources_for_quorum"
         return False, "insufficient_sources", debug
 
-    # Check pairwise agreement
+    # Only confident sources have a vote.  v17 accidentally let a low-quality
+    # segmented depth estimate agree with a direct normal and called that two
+    # votes; its later "direct normal alone" check was unreachable because an
+    # agreeing pair always has two names.  Low-confidence sources remain in
+    # diagnostics and may oppose nothing, but cannot unlock a projection.
+    voting_sources = [item for item in sources if item[2]]
+    debug["voting_sources"] = [item[0] for item in voting_sources]
+    if len(voting_sources) < 2:
+        debug["recovered"] = False
+        debug["reason"] = "insufficient_confident_sources_for_quorum"
+        return False, "insufficient_confident_sources", debug
+
+    # Check pairwise agreement. Wall headings are undirected: theta and
+    # theta+pi describe the same plane normal.
     threshold = float(np.radians(angle_threshold_deg))
     agreements: List[Tuple[str, str, float]] = []
-    for i in range(len(sources)):
-        for j in range(i + 1, len(sources)):
-            name_i, yaw_i, conf_i = sources[i]
-            name_j, yaw_j, conf_j = sources[j]
-            diff = abs(yaw_i - yaw_j)
-            diff = min(diff, 2.0 * math.pi - diff)
+    for i in range(len(voting_sources)):
+        for j in range(i + 1, len(voting_sources)):
+            name_i, yaw_i, _ = voting_sources[i]
+            name_j, yaw_j, _ = voting_sources[j]
+            diff = abs(yaw_i - yaw_j) % math.pi
+            diff = min(diff, math.pi - diff)
             if diff <= threshold:
                 agreements.append((name_i, name_j, float(np.degrees(diff))))
 
@@ -1345,9 +1384,14 @@ def evaluate_controlled_structural_quorum(
     best_agreement = min(agreements, key=lambda x: x[2])
     agreeing_sources = {best_agreement[0], best_agreement[1]}
     agreeing_yaws = [
-        yaw for name, yaw, _ in sources if name in agreeing_sources
+        yaw for name, yaw, _ in voting_sources if name in agreeing_sources
     ]
-    consensus_yaw = float(np.median(agreeing_yaws))
+    # Circular mean on doubled angles preserves the pi-periodic wall-heading
+    # contract (e.g. +179° and -179° agree near 180°, not near 0° by accident).
+    consensus_yaw = 0.5 * math.atan2(
+        float(np.mean(np.sin(2.0 * np.asarray(agreeing_yaws, dtype=np.float64)))),
+        float(np.mean(np.cos(2.0 * np.asarray(agreeing_yaws, dtype=np.float64)))),
+    )
 
     # Check third source: must not be high-confidence opposing
     third_sources = [
@@ -1355,8 +1399,8 @@ def evaluate_controlled_structural_quorum(
         if name not in agreeing_sources
     ]
     for name, yaw, conf in third_sources:
-        diff = abs(yaw - consensus_yaw)
-        diff = min(diff, 2.0 * math.pi - diff)
+        diff = abs(yaw - consensus_yaw) % math.pi
+        diff = min(diff, math.pi - diff)
         if conf and diff > threshold:
             # High-confidence opposing source → cannot recover
             debug["recovered"] = False
@@ -1364,12 +1408,6 @@ def evaluate_controlled_structural_quorum(
             debug["opposing_source"] = name
             debug["opposing_angle_deg"] = round(float(np.degrees(diff)), 2)
             return False, "opposed_by_confident_third", debug
-
-    # Direct normal alone cannot unlock
-    if len(agreeing_sources) == 1 and "direct_normal" in agreeing_sources:
-        debug["recovered"] = False
-        debug["reason"] = "direct_normal_alone_cannot_unlock"
-        return False, "direct_normal_only", debug
 
     source_label = f"controlled_quorum_{'_'.join(sorted(agreeing_sources))}"
     debug["recovered"] = True

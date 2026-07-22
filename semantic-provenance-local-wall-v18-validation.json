@@ -1,0 +1,30 @@
+{
+  "pipeline_build": "2026-07-21-semantic-provenance-and-local-wall-guard-v18",
+  "semantic_contracts": {
+    "auto_mock_fallback_returns_success": false,
+    "explicit_mock_requires_test_switch": true,
+    "mock_seed_alignment_allowed": false,
+    "geometry_proposals_promoted_to_hanging_walls": false,
+    "cached_geometry_proposal_without_sam_lineage_allowed": false
+  },
+  "hanging_geometry_contracts": {
+    "segmented_depth_partition_space": "projected_image_grid_exact_mask",
+    "semantic_occluders_subtracted": true,
+    "wall_boundary_erosion_px": 3,
+    "direct_normal_preselected_by_disputed_depth_plane": false,
+    "low_confidence_quorum_votes_allowed": false,
+    "quorum_heading_type": "wall_normal_yaw_pi_periodic",
+    "segmented_depth_exception_visible_in_diagnostics": true
+  },
+  "verification": {
+    "python_ast_files": 86,
+    "python_compile": "passed",
+    "json_validation": "passed",
+    "shell_syntax": "passed",
+    "dense_projected_wall_function_regression": "passed",
+    "semantic_provenance_function_regression": "passed",
+    "geometry_lineage_function_regression": "passed",
+    "pytest": "not_run_not_installed",
+    "gpu_end_to_end": "requires_production_image"
+  }
+}

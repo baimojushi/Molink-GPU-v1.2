@@ -65,7 +65,7 @@ except Exception:  # pragma: no cover - causal layer is optional at runtime
 API_KEY = os.getenv("API_KEY", "")
 ALLOW_UNAUTH_LOCAL = os.getenv("ALLOW_UNAUTH_LOCAL", "").strip().lower() in {"1", "true", "yes", "on"}
 PORT = int(os.getenv("HANGING_MVP_PORT", "6010"))
-HANGING_PIPELINE_BUILD_ID = "2026-07-22-controlled-structural-quorum-v17"
+HANGING_PIPELINE_BUILD_ID = "2026-07-21-semantic-provenance-and-local-wall-guard-v18"
 
 
 def _truthy_env(name: str, default: str = "0") -> bool:
@@ -1337,6 +1337,22 @@ async def analyze_hanging_mvp(
     rules = parse_json(rules_json, "rules_json")
     semantics = parse_json(semantics_json, "semantics_json")
 
+    # Reject cached mock semantics before constructing any mask or point cloud.
+    # v16/v17 could report semantic status=ok after a missing VLM provider,
+    # then geometry-split its single mock wall into curtains and a central wall.
+    binding = semantics.get("vlm_response_binding") if isinstance(semantics.get("vlm_response_binding"), dict) else {}
+    provider = str(binding.get("provider") or "").strip().lower()
+    semantic_warnings = [str(item).lower() for item in (semantics.get("warnings") or [])]
+    if provider in {"mock", "mock_fallback"} or any("fallback_to_mock" in item for item in semantic_warnings):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "untrusted_semantic_provenance",
+                "reason": f"semantic_provider={provider or 'warning_only_mock_fallback'}",
+                "repair_hint": "configure the real VLM provider and rerun from semantic; do not reuse geometry proposals, wall basis, or projected quads",
+            },
+        )
+
     metric_bytes = await metric3d_zip.read()
     bundle = load_metric3d_zip(metric_bytes)
     depth = bundle.depth_m
@@ -2122,11 +2138,50 @@ async def analyze_hanging_mvp(
                 np.sum(xyz * np.asarray(depth_support_plane.n, np.float32).reshape(1, 1, 3), axis=-1)
                 + float(depth_support_plane.d)
             )
+            # Local orientation evidence must come from the same visible wall
+            # component, not from furniture/people/art that overlap a coarse
+            # wall box.  This mask is used by both direct-normal validation and
+            # the segmented depth vote.
+            local_wall_evidence_mask = wall_mask.copy()
+            local_excluded_ids = []
+            for evidence_obj in objects.values():
+                if evidence_obj.get("object_id") == wall_id:
+                    continue
+                evidence_role = str(evidence_obj.get("role") or "").strip().lower()
+                if evidence_role not in {"forbidden", "foreground", "support", "existing_content", "non_support"}:
+                    continue
+                evidence_obj_mask = evidence_obj.get("mask")
+                if isinstance(evidence_obj_mask, np.ndarray) and evidence_obj_mask.shape[:2] == (h, w):
+                    overlap = int(np.count_nonzero((local_wall_evidence_mask > 0) & (evidence_obj_mask > 0)))
+                    if overlap > 0:
+                        local_wall_evidence_mask[evidence_obj_mask > 0] = 0
+                        local_excluded_ids.append(str(evidence_obj.get("object_id") or evidence_obj.get("label") or "unknown"))
+            erosion_px = int(rule_value(rules, ["wall_plane_fit", "segmented_depth_plane", "boundary_erosion_px"], 3))
+            if erosion_px > 0 and np.count_nonzero(local_wall_evidence_mask) > 0:
+                kernel = np.ones((2 * erosion_px + 1, 2 * erosion_px + 1), np.uint8)
+                local_wall_evidence_mask = cv2.erode(local_wall_evidence_mask, kernel, iterations=1)
+            local_wall_evidence_mask[~np.isfinite(xyz).all(axis=-1)] = 0
+            wall_filter_debug["local_wall_orientation_evidence"] = {
+                "source": "authoritative_wall_minus_semantic_occluders_and_boundary",
+                "excluded_object_ids": local_excluded_ids,
+                "boundary_erosion_px": erosion_px,
+                "pixel_count": int(np.count_nonzero(local_wall_evidence_mask)),
+            }
+
+            # Direct normals are independent evidence; do not preselect them
+            # with the disputed whole-wall depth plane.  Doing so makes a bad
+            # RANSAC plane choose the normals that are allowed to disagree with
+            # it.  The exact cleaned wall mask plus the normal head's own
+            # verticality/spread gates is the authority here.
             projection_normal_evidence_mask = (
-                (wall_mask > 0)
+                (local_wall_evidence_mask > 0)
+                & np.isfinite(normal).all(axis=-1)
+            ).astype(np.uint8) * 255
+            wall_filter_debug["depth_plane_inliers_within_local_evidence"] = int(np.count_nonzero(
+                (local_wall_evidence_mask > 0)
                 & np.isfinite(depth_plane_distance_full)
                 & (depth_plane_distance_full < 0.08)
-            ).astype(np.uint8) * 255
+            ))
 
             # Segmented depth plane yaw: local 4x4 grid clustering for
             # robust wall heading when whole-wall RANSAC is polluted.
@@ -2140,8 +2195,8 @@ async def analyze_hanging_mvp(
                 ))
                 if sdp_enabled:
                     seg_depth_yaw, seg_depth_confident, seg_depth_debug = estimate_segmented_depth_plane_yaw(
-                        basis_points,
-                        wall_mask,
+                        xyz,
+                        local_wall_evidence_mask,
                         g_hat,
                         grid_size=int(rule_value(
                             rules, ["wall_plane_fit", "segmented_depth_plane", "grid_size"], 4
@@ -2165,8 +2220,20 @@ async def analyze_hanging_mvp(
                             rules, ["wall_plane_fit", "segmented_depth_plane", "min_cluster_coverage"], 0.30
                         )),
                     )
-            except Exception:
-                pass
+            except Exception as seg_depth_exc:
+                # v17 swallowed an AttributeError caused by reading
+                # WallPlane.normal instead of WallPlane.n.  That made the
+                # configured fallback look merely "unavailable" in every real
+                # job.  Never hide a missing quorum source again.
+                seg_depth_yaw = None
+                seg_depth_confident = False
+                seg_depth_debug = {
+                    "enabled": True,
+                    "reliable": False,
+                    "reason": "segmented_depth_plane_estimation_exception",
+                    "error_type": type(seg_depth_exc).__name__,
+                    "error": str(seg_depth_exc),
+                }
 
             # Controlled structural quorum config
             csq_enabled = bool(rule_value(
