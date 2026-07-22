@@ -1093,6 +1093,7 @@ def resolve_wall_projection_plane(
             # three-evidence quorum cannot form, attempt recovery using
             # segmented depth planes, reliable direct normals, and
             # enhanced structure direction.
+            csq_debug_final: Optional[Dict[str, Any]] = None
             if bool(controlled_structural_quorum_enabled):
                 direct_normal_yaw_val = None
                 if direct_u is not None and bool(normal_debug.get("reliable")):
@@ -1113,6 +1114,7 @@ def resolve_wall_projection_plane(
                     structure_confident=structure_reliable,
                     angle_threshold_deg=float(controlled_structural_quorum_angle_threshold_deg),
                 )
+                csq_debug_final = quorum_debug
                 if quorum_recovered:
                     consensus_yaw = float(np.radians(quorum_debug.get("consensus_yaw_deg", 0.0)))
                     recovered_u = np.array([
@@ -1155,6 +1157,7 @@ def resolve_wall_projection_plane(
                 "direct_normal_used_for_yaw": False,
                 "normal_consensus": normal_debug,
                 "horizontal_structure": structure_debug,
+                "controlled_structural_quorum": csq_debug_final,
             }
         structure_to_depth = _undirected_angle_deg(structure_direction, expected_u)
         structure_to_direct = _undirected_angle_deg(structure_direction, direct_u)
