@@ -2135,27 +2135,46 @@ async def analyze_hanging_mvp(
             seg_depth_debug: dict = {}
             try:
                 from .geometry import estimate_segmented_depth_plane_yaw
-                sdp_cfg = rules.get("wall_plane_fit", {}).get("segmented_depth_plane", {})
-                if bool(sdp_cfg.get("enabled", False)):
+                sdp_enabled = bool(rule_value(
+                    rules, ["wall_plane_fit", "segmented_depth_plane", "enabled"], True
+                ))
+                if sdp_enabled:
                     seg_depth_yaw, seg_depth_confident, seg_depth_debug = estimate_segmented_depth_plane_yaw(
                         basis_points,
                         wall_mask,
                         g_hat,
-                        grid_size=int(sdp_cfg.get("grid_size", 4)),
-                        min_points_per_cell=int(sdp_cfg.get("min_points_per_cell", 50)),
-                        min_cell_inlier_ratio=float(sdp_cfg.get("min_cell_inlier_ratio", 0.4)),
-                        max_cell_tilt_deg=float(sdp_cfg.get("max_cell_tilt_deg", 15.0)),
-                        cluster_angle_deg=float(sdp_cfg.get("cluster_angle_deg", 6.0)),
-                        min_cluster_cells=int(sdp_cfg.get("min_cluster_cells", 4)),
-                        min_cluster_coverage=float(sdp_cfg.get("min_cluster_coverage", 0.30)),
+                        grid_size=int(rule_value(
+                            rules, ["wall_plane_fit", "segmented_depth_plane", "grid_size"], 4
+                        )),
+                        min_points_per_cell=int(rule_value(
+                            rules, ["wall_plane_fit", "segmented_depth_plane", "min_points_per_cell"], 50
+                        )),
+                        min_cell_inlier_ratio=float(rule_value(
+                            rules, ["wall_plane_fit", "segmented_depth_plane", "min_cell_inlier_ratio"], 0.4
+                        )),
+                        max_cell_tilt_deg=float(rule_value(
+                            rules, ["wall_plane_fit", "segmented_depth_plane", "max_cell_tilt_deg"], 15.0
+                        )),
+                        cluster_angle_deg=float(rule_value(
+                            rules, ["wall_plane_fit", "segmented_depth_plane", "cluster_angle_deg"], 6.0
+                        )),
+                        min_cluster_cells=int(rule_value(
+                            rules, ["wall_plane_fit", "segmented_depth_plane", "min_cluster_cells"], 4
+                        )),
+                        min_cluster_coverage=float(rule_value(
+                            rules, ["wall_plane_fit", "segmented_depth_plane", "min_cluster_coverage"], 0.30
+                        )),
                     )
             except Exception:
                 pass
 
             # Controlled structural quorum config
-            csq_cfg = rules.get("wall_plane_fit", {}).get("controlled_structural_quorum", {})
-            csq_enabled = bool(csq_cfg.get("enabled", False))
-            csq_angle = float(csq_cfg.get("angle_threshold_deg", 6.0))
+            csq_enabled = bool(rule_value(
+                rules, ["wall_plane_fit", "controlled_structural_quorum", "enabled"], True
+            ))
+            csq_angle = float(rule_value(
+                rules, ["wall_plane_fit", "controlled_structural_quorum", "angle_threshold_deg"], 6.0
+            ))
 
             projection_plane, projection_orientation_debug = resolve_wall_projection_plane(
                 depth_support_plane,
