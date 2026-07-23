@@ -569,6 +569,288 @@ def estimate_wall_normal_consensus(
     return consensus.astype(np.float32), debug
 
 
+def _normal_mode_angular_error_deg(
+    normal_xyz: np.ndarray,
+    reference_normal: np.ndarray,
+) -> np.ndarray:
+    """Return sign-invariant per-pixel angular error to one normal mode."""
+    normals = np.asarray(normal_xyz, dtype=np.float32)
+    ref = normalize(np.asarray(reference_normal, dtype=np.float32).reshape(3))
+    lengths = np.linalg.norm(normals, axis=-1)
+    valid = np.isfinite(normals).all(axis=-1) & (lengths > EPS)
+    unit = np.zeros_like(normals, dtype=np.float32)
+    unit[valid] = normals[valid] / np.maximum(lengths[valid, None], EPS)
+    alignment = np.zeros(lengths.shape, dtype=np.float32)
+    alignment[valid] = np.abs(np.sum(unit[valid] * ref.reshape(1, 3), axis=-1))
+    error = np.full(lengths.shape, np.inf, dtype=np.float32)
+    error[valid] = np.degrees(np.arccos(np.clip(alignment[valid], 0.0, 1.0)))
+    return error
+
+
+def recover_localized_coherent_normal_support(
+    normal_xyz: np.ndarray,
+    candidate_mask: np.ndarray,
+    consensus_normal: np.ndarray,
+    *,
+    max_angle_deg: float = 4.0,
+    min_inlier_fraction: float = 0.35,
+    min_component_pixels: int = 1200,
+    min_component_fraction: float = 0.06,
+    morphology_close_px: int = 5,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """Extract continuous islands belonging to a tight direct-normal mode.
+
+    This is the narrow V22 escape path for a wall whose direct-normal field is
+    globally bimodal because windows, reveals or curtain boundaries occupy a
+    material fraction of the semantic wall.  It does *not* relax the original
+    p90 gate over arbitrary pixels.  Instead it first selects pixels within the
+    original angular tolerance of the robust mode, then requires substantial
+    connected support.  Candidate geometry is later constrained to these
+    islands (plus separately validated removable-art reconstruction).
+    """
+    mask = (np.asarray(candidate_mask, dtype=np.uint8) > 0)
+    total = int(np.count_nonzero(mask))
+    debug: Dict[str, Any] = {
+        "enabled": True,
+        "policy": "tight_p50_then_continuous_normal_mode_islands",
+        "candidate_pixel_count": total,
+        "max_angle_deg": float(max_angle_deg),
+        "min_inlier_fraction": float(min_inlier_fraction),
+        "min_component_pixels": int(min_component_pixels),
+        "min_component_fraction": float(min_component_fraction),
+        "authorized": False,
+    }
+    if total <= 0:
+        debug["reason"] = "empty_candidate_mask"
+        return np.zeros_like(candidate_mask, dtype=np.uint8), debug
+
+    angular_error = _normal_mode_angular_error_deg(normal_xyz, consensus_normal)
+    modal = mask & np.isfinite(angular_error) & (angular_error <= float(max_angle_deg))
+    raw_modal_count = int(np.count_nonzero(modal))
+    raw_modal_fraction = float(raw_modal_count / max(1, total))
+    debug.update({
+        "raw_modal_pixel_count": raw_modal_count,
+        "raw_modal_fraction": raw_modal_fraction,
+    })
+    if raw_modal_fraction < float(min_inlier_fraction):
+        debug["reason"] = "normal_mode_inlier_fraction_too_small"
+        return np.zeros_like(candidate_mask, dtype=np.uint8), debug
+
+    modal_u8 = modal.astype(np.uint8) * 255
+    modal_u8 = cv2.morphologyEx(
+        modal_u8,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+        iterations=1,
+    )
+    close_px = max(0, int(morphology_close_px))
+    if close_px > 0:
+        kernel_size = 2 * close_px + 1
+        modal_u8 = cv2.morphologyEx(
+            modal_u8,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size)),
+            iterations=1,
+        )
+
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(modal_u8, connectivity=8)
+    min_area = max(int(min_component_pixels), int(round(total * float(min_component_fraction))))
+    kept = np.zeros_like(modal_u8)
+    components: List[Dict[str, Any]] = []
+    for component_id in range(1, int(count)):
+        area = int(stats[component_id, cv2.CC_STAT_AREA])
+        width = int(stats[component_id, cv2.CC_STAT_WIDTH])
+        height = int(stats[component_id, cv2.CC_STAT_HEIGHT])
+        accepted = bool(area >= min_area)
+        components.append({
+            "component_id": int(component_id),
+            "area_px": area,
+            "bbox_width_px": width,
+            "bbox_height_px": height,
+            "accepted": accepted,
+        })
+        if accepted:
+            kept[labels == component_id] = 255
+
+    kept_count = int(np.count_nonzero(kept))
+    kept_fraction = float(kept_count / max(1, total))
+    debug.update({
+        "component_count": max(0, int(count - 1)),
+        "component_min_area_px": int(min_area),
+        "components": components,
+        "kept_pixel_count": kept_count,
+        "kept_fraction": kept_fraction,
+        "authorized": bool(kept_count >= min_area and kept_fraction >= float(min_inlier_fraction)),
+    })
+    if not debug["authorized"]:
+        debug["reason"] = "no_continuous_normal_mode_with_sufficient_support"
+        return np.zeros_like(candidate_mask, dtype=np.uint8), debug
+    debug["reason"] = "continuous_normal_mode_support_authorized"
+    return kept, debug
+
+
+def refit_semantic_art_to_wall_plane(
+    semantic_art_mask: np.ndarray,
+    authoritative_wall_mask: np.ndarray,
+    coherent_wall_support_mask: np.ndarray,
+    points_3d: np.ndarray,
+    intr: Intrinsics,
+    wall_plane: WallPlane,
+    *,
+    structural_forbidden_mask: Optional[np.ndarray] = None,
+    enabled: bool = True,
+    ring_dilate_px: int = 14,
+    min_component_pixels: int = 120,
+    min_ring_wall_fraction: float = 0.45,
+    min_ring_support_fraction: float = 0.22,
+    min_supported_sides: int = 2,
+    min_side_support_fraction: float = 0.12,
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+    """Reconstruct removable artwork pixels as the underlying wall plane.
+
+    The artwork's observed depth and normal are deliberately ignored: a
+    side-view frame may be tilted or have visible thickness.  A component is
+    accepted only when a ring around it is supported by the authoritative wall
+    and by coherent wall-normal islands on enough sides.  Accepted pixels are
+    back-projected onto ``wall_plane`` so they can participate in metric
+    connected-component and empty-region calculations without flattening any
+    already projected 2-D quad.
+    """
+    art = (np.asarray(semantic_art_mask, dtype=np.uint8) > 0)
+    wall = (np.asarray(authoritative_wall_mask, dtype=np.uint8) > 0)
+    support = (np.asarray(coherent_wall_support_mask, dtype=np.uint8) > 0)
+    xyz = np.asarray(points_3d, dtype=np.float32)
+    debug: Dict[str, Any] = {
+        "enabled": bool(enabled),
+        "policy": "surrounding_wall_supported_artwork_plane_refit",
+        "artwork_observed_normal_used": False,
+        "artwork_observed_depth_used": False,
+        "refit_plane_normal": [float(x) for x in wall_plane.n],
+        "refit_plane_d": float(wall_plane.d),
+        "accepted_pixel_count": 0,
+        "components": [],
+    }
+    if not bool(enabled) or not np.any(art):
+        debug["reason"] = "disabled_or_empty_art_mask"
+        return np.zeros_like(semantic_art_mask, dtype=np.uint8), xyz.copy(), debug
+    if art.shape != wall.shape or art.shape != support.shape or xyz.shape[:2] != art.shape:
+        debug["reason"] = "art_wall_support_shape_mismatch"
+        return np.zeros_like(semantic_art_mask, dtype=np.uint8), xyz.copy(), debug
+
+    forbidden = np.zeros_like(art, dtype=bool)
+    if structural_forbidden_mask is not None:
+        arr = np.asarray(structural_forbidden_mask, dtype=np.uint8)
+        if arr.shape == art.shape:
+            forbidden = arr > 0
+
+    art_u8 = (art.astype(np.uint8) * 255)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(art_u8, connectivity=8)
+    accepted_mask = np.zeros_like(art_u8)
+    dilate_px = max(2, int(ring_dilate_px))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * dilate_px + 1, 2 * dilate_px + 1))
+
+    for component_id in range(1, int(count)):
+        comp = labels == component_id
+        area = int(np.count_nonzero(comp))
+        item: Dict[str, Any] = {"component_id": int(component_id), "area_px": area, "accepted": False}
+        if area < int(min_component_pixels):
+            item["reason"] = "component_too_small"
+            debug["components"].append(item)
+            continue
+        if np.any(comp & forbidden):
+            item["reason"] = "component_overlaps_structural_forbidden_mask"
+            debug["components"].append(item)
+            continue
+
+        dilated = cv2.dilate(comp.astype(np.uint8) * 255, kernel, iterations=1) > 0
+        ring = dilated & (~comp) & (~forbidden)
+        ring_count = int(np.count_nonzero(ring))
+        ring_wall_count = int(np.count_nonzero(ring & wall))
+        ring_support_count = int(np.count_nonzero(ring & support))
+        ring_wall_fraction = float(ring_wall_count / max(1, ring_count))
+        ring_support_fraction = float(ring_support_count / max(1, ring_wall_count))
+
+        ys, xs = np.where(comp)
+        x0, x1 = int(xs.min()), int(xs.max()) + 1
+        y0, y1 = int(ys.min()), int(ys.max()) + 1
+        band = max(2, min(dilate_px, max(2, min(x1 - x0, y1 - y0) // 3)))
+        side_regions = {
+            "left": np.s_[max(0, y0 - band):min(art.shape[0], y1 + band), max(0, x0 - band):x0],
+            "right": np.s_[max(0, y0 - band):min(art.shape[0], y1 + band), x1:min(art.shape[1], x1 + band)],
+            "top": np.s_[max(0, y0 - band):y0, max(0, x0 - band):min(art.shape[1], x1 + band)],
+            "bottom": np.s_[y1:min(art.shape[0], y1 + band), max(0, x0 - band):min(art.shape[1], x1 + band)],
+        }
+        side_debug: Dict[str, Any] = {}
+        supported_sides = 0
+        for name, region in side_regions.items():
+            side_wall = wall[region] & (~forbidden[region])
+            side_support = support[region] & side_wall
+            wall_count = int(np.count_nonzero(side_wall))
+            support_count = int(np.count_nonzero(side_support))
+            fraction = float(support_count / max(1, wall_count))
+            side_ok = bool(wall_count >= max(8, band * 2) and fraction >= float(min_side_support_fraction))
+            supported_sides += int(side_ok)
+            side_debug[name] = {
+                "wall_pixels": wall_count,
+                "support_pixels": support_count,
+                "support_fraction": fraction,
+                "supported": side_ok,
+            }
+
+        accepted = bool(
+            ring_wall_fraction >= float(min_ring_wall_fraction)
+            and ring_support_fraction >= float(min_ring_support_fraction)
+            and supported_sides >= int(min_supported_sides)
+        )
+        item.update({
+            "bbox_xyxy": [x0, y0, x1, y1],
+            "ring_pixel_count": ring_count,
+            "ring_wall_fraction": ring_wall_fraction,
+            "ring_support_fraction": ring_support_fraction,
+            "supported_side_count": int(supported_sides),
+            "side_support": side_debug,
+            "accepted": accepted,
+        })
+        if accepted:
+            accepted_mask[comp] = 255
+            item["reason"] = "surrounding_coherent_wall_support_confirmed"
+        else:
+            item["reason"] = "surrounding_wall_support_gate_failed"
+        debug["components"].append(item)
+
+    accepted_count = int(np.count_nonzero(accepted_mask))
+    refit_xyz = xyz.copy()
+    if accepted_count > 0:
+        plane_depth = ray_plane_depth_for_mask(accepted_mask, intr, wall_plane)
+        plane_xyz = backproject(plane_depth, intr)
+        valid_refit = (accepted_mask > 0) & np.isfinite(plane_xyz).all(axis=-1) & (plane_depth > 0.0)
+        refit_xyz[valid_refit] = plane_xyz[valid_refit]
+        accepted_mask[~valid_refit] = 0
+        accepted_count = int(np.count_nonzero(accepted_mask))
+    debug["accepted_pixel_count"] = accepted_count
+    debug["reason"] = "artwork_wall_plane_refit_available" if accepted_count > 0 else "no_art_component_passed_refit_gates"
+    return accepted_mask, refit_xyz, debug
+
+
+def _vertical_normal_from_axial_yaw(
+    yaw_rad: float,
+    g_hat_cam: np.ndarray,
+    reference_normal: np.ndarray,
+) -> Optional[np.ndarray]:
+    """Build a gravity-orthogonal plane normal from camera x/z axial yaw."""
+    g = normalize(np.asarray(g_hat_cam, dtype=np.float64).reshape(3))
+    nx = math.cos(float(yaw_rad))
+    nz = math.sin(float(yaw_rad))
+    if abs(float(g[1])) < 0.15:
+        return None
+    ny = -(float(g[0]) * nx + float(g[2]) * nz) / float(g[1])
+    n = normalize(np.array([nx, ny, nz], dtype=np.float64))
+    ref = normalize(np.asarray(reference_normal, dtype=np.float64).reshape(3))
+    if float(np.dot(n, ref)) < 0.0:
+        n = -n
+    return n.astype(np.float32)
+
+
 def refine_wall_orientation_evidence(
     normal_xyz: np.ndarray,
     points_3d: np.ndarray,
@@ -592,6 +874,13 @@ def refine_wall_orientation_evidence(
     normal_min_samples: int = 1000,
     normal_max_p90_spread_deg: float = 4.0,
     normal_max_vertical_tilt_deg: float = 5.0,
+    localized_normal_support_enabled: bool = True,
+    localized_max_p50_spread_deg: float = 1.0,
+    localized_normal_inlier_angle_deg: float = 4.0,
+    localized_min_inlier_fraction: float = 0.35,
+    localized_min_component_pixels: int = 1200,
+    localized_min_component_fraction: float = 0.06,
+    localized_morphology_close_px: int = 5,
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
     """Peel known artwork and an adjacent depth mode from wall orientation evidence.
 
@@ -609,15 +898,19 @@ def refine_wall_orientation_evidence(
     * a failed, bimodal direct-normal field may be restricted to the fitted
       depth plane only when the whole-wall depth fit is strong and an
       independent segmented-depth heading agrees with it;
-    * the refined direct-normal field must then pass the original strict p90
-      and verticality gates.  Direct-normal yaw is still not authoritative.
+    * the refined direct-normal field first attempts the original strict p90
+      and verticality gates;
+    * when structural openings keep global p90 high, a V22 path is allowed only
+      for a sub-degree p50 mode with substantial connected pixels inside the
+      depth-supported region.  The selected islands are then re-checked with
+      the original strict p90 gate.  Direct-normal yaw is never authoritative.
     """
     normal_arr = np.asarray(normal_xyz)
     xyz = np.asarray(points_3d)
     mask = np.asarray(evidence_mask, dtype=np.uint8)
     debug: Dict[str, Any] = {
         "enabled": bool(enabled),
-        "policy": "semantic_art_peel_then_depth_supported_connected_material_mode",
+        "policy": "semantic_art_peel_depth_support_then_localized_continuous_normal_mode_v22",
         "recovered": False,
         "direct_normal_used_for_yaw": False,
     }
@@ -798,6 +1091,79 @@ def refine_wall_orientation_evidence(
     )
     debug["refined_normal_consensus"] = refined_debug
     if refined_consensus is None or not bool(refined_debug.get("reliable")):
+        refined_p50 = refined_debug.get("angular_spread_p50_deg")
+        refined_vertical_tilt = refined_debug.get("vertical_tilt_deg")
+        localized_entry_gates = {
+            "localized_recovery_enabled": bool(localized_normal_support_enabled),
+            "all_depth_support_gates_passed": bool(all(gates.values()) and all(support_gates.values())),
+            "refined_p50_is_subdegree": bool(
+                refined_p50 is not None
+                and float(refined_p50) <= float(localized_max_p50_spread_deg)
+            ),
+            "refined_consensus_is_vertical": bool(
+                refined_vertical_tilt is not None
+                and float(refined_vertical_tilt) <= float(normal_max_vertical_tilt_deg)
+            ),
+            "segmented_depth_heading_available": bool(
+                segmented_depth_confident and segmented_depth_yaw is not None
+            ),
+        }
+        localized_debug: Dict[str, Any] = {
+            "entry_gates": localized_entry_gates,
+            "failed_entry_gates": [
+                name for name, passed in localized_entry_gates.items() if not passed
+            ],
+            "authorized": False,
+            "max_p50_spread_deg": float(localized_max_p50_spread_deg),
+        }
+        if all(localized_entry_gates.values()):
+            localized_mask, mode_debug = recover_localized_coherent_normal_support(
+                normal_arr,
+                refined_u8,
+                refined_consensus,
+                max_angle_deg=float(localized_normal_inlier_angle_deg),
+                min_inlier_fraction=float(localized_min_inlier_fraction),
+                min_component_pixels=int(localized_min_component_pixels),
+                min_component_fraction=float(localized_min_component_fraction),
+                morphology_close_px=int(localized_morphology_close_px),
+            )
+            localized_debug["normal_mode_support"] = mode_debug
+            if bool(mode_debug.get("authorized")):
+                localized_consensus, localized_consensus_debug = estimate_wall_normal_consensus(
+                    normal_arr,
+                    localized_mask,
+                    depth_n,
+                    g_hat,
+                    min_samples=int(normal_min_samples),
+                    max_p90_spread_deg=float(normal_max_p90_spread_deg),
+                    max_vertical_tilt_deg=float(normal_max_vertical_tilt_deg),
+                )
+                localized_debug["strict_recheck"] = localized_consensus_debug
+                if localized_consensus is not None and bool(localized_consensus_debug.get("reliable")):
+                    localized_debug.update({
+                        "authorized": True,
+                        "reason": "localized_continuous_normal_support_passed_strict_recheck",
+                        "candidate_acceptance_contract": (
+                            "candidate footprint must remain inside a connected coherent-wall component "
+                            "or validated removable-art refit and still pass structural clearance"
+                        ),
+                    })
+                    debug["localized_normal_support_recovery"] = localized_debug
+                    debug.update({
+                        "recovered": True,
+                        "reason": "localized_coherent_normal_support_recovered",
+                        "final_pixel_count": int(np.count_nonzero(localized_mask)),
+                        "selected_evidence_source": "localized_depth_supported_coherent_normal_islands",
+                        "segmented_depth_consensus_authorized_for_yaw": True,
+                        "authorized_segmented_depth_yaw_rad": float(segmented_depth_yaw),
+                        "authorized_segmented_depth_yaw_deg": float(np.degrees(segmented_depth_yaw)),
+                    })
+                    return localized_mask, debug
+        if "normal_mode_support" not in localized_debug:
+            localized_debug["reason"] = "localized_recovery_entry_gates_failed"
+        elif not bool(localized_debug.get("authorized")):
+            localized_debug.setdefault("reason", "localized_normal_support_failed_strict_recheck")
+        debug["localized_normal_support_recovery"] = localized_debug
         debug["reason"] = "refined_material_mode_still_fails_direct_normal_quality_gate"
         debug["final_pixel_count"] = semantic_clean_count
         return cleaned, debug
@@ -807,6 +1173,7 @@ def refine_wall_orientation_evidence(
         "reason": "depth_supported_wall_material_mode_recovered",
         "final_pixel_count": retained_count,
         "selected_evidence_source": "semantic_art_peeled_depth_plane_inliers",
+        "segmented_depth_consensus_authorized_for_yaw": False,
     })
     return refined_u8, debug
 
@@ -1424,6 +1791,9 @@ def resolve_wall_projection_plane(
     projection_shape_feedback_max_direct_distortion_ratio: float = 1.45,
     projection_shape_feedback_min_distortion_improvement: float = 0.15,
     projection_shape_feedback_max_depth_direct_yaw_disagreement_deg: float = 35.0,
+    localized_depth_consensus_authorized: bool = False,
+    localized_depth_max_yaw_disagreement_deg: float = 8.0,
+    localized_depth_consensus_debug: Optional[Dict[str, Any]] = None,
 ) -> Tuple[WallPlane, Dict[str, Any]]:
     """Resolve the plane orientation used for artwork perspective.
 
@@ -1434,7 +1804,10 @@ def resolve_wall_projection_plane(
     is allowed to win alone: wall-interior structure lines must clearly support
     one hypothesis or the wall fails closed.  After a strict depth-hierarchy
     recovery, a stable direct-normal heading may replace depth yaw only through
-    the separately gated physical 3-D projection-shape feedback policy.
+    the separately gated physical 3-D projection-shape feedback policy.  V22's
+    localized-support route is different: direct normals validate only the
+    selected material islands, while the independently agreeing segmented-depth
+    consensus supplies yaw and wall structure remains the final visual gate.
     """
     depth_n = normalize(np.asarray(depth_plane.n, dtype=np.float32).reshape(3))
     g_hat = normalize(np.asarray(g_hat_cam, dtype=np.float32).reshape(3))
@@ -1473,6 +1846,60 @@ def resolve_wall_projection_plane(
     direct_u = None
     chosen_n = depth_vertical_n
     source = "depth_plane_gravity_verticalized"
+    localized_depth_debug: Dict[str, Any] = {
+        "authorized": bool(localized_depth_consensus_authorized),
+        "segmented_depth_confident": bool(segmented_depth_plane_confident),
+        "segmented_depth_yaw_deg": (
+            float(np.degrees(segmented_depth_plane_yaw))
+            if segmented_depth_plane_yaw is not None else None
+        ),
+        "max_yaw_disagreement_deg": float(localized_depth_max_yaw_disagreement_deg),
+        "upstream": dict(localized_depth_consensus_debug or {}),
+    }
+    if bool(localized_depth_consensus_authorized):
+        whole_depth_yaw = float(np.arctan2(float(depth_vertical_n[2]), float(depth_vertical_n[0])))
+        localized_disagreement = (
+            float(np.degrees(_axial_angle_distance_rad(whole_depth_yaw, float(segmented_depth_plane_yaw))))
+            if segmented_depth_plane_yaw is not None else None
+        )
+        localized_depth_debug["whole_segmented_yaw_disagreement_deg"] = localized_disagreement
+        localized_gates = {
+            "segmented_depth_is_confident": bool(
+                segmented_depth_plane_confident and segmented_depth_plane_yaw is not None
+            ),
+            "whole_and_segmented_depth_agree": bool(
+                localized_disagreement is not None
+                and localized_disagreement <= float(localized_depth_max_yaw_disagreement_deg)
+            ),
+        }
+        localized_depth_debug["gates"] = localized_gates
+        localized_depth_debug["failed_gates"] = [
+            name for name, passed in localized_gates.items() if not passed
+        ]
+        if not all(localized_gates.values()):
+            return depth_plane, {
+                "hard_reject": True,
+                "reason": "localized_depth_consensus_authorization_invalid",
+                "direct_normal_used_for_yaw": False,
+                "localized_depth_consensus": localized_depth_debug,
+            }
+        localized_n = _vertical_normal_from_axial_yaw(
+            float(segmented_depth_plane_yaw),
+            g_hat,
+            depth_n,
+        )
+        if localized_n is None:
+            return depth_plane, {
+                "hard_reject": True,
+                "reason": "localized_depth_consensus_gravity_basis_degenerate",
+                "direct_normal_used_for_yaw": False,
+                "localized_depth_consensus": localized_depth_debug,
+            }
+        chosen_n = localized_n
+        source = "segmented_depth_yaw_on_localized_coherent_normal_support"
+        localized_depth_debug["selected"] = True
+        localized_depth_debug["selected_normal"] = [float(x) for x in chosen_n]
+
     if normal_consensus is not None:
         disagreement = float(np.degrees(np.arccos(np.clip(abs(float(np.dot(depth_n, normal_consensus))), 0.0, 1.0))))
         if (
@@ -1526,7 +1953,8 @@ def resolve_wall_projection_plane(
         )
     structure_reliable = bool(structure_direction is not None and structure_debug.get("reliable"))
     normal_yaw_conflict = bool(
-        yaw_disagreement is not None
+        not bool(localized_depth_consensus_authorized)
+        and yaw_disagreement is not None
         and yaw_disagreement > float(normal_recovery_angle_deg)
     )
 
@@ -1826,6 +2254,7 @@ def resolve_wall_projection_plane(
         "depth_horizontal_heading_preserved": source in {
             "depth_plane_gravity_verticalized",
             "depth_yaw_validated_by_wall_internal_structure_quorum",
+            "segmented_depth_yaw_on_localized_coherent_normal_support",
         },
         "direct_normal_used_for_yaw": False,
         "depth_plane_normal": [float(x) for x in depth_n],
@@ -1842,6 +2271,7 @@ def resolve_wall_projection_plane(
         "metric_anchor_m": [float(x) for x in anchor],
         "normal_consensus": normal_debug,
         "horizontal_structure": structure_debug,
+        "localized_depth_consensus": localized_depth_debug,
     }
     return WallPlane(tuple(map(float, chosen_n)), chosen_d), debug
 

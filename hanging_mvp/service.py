@@ -22,6 +22,7 @@ from .geometry import (
     orient_vector_to_camera_up, resolve_wall_projection_plane, select_gravity_consensus,
     points_from_mask, project_points, project_quad, polygon_mask, ray_plane_depth_for_mask, scale_points_to_original,
     estimate_segmented_depth_plane_yaw, refine_wall_orientation_evidence,
+    refit_semantic_art_to_wall_plane,
 )
 from .hardpaste import load_rgba, warp_artwork_mount_to_geometry, warp_artwork_to_quad
 from .debug_assets import png_bytes as debug_png_bytes, mask_preview, build_wall_debug_overlay, draw_rejected_wall_overlay
@@ -2298,6 +2299,27 @@ async def analyze_hanging_mvp(
                 normal_max_vertical_tilt_deg=float(rule_value(
                     rules, ["wall_plane_fit", "normal_consensus_max_vertical_tilt_deg"], 5.0
                 )),
+                localized_normal_support_enabled=bool(rule_value(
+                    rules, ["wall_plane_fit", "orientation_evidence_recovery", "localized_normal_support", "enabled"], True
+                )),
+                localized_max_p50_spread_deg=float(rule_value(
+                    rules, ["wall_plane_fit", "orientation_evidence_recovery", "localized_normal_support", "max_p50_spread_deg"], 1.0
+                )),
+                localized_normal_inlier_angle_deg=float(rule_value(
+                    rules, ["wall_plane_fit", "orientation_evidence_recovery", "localized_normal_support", "normal_inlier_angle_deg"], 4.0
+                )),
+                localized_min_inlier_fraction=float(rule_value(
+                    rules, ["wall_plane_fit", "orientation_evidence_recovery", "localized_normal_support", "min_inlier_fraction"], 0.35
+                )),
+                localized_min_component_pixels=int(rule_value(
+                    rules, ["wall_plane_fit", "orientation_evidence_recovery", "localized_normal_support", "min_component_pixels"], 1200
+                )),
+                localized_min_component_fraction=float(rule_value(
+                    rules, ["wall_plane_fit", "orientation_evidence_recovery", "localized_normal_support", "min_component_fraction"], 0.06
+                )),
+                localized_morphology_close_px=int(rule_value(
+                    rules, ["wall_plane_fit", "orientation_evidence_recovery", "localized_normal_support", "morphology_close_px"], 5
+                )),
             )
             orientation_refinement_debug.update({
                 "existing_art_object_ids": sorted(set(orientation_art_ids)),
@@ -2499,6 +2521,16 @@ async def analyze_hanging_mvp(
                 projection_shape_feedback_max_depth_direct_yaw_disagreement_deg=float(rule_value(
                     rules, ["wall_plane_fit", "hierarchical_depth_consensus", "projection_shape_feedback", "max_depth_direct_yaw_disagreement_deg"], 35.0
                 )),
+                localized_depth_consensus_authorized=bool(
+                    orientation_refinement_debug.get("segmented_depth_consensus_authorized_for_yaw")
+                ),
+                localized_depth_max_yaw_disagreement_deg=float(rule_value(
+                    rules, ["wall_plane_fit", "orientation_evidence_recovery", "max_depth_segmented_yaw_disagreement_deg"], 8.0
+                )),
+                localized_depth_consensus_debug=(
+                    orientation_refinement_debug.get("localized_normal_support_recovery")
+                    if isinstance(orientation_refinement_debug, dict) else None
+                ),
             )
             structure_debug = projection_orientation_debug.get("horizontal_structure")
             if isinstance(structure_debug, dict):
@@ -2524,6 +2556,59 @@ async def analyze_hanging_mvp(
                 })
                 continue
             basis = make_wall_basis(projection_plane, basis_points, g_hat)
+
+            # V22: an existing removable artwork is not free-space evidence in
+            # its observed tilted plane, but it may represent usable wall after
+            # cleanup.  Reconstruct it only when coherent wall support surrounds
+            # the component on multiple sides.  The artwork's own depth/normal
+            # are ignored and its pixels are back-projected onto the resolved 3-D
+            # wall plane for metric component/empty-region calculations.
+            structural_forbidden_union = np.zeros((h, w), dtype=np.uint8)
+            for structural_item in structural_masks:
+                structural_item_mask = structural_item.get("mask")
+                if isinstance(structural_item_mask, np.ndarray) and structural_item_mask.shape[:2] == (h, w):
+                    structural_forbidden_union[structural_item_mask > 0] = 255
+            art_wall_refit_mask, candidate_wall_xyz, art_wall_refit_debug = refit_semantic_art_to_wall_plane(
+                semantic_art_orientation_mask,
+                raw_wall_mask_before_structural,
+                orientation_evidence_mask,
+                xyz,
+                bundle.intr,
+                projection_plane,
+                structural_forbidden_mask=structural_forbidden_union,
+                enabled=bool(rule_value(
+                    rules, ["wall_plane_fit", "orientation_evidence_recovery", "artwork_wall_refit", "enabled"], True
+                )),
+                ring_dilate_px=int(rule_value(
+                    rules, ["wall_plane_fit", "orientation_evidence_recovery", "artwork_wall_refit", "ring_dilate_px"], 14
+                )),
+                min_component_pixels=int(rule_value(
+                    rules, ["wall_plane_fit", "orientation_evidence_recovery", "artwork_wall_refit", "min_component_pixels"], 120
+                )),
+                min_ring_wall_fraction=float(rule_value(
+                    rules, ["wall_plane_fit", "orientation_evidence_recovery", "artwork_wall_refit", "min_ring_wall_fraction"], 0.45
+                )),
+                min_ring_support_fraction=float(rule_value(
+                    rules, ["wall_plane_fit", "orientation_evidence_recovery", "artwork_wall_refit", "min_ring_support_fraction"], 0.22
+                )),
+                min_supported_sides=int(rule_value(
+                    rules, ["wall_plane_fit", "orientation_evidence_recovery", "artwork_wall_refit", "min_supported_sides"], 2
+                )),
+                min_side_support_fraction=float(rule_value(
+                    rules, ["wall_plane_fit", "orientation_evidence_recovery", "artwork_wall_refit", "min_side_support_fraction"], 0.12
+                )),
+            )
+            localized_support_active = bool(
+                orientation_refinement_debug.get("reason") == "localized_coherent_normal_support_recovered"
+            )
+            candidate_wall_mask = wall_mask.copy()
+            candidate_wall_mask[art_wall_refit_mask > 0] = 255
+            wall_filter_debug["artwork_wall_plane_refit"] = art_wall_refit_debug
+            wall_filter_debug["localized_normal_support_constrains_candidate_generation"] = localized_support_active
+            if wall_id in wall_debug_registry:
+                wall_debug_registry[wall_id]["artwork_wall_refit_mask"] = art_wall_refit_mask.copy()
+                wall_debug_registry[wall_id]["summary"]["artwork_wall_plane_refit"] = art_wall_refit_debug
+
             # All wall-local ranges must come from the selected plane, not from
             # ceiling/cove points that happened to remain in the coarse box.
             pts = basis_points
@@ -2559,6 +2644,15 @@ async def analyze_hanging_mvp(
             & (wall_depth_err <= wall_depth_tol)
             & (wall_normal_alignment_for_solid >= normal_consistency_dot_threshold)
         )
+        if localized_support_active:
+            # The special route is only safe where a continuous direct-normal
+            # island was actually recovered.  Window/reveal pixels that merely
+            # happen to sit near the global depth plane cannot generate axes.
+            solid_wall_bool &= (orientation_evidence_mask > 0)
+        # A validated removable artwork is represented by the *underlying* wall
+        # plane, not by its observed tilted face.  It can reconnect otherwise
+        # split wall components and participate in candidate generation.
+        solid_wall_bool |= (art_wall_refit_mask > 0)
 
         solid_wall_mask_u8 = (solid_wall_bool.astype(np.uint8) * 255)
 
@@ -2572,7 +2666,9 @@ async def analyze_hanging_mvp(
                 "plane_consistency_mask": ((wall_valid & (wall_depth_err <= wall_depth_tol)).astype(np.uint8) * 255),
                 "normal_consistency_mask": ((wall_valid & (wall_normal_alignment_for_solid >= normal_consistency_dot_threshold)).astype(np.uint8) * 255),
                 "solid_wall_mask": solid_wall_mask_u8.copy(),
-                "opening_recess_mask": (((wall_mask > 0) & ~(solid_wall_mask_u8 > 0)).astype(np.uint8) * 255),
+                "opening_recess_mask": (((candidate_wall_mask > 0) & ~(solid_wall_mask_u8 > 0)).astype(np.uint8) * 255),
+                "localized_coherent_normal_support_mask": orientation_evidence_mask.copy() if localized_support_active else np.zeros_like(wall_mask),
+                "artwork_wall_refit_mask": art_wall_refit_mask.copy(),
             })
 
         num_labels, comp_labels, comp_stats, comp_centroids = cv2.connectedComponentsWithStats(
@@ -2580,7 +2676,7 @@ async def analyze_hanging_mvp(
             connectivity=8
         )
 
-        raw_wall_area_px = int(np.count_nonzero(wall_mask))
+        raw_wall_area_px = int(np.count_nonzero(candidate_wall_mask))
         solid_wall_area_px = int(np.count_nonzero(solid_wall_mask_u8))
         min_component_area_px = max(2500, int(raw_wall_area_px * 0.015))
 
@@ -2607,7 +2703,7 @@ async def analyze_hanging_mvp(
                 continue
 
             comp_mask = ((comp_labels == comp_id).astype(np.uint8) * 255)
-            comp_pts = points_from_mask(xyz, comp_mask, max_points=30000)
+            comp_pts = points_from_mask(candidate_wall_xyz, comp_mask, max_points=30000)
             if len(comp_pts) < 300:
                 continue
 
@@ -2671,17 +2767,36 @@ async def analyze_hanging_mvp(
             _sem_mask = _sem_obj.get("mask")
             if _sem_mask is None:
                 continue
-            _overlap = int(np.count_nonzero((_sem_mask > 0) & (wall_mask > 0)))
+            _sem_bool = np.asarray(_sem_mask) > 0
+            _overlap = int(np.count_nonzero(_sem_bool & (candidate_wall_mask > 0)))
             if _overlap <= 0:
                 continue
-            semantic_occupied_mask[_sem_mask > 0] = 255
+            _occupied_bool = _sem_bool.copy()
+            _refit_overlap = int(np.count_nonzero(_sem_bool & (art_wall_refit_mask > 0)))
+            _safety_class = str(_sem_obj.get("existing_content_safety_class") or "")
+            _is_removable_existing = bool(
+                str(_sem_obj.get("role") or "").lower() == "existing_content"
+                and _safety_class != "blocking"
+            )
+            _refit_as_wall = bool(_is_removable_existing and _refit_overlap > 0)
+            if _refit_as_wall:
+                # The exact accepted artwork pixels remain cleanup scope later,
+                # but are not an obstacle for candidate generation because their
+                # underlying wall geometry has already been reconstructed.
+                _occupied_bool &= ~(art_wall_refit_mask > 0)
+            semantic_occupied_mask[_occupied_bool] = 255
             semantic_occupied_objects.append({
                 "object_id": _sem_obj.get("object_id"),
                 "label": _sem_obj.get("label"),
                 "role": _sem_obj.get("role"),
                 "wall_overlap_px": _overlap,
+                "artwork_wall_refit_overlap_px": _refit_overlap,
+                "candidate_generation_action": (
+                    "cleanup_object_refit_as_underlying_wall"
+                    if _refit_as_wall else "subtract_as_occupied"
+                ),
             })
-        semantic_clear_wall_mask = wall_mask.copy()
+        semantic_clear_wall_mask = candidate_wall_mask.copy()
         semantic_clear_wall_mask[semantic_occupied_mask > 0] = 0
         safe_axis_wall_mask = solid_wall_mask_u8.copy()
         safe_axis_wall_mask[semantic_occupied_mask > 0] = 0
@@ -2698,7 +2813,7 @@ async def analyze_hanging_mvp(
                 "enabled": True,
                 "excluded_object_count": len(semantic_occupied_objects),
                 "excluded_objects": semantic_occupied_objects,
-                "policy": "semantic_clear_subregion subtracts existing_content and foreground masks; no per-wall high-res crop is used",
+                "policy": "subtract foreground/blocking content; validated removable artwork refit remains candidate wall but is still cleanup scope",
             },
             **semantic_axis_gate,
         }
@@ -2709,7 +2824,7 @@ async def analyze_hanging_mvp(
             wall_debug_registry[wall_id]["summary"]["semantic_axis_safe_mask_coverage"] = semantic_axis_gate.get("semantic_axis_safe_mask_coverage")
             wall_debug_registry[wall_id]["summary"]["semantic_object_exclusion_count"] = len(semantic_occupied_objects)
         if fine_grained_front_policy_enabled and semantic_axis_gate.get("allowed"):
-            sem_pts = points_from_mask(xyz, semantic_clear_wall_mask, max_points=30000)
+            sem_pts = points_from_mask(candidate_wall_xyz, semantic_clear_wall_mask, max_points=30000)
             sem_pts = sem_pts[np.isfinite(sem_pts).all(axis=1)] if sem_pts.size else sem_pts
             if len(sem_pts) >= 50:
                 sem_rel = sem_pts - origin.reshape(1, 3)

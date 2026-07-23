@@ -391,7 +391,27 @@
       "min_retained_pixels": 3000,
       "min_component_pixels": 500,
       "max_raw_p50_spread_deg": 4.0,
-      "notes": "V21: existing artwork is dilated and removed only from wall-orientation evidence. When direct normals are bimodal, a material mode may be isolated with depth-plane inliers only if whole-wall RANSAC is strong, segmented depth independently agrees in yaw, and the refined direct-normal field passes the original strict p90/verticality gates. Artwork remains available to same-wall height anchoring and candidate-scoped cleanup."
+      "notes": "V22: keep the original global p90 gate. After semantic-art peel and depth-plane support, a sub-degree p50 field may recover through continuous tight-normal islands and an original-threshold p90 recheck. Independently agreeing segmented depth supplies yaw for this route; direct normals validate material/verticality only. Removable artwork can be refit to the underlying 3-D wall plane for candidate area when surrounding wall support proves the association.",
+      "localized_normal_support": {
+        "enabled": true,
+        "max_p50_spread_deg": 1.0,
+        "normal_inlier_angle_deg": 4.0,
+        "min_inlier_fraction": 0.35,
+        "min_component_pixels": 1200,
+        "min_component_fraction": 0.06,
+        "morphology_close_px": 5,
+        "notes": "V22: only after all depth-support gates pass and refined p50 is sub-degree, select pixels within the original 4 degree normal tolerance and require substantial connected islands. The original strict p90 gate is rerun on those islands; candidates must remain inside these components and pass structural clearance."
+      },
+      "artwork_wall_refit": {
+        "enabled": true,
+        "ring_dilate_px": 14,
+        "min_component_pixels": 120,
+        "min_ring_wall_fraction": 0.45,
+        "min_ring_support_fraction": 0.22,
+        "min_supported_sides": 2,
+        "min_side_support_fraction": 0.12,
+        "notes": "V22: removable artwork is reconstructed onto the resolved 3-D wall plane only when surrounding authoritative/coherent wall support is present on multiple sides and no structural-forbidden mask overlaps it. Observed artwork depth and normal are never used as wall geometry."
+      }
     },
     "horizontal_structure_validation_enabled": {
       "value": true

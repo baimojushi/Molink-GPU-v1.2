@@ -654,6 +654,7 @@ class Worker:
                 diag_later(diag.copy_file, inputs.get("room"), "01_inputs/room.jpg")
                 diag_later(diag.copy_file, inputs.get("artwork"), "01_inputs/artwork.png")
                 metric_zip = await asyncio.to_thread(pipeline.call_metric3d, inputs["room"], work_dir)
+                diag_later(diag.copy_file, metric_zip, "01_inputs/metric3d.zip")
 
                 await self.progress(ws, job, "semantic", "running", 35, "正在识别墙面与结构信息…")
                 scene_profile = (job.get("rules_overrides") or {}).get("scene_profile", "home")
