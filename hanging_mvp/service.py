@@ -3657,12 +3657,19 @@ async def analyze_hanging_mvp(
             if enforce_edge_corner_support and edge_corner_support_debug.get("status") == "ok":
                 edge_support_min = float(edge_corner_support_debug.get("min_edge_support_ratio", 0.0))
                 corner_support_min = float(edge_corner_support_debug.get("min_corner_support_ratio", 0.0))
+                _anchor_edge_corner = bool(axis_item.get("proven_artwork_anchor"))
                 if edge_support_min < hard_reject_edge_support_ratio:
-                    reasons.append("artwork_edge_support_below_hard_reject_threshold")
+                    if not _anchor_edge_corner:
+                        reasons.append("artwork_edge_support_below_hard_reject_threshold")
+                    else:
+                        soft_risk_reasons.append("artwork_edge_support_below_hard_reject_threshold_bypassed_by_proven_anchor")
                 elif edge_support_min < min_edge_support_ratio:
                     soft_risk_reasons.append("artwork_edge_support_below_auto_pass_threshold")
                 if corner_support_min < hard_reject_corner_support_ratio:
-                    reasons.append("artwork_corner_support_below_hard_reject_threshold")
+                    if not _anchor_edge_corner:
+                        reasons.append("artwork_corner_support_below_hard_reject_threshold")
+                    else:
+                        soft_risk_reasons.append("artwork_corner_support_below_hard_reject_threshold_bypassed_by_proven_anchor")
                 elif corner_support_min < min_corner_support_ratio:
                     soft_risk_reasons.append("artwork_corner_support_below_auto_pass_threshold")
             # Existing_content is split by safety class: flat visual wall content
