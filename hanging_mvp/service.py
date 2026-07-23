@@ -3614,61 +3614,19 @@ async def analyze_hanging_mvp(
                 rules=rules,
             )
 
-            # === PROVEN ARTWORK ANCHOR: relax structural clearance ===
-            # When the candidate is at a proven artwork position, structural
-            # objects that physically overlap with the existing artwork mask
-            # are downgraded from hard reject to soft risk — the existing art
-            # already coexisted with them on the same wall in reality.
-            _anchor_sc_relaxed = False
+            # === PROVEN ARTWORK ANCHOR: bypass structural clearance ===
+            # The human-chosen position is authoritative — structural objects
+            # (windows, lamps, curtains) within clearance distance do not block
+            # because the artwork already coexisted with them on the same wall.
+            # Record the original clearance data for diagnostics, then force pass.
             if axis_item.get("proven_artwork_anchor"):
-                _anchor_obj_id = str(axis_item.get("proven_artwork_object_id") or "")
-                _blocking_list = structural_clearance_debug.get("blocking_objects") or []
-                _relaxed_items = []
-                if _anchor_obj_id and _blocking_list:
-                    # Find the proven art mask
-                    _proven_art_mask = None
-                    for _em in existing_masks:
-                        if str(_em.get("object_id") or "") == _anchor_obj_id:
-                            _pm = _em.get("mask")
-                            if _pm is not None:
-                                _proven_art_mask = np.asarray(_pm) > 0
-                            break
-                    if _proven_art_mask is not None and _proven_art_mask.shape == (h, w):
-                        _remaining_blocking = []
-                        for _blk_item in _blocking_list:
-                            _blk_id = str(_blk_item.get("object_id") or "")
-                            # Find the structural mask
-                            _blk_mask = None
-                            for _sm in structural_masks:
-                                if str(_sm.get("object_id") or "") == _blk_id:
-                                    _sm_mask = _sm.get("mask")
-                                    if _sm_mask is not None:
-                                        _blk_mask = np.asarray(_sm_mask) > 0
-                                    break
-                            if _blk_mask is not None and _blk_mask.shape == (h, w):
-                                _inter = int(np.count_nonzero(_blk_mask & _proven_art_mask))
-                                if _inter > 0:
-                                    _relaxed_items.append({
-                                        "object_id": _blk_id,
-                                        "label": str(_blk_item.get("label", "")),
-                                        "clearance_m": _blk_item.get("edge_clearance_m"),
-                                        "overlap_with_proven_art_px": _inter,
-                                        "reason": "coexists_with_proven_artwork_on_wall",
-                                    })
-                                    continue  # skip — not a hard blocker
-                            _remaining_blocking.append(_blk_item)
-                        if _relaxed_items:
-                            _anchor_sc_relaxed = True
-                            structural_clearance_debug["blocking_objects"] = _remaining_blocking
-                            structural_clearance_debug["passed"] = len(_remaining_blocking) == 0
-                            structural_clearance_debug["proven_anchor_relaxation"] = {
-                                "applied": True,
-                                "relaxed_count": len(_relaxed_items),
-                                "remaining_blocking_count": len(_remaining_blocking),
-                                "relaxed_items": _relaxed_items,
-                            }
-                if not _anchor_sc_relaxed:
-                    structural_clearance_debug["proven_anchor_relaxation"] = {"applied": False}
+                _orig_blocking = structural_clearance_debug.get("blocking_objects") or []
+                structural_clearance_debug["passed"] = True
+                structural_clearance_debug["proven_anchor_bypass"] = {
+                    "applied": True,
+                    "original_blocking_count": len(_orig_blocking),
+                    "original_min_clearance_m": structural_clearance_debug.get("min_clearance_m"),
+                }
             # === END PROVEN ARTWORK ANCHOR RELAXATION ===
 
             reasons = height_contract_gate_reasons(
