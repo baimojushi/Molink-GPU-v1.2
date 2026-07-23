@@ -569,6 +569,248 @@ def estimate_wall_normal_consensus(
     return consensus.astype(np.float32), debug
 
 
+def refine_wall_orientation_evidence(
+    normal_xyz: np.ndarray,
+    points_3d: np.ndarray,
+    evidence_mask: np.ndarray,
+    depth_plane: WallPlane,
+    g_hat_cam: np.ndarray,
+    *,
+    semantic_art_mask: Optional[np.ndarray] = None,
+    art_mask_dilate_px: int = 10,
+    enabled: bool = True,
+    whole_depth_inlier_ratio: Optional[float] = None,
+    min_whole_depth_inlier_ratio: float = 0.55,
+    segmented_depth_yaw: Optional[float] = None,
+    segmented_depth_confident: bool = False,
+    max_depth_segmented_yaw_disagreement_deg: float = 8.0,
+    depth_plane_distance_threshold_m: float = 0.08,
+    min_retained_fraction: float = 0.20,
+    min_retained_pixels: int = 3000,
+    min_component_pixels: int = 500,
+    max_raw_p50_spread_deg: float = 4.0,
+    normal_min_samples: int = 1000,
+    normal_max_p90_spread_deg: float = 4.0,
+    normal_max_vertical_tilt_deg: float = 5.0,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """Peel known artwork and an adjacent depth mode from wall orientation evidence.
+
+    A semantic wall region may contain a thin, removable artwork plane or a
+    connected return/column face.  The old direct-normal quality gate measured
+    every remaining pixel together, so a coherent wall majority plus a second
+    coherent plane produced a low p50 but an approximately 90-degree p90 and
+    rejected the entire wall.
+
+    Recovery is deliberately narrow and fail-closed:
+
+    * detected artwork is removed only from *orientation* evidence (the object
+      record and its metric pixels remain available to height anchoring and
+      cleanup later in the pipeline);
+    * a failed, bimodal direct-normal field may be restricted to the fitted
+      depth plane only when the whole-wall depth fit is strong and an
+      independent segmented-depth heading agrees with it;
+    * the refined direct-normal field must then pass the original strict p90
+      and verticality gates.  Direct-normal yaw is still not authoritative.
+    """
+    normal_arr = np.asarray(normal_xyz)
+    xyz = np.asarray(points_3d)
+    mask = np.asarray(evidence_mask, dtype=np.uint8)
+    debug: Dict[str, Any] = {
+        "enabled": bool(enabled),
+        "policy": "semantic_art_peel_then_depth_supported_connected_material_mode",
+        "recovered": False,
+        "direct_normal_used_for_yaw": False,
+    }
+    if (
+        normal_arr.ndim != 3
+        or normal_arr.shape[-1] != 3
+        or xyz.ndim != 3
+        or xyz.shape[-1] != 3
+        or mask.shape[:2] != normal_arr.shape[:2]
+        or xyz.shape[:2] != mask.shape[:2]
+    ):
+        debug["reason"] = "orientation_evidence_shape_mismatch"
+        return mask.copy(), debug
+
+    cleaned = (mask > 0).astype(np.uint8) * 255
+    initial_count = int(np.count_nonzero(cleaned))
+    debug["initial_pixel_count"] = initial_count
+
+    art_count = 0
+    art_dilated_count = 0
+    if semantic_art_mask is not None:
+        art = np.asarray(semantic_art_mask, dtype=np.uint8)
+        if art.shape[:2] == cleaned.shape[:2]:
+            art = (art > 0).astype(np.uint8) * 255
+            art_count = int(np.count_nonzero(art))
+            dilate_px = max(0, int(art_mask_dilate_px))
+            if dilate_px > 0 and art_count > 0:
+                kernel = cv2.getStructuringElement(
+                    cv2.MORPH_ELLIPSE,
+                    (2 * dilate_px + 1, 2 * dilate_px + 1),
+                )
+                art = cv2.dilate(art, kernel, iterations=1)
+            art_dilated_count = int(np.count_nonzero(art))
+            cleaned[art > 0] = 0
+    debug.update({
+        "semantic_art_pixel_count": art_count,
+        "semantic_art_dilated_pixel_count": art_dilated_count,
+        "semantic_art_dilate_px": max(0, int(art_mask_dilate_px)),
+        "pixel_count_after_semantic_art_peel": int(np.count_nonzero(cleaned)),
+        "artwork_retained_for_height_anchor": True,
+        "artwork_retained_for_candidate_cleanup": True,
+    })
+
+    depth_n = normalize(np.asarray(depth_plane.n, dtype=np.float32).reshape(3))
+    g_hat = normalize(np.asarray(g_hat_cam, dtype=np.float32).reshape(3))
+    raw_consensus, raw_debug = estimate_wall_normal_consensus(
+        normal_arr,
+        cleaned,
+        depth_n,
+        g_hat,
+        min_samples=int(normal_min_samples),
+        max_p90_spread_deg=float(normal_max_p90_spread_deg),
+        max_vertical_tilt_deg=float(normal_max_vertical_tilt_deg),
+    )
+    debug["raw_normal_consensus"] = raw_debug
+    if bool(raw_debug.get("reliable")):
+        debug["reason"] = "semantic_clean_evidence_already_reliable"
+        debug["final_pixel_count"] = int(np.count_nonzero(cleaned))
+        return cleaned, debug
+    if not bool(enabled):
+        debug["reason"] = "orientation_mode_recovery_disabled"
+        debug["final_pixel_count"] = int(np.count_nonzero(cleaned))
+        return cleaned, debug
+
+    depth_vertical_n = depth_n - float(np.dot(depth_n, g_hat)) * g_hat
+    if float(np.linalg.norm(depth_vertical_n)) < EPS:
+        debug["reason"] = "depth_plane_parallel_to_gravity"
+        debug["final_pixel_count"] = int(np.count_nonzero(cleaned))
+        return cleaned, debug
+    depth_vertical_n = normalize(depth_vertical_n)
+    depth_yaw = float(np.arctan2(float(depth_vertical_n[2]), float(depth_vertical_n[0])))
+    depth_segmented_disagreement = None
+    if segmented_depth_yaw is not None:
+        depth_segmented_disagreement = float(np.degrees(
+            _axial_angle_distance_rad(depth_yaw, float(segmented_depth_yaw))
+        ))
+
+    raw_p50 = raw_debug.get("angular_spread_p50_deg")
+    raw_p90 = raw_debug.get("angular_spread_p90_deg")
+    gates = {
+        "raw_field_is_bimodal_not_diffuse": bool(
+            raw_p50 is not None
+            and raw_p90 is not None
+            and float(raw_p50) <= float(max_raw_p50_spread_deg)
+            and float(raw_p90) > float(normal_max_p90_spread_deg)
+        ),
+        "whole_depth_plane_support": bool(
+            whole_depth_inlier_ratio is not None
+            and float(whole_depth_inlier_ratio) >= float(min_whole_depth_inlier_ratio)
+        ),
+        "segmented_depth_is_confident": bool(segmented_depth_confident and segmented_depth_yaw is not None),
+        "whole_and_segmented_depth_agree": bool(
+            depth_segmented_disagreement is not None
+            and depth_segmented_disagreement <= float(max_depth_segmented_yaw_disagreement_deg)
+        ),
+    }
+    debug.update({
+        "gates": gates,
+        "failed_gates": [name for name, passed in gates.items() if not passed],
+        "whole_depth_inlier_ratio": whole_depth_inlier_ratio,
+        "min_whole_depth_inlier_ratio": float(min_whole_depth_inlier_ratio),
+        "depth_yaw_deg": float(np.degrees(depth_yaw)),
+        "segmented_depth_yaw_deg": (
+            float(np.degrees(segmented_depth_yaw)) if segmented_depth_yaw is not None else None
+        ),
+        "depth_segmented_yaw_disagreement_deg": depth_segmented_disagreement,
+        "max_depth_segmented_yaw_disagreement_deg": float(max_depth_segmented_yaw_disagreement_deg),
+    })
+    if not all(gates.values()):
+        debug["reason"] = "depth_supported_material_mode_recovery_gates_failed"
+        debug["final_pixel_count"] = int(np.count_nonzero(cleaned))
+        return cleaned, debug
+
+    finite_xyz = np.isfinite(xyz).all(axis=-1)
+    plane_distance = np.abs(
+        np.sum(xyz * depth_n.reshape(1, 1, 3), axis=-1) + float(depth_plane.d)
+    )
+    refined_bool = (
+        (cleaned > 0)
+        & finite_xyz
+        & np.isfinite(plane_distance)
+        & (plane_distance <= float(depth_plane_distance_threshold_m))
+    )
+    refined_u8 = refined_bool.astype(np.uint8) * 255
+
+    # Remove isolated depth speckles while preserving multiple regions of the
+    # same physical wall around a semantically removed artwork hole.
+    component_count = 0
+    retained_components: List[Dict[str, int]] = []
+    if np.count_nonzero(refined_u8) > 0:
+        opened = cv2.morphologyEx(
+            refined_u8,
+            cv2.MORPH_OPEN,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+            iterations=1,
+        )
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(opened, connectivity=8)
+        component_count = max(0, int(count - 1))
+        kept = np.zeros_like(opened)
+        for component_id in range(1, count):
+            area = int(stats[component_id, cv2.CC_STAT_AREA])
+            if area < int(min_component_pixels):
+                continue
+            kept[labels == component_id] = 255
+            retained_components.append({"component_id": int(component_id), "area_px": area})
+        refined_u8 = kept
+
+    retained_count = int(np.count_nonzero(refined_u8))
+    semantic_clean_count = int(np.count_nonzero(cleaned))
+    retained_fraction = float(retained_count / max(1, semantic_clean_count))
+    support_gates = {
+        "enough_refined_pixels": retained_count >= max(int(min_retained_pixels), int(normal_min_samples)),
+        "enough_refined_fraction": retained_fraction >= float(min_retained_fraction),
+    }
+    debug.update({
+        "depth_plane_distance_threshold_m": float(depth_plane_distance_threshold_m),
+        "connected_component_count": component_count,
+        "retained_components": retained_components,
+        "retained_pixel_count": retained_count,
+        "retained_fraction": retained_fraction,
+        "min_retained_pixels": int(min_retained_pixels),
+        "min_retained_fraction": float(min_retained_fraction),
+        "support_gates": support_gates,
+    })
+    if not all(support_gates.values()):
+        debug["reason"] = "depth_supported_material_mode_has_insufficient_support"
+        debug["final_pixel_count"] = semantic_clean_count
+        return cleaned, debug
+
+    refined_consensus, refined_debug = estimate_wall_normal_consensus(
+        normal_arr,
+        refined_u8,
+        depth_n,
+        g_hat,
+        min_samples=int(normal_min_samples),
+        max_p90_spread_deg=float(normal_max_p90_spread_deg),
+        max_vertical_tilt_deg=float(normal_max_vertical_tilt_deg),
+    )
+    debug["refined_normal_consensus"] = refined_debug
+    if refined_consensus is None or not bool(refined_debug.get("reliable")):
+        debug["reason"] = "refined_material_mode_still_fails_direct_normal_quality_gate"
+        debug["final_pixel_count"] = semantic_clean_count
+        return cleaned, debug
+
+    debug.update({
+        "recovered": True,
+        "reason": "depth_supported_wall_material_mode_recovered",
+        "final_pixel_count": retained_count,
+        "selected_evidence_source": "semantic_art_peeled_depth_plane_inliers",
+    })
+    return refined_u8, debug
+
+
 def _undirected_angle_deg(a: np.ndarray, b: np.ndarray) -> float:
     av = np.asarray(a, dtype=np.float64).reshape(-1)
     bv = np.asarray(b, dtype=np.float64).reshape(-1)

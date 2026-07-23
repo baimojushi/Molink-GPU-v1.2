@@ -381,6 +381,18 @@
       "value": true,
       "notes": "With enough samples, unstable or non-vertical direct normals reject the wall as an unreliable material surface. Direct-normal yaw is never copied into projection geometry."
     },
+    "orientation_evidence_recovery": {
+      "enabled": true,
+      "art_mask_dilate_px": 10,
+      "min_whole_depth_inlier_ratio": 0.55,
+      "max_depth_segmented_yaw_disagreement_deg": 8.0,
+      "depth_plane_distance_threshold_m": 0.08,
+      "min_retained_fraction": 0.2,
+      "min_retained_pixels": 3000,
+      "min_component_pixels": 500,
+      "max_raw_p50_spread_deg": 4.0,
+      "notes": "V21: existing artwork is dilated and removed only from wall-orientation evidence. When direct normals are bimodal, a material mode may be isolated with depth-plane inliers only if whole-wall RANSAC is strong, segmented depth independently agrees in yaw, and the refined direct-normal field passes the original strict p90/verticality gates. Artwork remains available to same-wall height anchoring and candidate-scoped cleanup."
+    },
     "horizontal_structure_validation_enabled": {
       "value": true
     },
@@ -446,7 +458,7 @@
       "max_cell_tilt_deg": 15.0,
       "cluster_angle_deg": 6.0,
       "min_cluster_cells": 4,
-      "min_cluster_coverage": 0.30,
+      "min_cluster_coverage": 0.3,
       "boundary_erosion_px": 3,
       "notes": "Local depth plane clustering uses the dense projected xyz image and exact authoritative wall mask after subtracting forbidden, foreground, support, existing-content and non-support masks. It never partitions a shuffled 3-D list by global coordinate ranges. Plane-normal yaws are 180-degree axes, so n and -n always belong to the same physical heading cluster."
     },

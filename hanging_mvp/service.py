@@ -20,7 +20,8 @@ from .geometry import (
     backproject, estimate_g_hat_from_floor_normals, estimate_g_hat_from_global_floor_like_normals,
     estimate_g_hat_from_horizontal_reference_normals, fit_plane_ransac, fit_vertical_plane_ransac, make_wall_basis,
     orient_vector_to_camera_up, resolve_wall_projection_plane, select_gravity_consensus,
-    points_from_mask, project_points, project_quad, polygon_mask, ray_plane_depth_for_mask, scale_points_to_original
+    points_from_mask, project_points, project_quad, polygon_mask, ray_plane_depth_for_mask, scale_points_to_original,
+    estimate_segmented_depth_plane_yaw, refine_wall_orientation_evidence,
 )
 from .hardpaste import load_rgba, warp_artwork_mount_to_geometry, warp_artwork_to_quad
 from .debug_assets import png_bytes as debug_png_bytes, mask_preview, build_wall_debug_overlay, draw_rejected_wall_overlay
@@ -65,7 +66,7 @@ except Exception:  # pragma: no cover - causal layer is optional at runtime
 API_KEY = os.getenv("API_KEY", "")
 ALLOW_UNAUTH_LOCAL = os.getenv("ALLOW_UNAUTH_LOCAL", "").strip().lower() in {"1", "true", "yes", "on"}
 PORT = int(os.getenv("HANGING_MVP_PORT", "6010"))
-HANGING_PIPELINE_BUILD_ID = "2026-07-22-projection-shape-feedback-consensus-v20"
+HANGING_PIPELINE_BUILD_ID = "2026-07-23-semantic-art-plane-peel-consensus-v21"
 
 
 def _truthy_env(name: str, default: str = "0") -> bool:
@@ -2140,11 +2141,24 @@ async def analyze_hanging_mvp(
             )
             # Local orientation evidence must come from the same visible wall
             # component, not from furniture/people/art that overlap a coarse
-            # wall box.  This mask is used by both direct-normal validation and
-            # the segmented depth vote.
+            # wall box.  Existing artwork is special: it must be excluded from
+            # orientation consensus, while its original semantic object and
+            # depth samples remain intact for the later same-wall height anchor
+            # and candidate-scoped cleanup stages.
             local_wall_evidence_mask = wall_mask.copy()
+            semantic_art_orientation_mask = np.zeros((h, w), dtype=np.uint8)
             local_excluded_ids = []
+            orientation_art_ids = []
             evidence_purposes = {"forbidden", "foreground", "support", "existing_content", "non_support"}
+            art_orientation_labels = {
+                canonical_semantic_label(value)
+                for value in rule_value(
+                    rules,
+                    ["existing_art_height_anchor", "labels"],
+                    ["existing_art", "framed_art", "painting", "artwork", "poster"],
+                )
+                if str(value or "").strip()
+            }
             for evidence_obj in objects.values():
                 if evidence_obj.get("object_id") == wall_id:
                     continue
@@ -2162,13 +2176,22 @@ async def analyze_hanging_mvp(
                     bbox = evidence_obj.get("bbox_xyxy_processed") or evidence_obj.get("bbox_xyxy") or []
                     if len(bbox) == 4:
                         x1, y1, x2, y2 = [int(max(0, bbox[i])) for i in range(4)]
-                        x2, y2 = min(x2, w - 1), min(y2, h - 1)
+                        x2, y2 = min(x2, w), min(y2, h)
                         if x2 > x1 and y2 > y1:
                             evidence_obj_mask = np.zeros((h, w), dtype=np.uint8)
                             evidence_obj_mask[y1:y2, x1:x2] = 255
                             bbox_available = True
                 if isinstance(evidence_obj_mask, np.ndarray) and evidence_obj_mask.shape[:2] == (h, w):
+                    evidence_obj_mask = (np.asarray(evidence_obj_mask) > 0).astype(np.uint8) * 255
+                    label = canonical_semantic_label(evidence_obj.get("label"))
+                    is_art = bool(
+                        label in art_orientation_labels
+                        or semantic_label_matches(label, art_orientation_labels)
+                    )
                     overlap = int(np.count_nonzero((local_wall_evidence_mask > 0) & (evidence_obj_mask > 0)))
+                    if is_art and overlap > 0:
+                        semantic_art_orientation_mask[evidence_obj_mask > 0] = 255
+                        orientation_art_ids.append(str(evidence_obj.get("object_id") or label or "unknown"))
                     if overlap > 0:
                         local_wall_evidence_mask[evidence_obj_mask > 0] = 0
                         tag = str(evidence_obj.get("object_id") or evidence_obj.get("label") or "unknown")
@@ -2180,38 +2203,17 @@ async def analyze_hanging_mvp(
                 kernel = np.ones((2 * erosion_px + 1, 2 * erosion_px + 1), np.uint8)
                 local_wall_evidence_mask = cv2.erode(local_wall_evidence_mask, kernel, iterations=1)
             local_wall_evidence_mask[~np.isfinite(xyz).all(axis=-1)] = 0
-            wall_filter_debug["local_wall_orientation_evidence"] = {
-                "source": "authoritative_wall_minus_semantic_occluders_and_boundary",
-                "excluded_object_ids": local_excluded_ids,
-                "boundary_erosion_px": erosion_px,
-                "pixel_count": int(np.count_nonzero(local_wall_evidence_mask)),
-            }
 
-            # Direct normals are independent evidence; do not preselect them
-            # with the disputed whole-wall depth plane.  Doing so makes a bad
-            # RANSAC plane choose the normals that are allowed to disagree with
-            # it.  The exact cleaned wall mask plus the normal head's own
-            # verticality/spread gates is the authority here.
-            projection_normal_evidence_mask = (
-                (local_wall_evidence_mask > 0)
-                & np.isfinite(normal).all(axis=-1)
-            ).astype(np.uint8) * 255
-            wall_filter_debug["depth_plane_inliers_within_local_evidence"] = int(np.count_nonzero(
-                (local_wall_evidence_mask > 0)
-                & np.isfinite(depth_plane_distance_full)
-                & (depth_plane_distance_full < 0.08)
-            ))
-
-            # Segmented depth plane yaw: local 4x4 grid clustering for
-            # robust wall heading when whole-wall RANSAC is polluted.
+            # First depth vote uses the semantic-clean wall.  It is independent
+            # of direct normals and may authorize a much narrower material-mode
+            # recovery only when it agrees with the strong whole-wall RANSAC.
             seg_depth_yaw = None
             seg_depth_confident = False
             seg_depth_debug: dict = {}
+            sdp_enabled = bool(rule_value(
+                rules, ["wall_plane_fit", "segmented_depth_plane", "enabled"], True
+            ))
             try:
-                from .geometry import estimate_segmented_depth_plane_yaw
-                sdp_enabled = bool(rule_value(
-                    rules, ["wall_plane_fit", "segmented_depth_plane", "enabled"], True
-                ))
                 if sdp_enabled:
                     seg_depth_yaw, seg_depth_confident, seg_depth_debug = estimate_segmented_depth_plane_yaw(
                         xyz,
@@ -2240,10 +2242,6 @@ async def analyze_hanging_mvp(
                         )),
                     )
             except Exception as seg_depth_exc:
-                # v17 swallowed an AttributeError caused by reading
-                # WallPlane.normal instead of WallPlane.n.  That made the
-                # configured fallback look merely "unavailable" in every real
-                # job.  Never hide a missing quorum source again.
                 seg_depth_yaw = None
                 seg_depth_confident = False
                 seg_depth_debug = {
@@ -2253,6 +2251,128 @@ async def analyze_hanging_mvp(
                     "error_type": type(seg_depth_exc).__name__,
                     "error": str(seg_depth_exc),
                 }
+
+            orientation_evidence_mask, orientation_refinement_debug = refine_wall_orientation_evidence(
+                normal,
+                xyz,
+                local_wall_evidence_mask,
+                depth_support_plane,
+                g_hat,
+                semantic_art_mask=semantic_art_orientation_mask,
+                art_mask_dilate_px=int(rule_value(
+                    rules, ["wall_plane_fit", "orientation_evidence_recovery", "art_mask_dilate_px"], 10
+                )),
+                enabled=bool(rule_value(
+                    rules, ["wall_plane_fit", "orientation_evidence_recovery", "enabled"], True
+                )),
+                whole_depth_inlier_ratio=float(inlier_ratio),
+                min_whole_depth_inlier_ratio=float(rule_value(
+                    rules, ["wall_plane_fit", "orientation_evidence_recovery", "min_whole_depth_inlier_ratio"], 0.55
+                )),
+                segmented_depth_yaw=seg_depth_yaw,
+                segmented_depth_confident=seg_depth_confident,
+                max_depth_segmented_yaw_disagreement_deg=float(rule_value(
+                    rules, ["wall_plane_fit", "orientation_evidence_recovery", "max_depth_segmented_yaw_disagreement_deg"], 8.0
+                )),
+                depth_plane_distance_threshold_m=float(rule_value(
+                    rules, ["wall_plane_fit", "orientation_evidence_recovery", "depth_plane_distance_threshold_m"], 0.08
+                )),
+                min_retained_fraction=float(rule_value(
+                    rules, ["wall_plane_fit", "orientation_evidence_recovery", "min_retained_fraction"], 0.20
+                )),
+                min_retained_pixels=int(rule_value(
+                    rules, ["wall_plane_fit", "orientation_evidence_recovery", "min_retained_pixels"], 3000
+                )),
+                min_component_pixels=int(rule_value(
+                    rules, ["wall_plane_fit", "orientation_evidence_recovery", "min_component_pixels"], 500
+                )),
+                max_raw_p50_spread_deg=float(rule_value(
+                    rules, ["wall_plane_fit", "orientation_evidence_recovery", "max_raw_p50_spread_deg"], 4.0
+                )),
+                normal_min_samples=int(rule_value(
+                    rules, ["wall_plane_fit", "normal_consensus_min_samples"], 1000
+                )),
+                normal_max_p90_spread_deg=float(rule_value(
+                    rules, ["wall_plane_fit", "normal_consensus_max_p90_spread_deg"], 4.0
+                )),
+                normal_max_vertical_tilt_deg=float(rule_value(
+                    rules, ["wall_plane_fit", "normal_consensus_max_vertical_tilt_deg"], 5.0
+                )),
+            )
+            orientation_refinement_debug.update({
+                "existing_art_object_ids": sorted(set(orientation_art_ids)),
+                "excluded_object_ids": list(local_excluded_ids),
+            })
+            wall_filter_debug["local_wall_orientation_evidence"] = {
+                "source": "authoritative_wall_minus_semantic_occluders_then_depth_supported_material_mode",
+                "excluded_object_ids": local_excluded_ids,
+                "existing_art_object_ids": sorted(set(orientation_art_ids)),
+                "boundary_erosion_px": erosion_px,
+                "pixel_count_before_mode_recovery": int(np.count_nonzero(local_wall_evidence_mask)),
+                "pixel_count": int(np.count_nonzero(orientation_evidence_mask)),
+                "artwork_pipeline_bridge": {
+                    "excluded_from_orientation_consensus": True,
+                    "retained_for_same_wall_height_anchor": True,
+                    "retained_for_candidate_scoped_cleanup": True,
+                },
+                "orientation_evidence_recovery": orientation_refinement_debug,
+            }
+
+            # If the depth-supported material mode was recovered, recompute the
+            # segmented yaw on exactly the same final evidence.  This raises the
+            # cluster coverage for the real wall and prevents the peeled artwork
+            # or adjacent return from remaining a later quorum vote.
+            if bool(orientation_refinement_debug.get("recovered")) and sdp_enabled:
+                try:
+                    recovered_yaw, recovered_confident, recovered_debug = estimate_segmented_depth_plane_yaw(
+                        xyz,
+                        orientation_evidence_mask,
+                        g_hat,
+                        grid_size=int(rule_value(
+                            rules, ["wall_plane_fit", "segmented_depth_plane", "grid_size"], 4
+                        )),
+                        min_points_per_cell=int(rule_value(
+                            rules, ["wall_plane_fit", "segmented_depth_plane", "min_points_per_cell"], 50
+                        )),
+                        min_cell_inlier_ratio=float(rule_value(
+                            rules, ["wall_plane_fit", "segmented_depth_plane", "min_cell_inlier_ratio"], 0.4
+                        )),
+                        max_cell_tilt_deg=float(rule_value(
+                            rules, ["wall_plane_fit", "segmented_depth_plane", "max_cell_tilt_deg"], 15.0
+                        )),
+                        cluster_angle_deg=float(rule_value(
+                            rules, ["wall_plane_fit", "segmented_depth_plane", "cluster_angle_deg"], 6.0
+                        )),
+                        min_cluster_cells=int(rule_value(
+                            rules, ["wall_plane_fit", "segmented_depth_plane", "min_cluster_cells"], 4
+                        )),
+                        min_cluster_coverage=float(rule_value(
+                            rules, ["wall_plane_fit", "segmented_depth_plane", "min_cluster_coverage"], 0.30
+                        )),
+                    )
+                    recovered_debug["pre_recovery_segmented_depth"] = seg_depth_debug
+                    if recovered_confident:
+                        seg_depth_yaw = recovered_yaw
+                        seg_depth_confident = recovered_confident
+                        seg_depth_debug = recovered_debug
+                except Exception as recovered_seg_exc:
+                    orientation_refinement_debug["recovered_segmented_depth_error"] = {
+                        "error_type": type(recovered_seg_exc).__name__,
+                        "error": str(recovered_seg_exc),
+                    }
+
+            # Direct normals are independent material evidence.  The final mask
+            # may be a strictly gated depth-supported wall mode, but the normal
+            # head must still pass its original p90/verticality quality gates.
+            projection_normal_evidence_mask = (
+                (orientation_evidence_mask > 0)
+                & np.isfinite(normal).all(axis=-1)
+            ).astype(np.uint8) * 255
+            wall_filter_debug["depth_plane_inliers_within_local_evidence"] = int(np.count_nonzero(
+                (orientation_evidence_mask > 0)
+                & np.isfinite(depth_plane_distance_full)
+                & (depth_plane_distance_full < 0.08)
+            ))
 
             # Controlled structural quorum config
             csq_enabled = bool(rule_value(
@@ -2287,7 +2407,7 @@ async def analyze_hanging_mvp(
                     rules, ["wall_plane_fit", "normal_consensus_max_vertical_tilt_deg"], 5.0
                 )),
                 image_rgb=room_rgb_processed,
-                wall_mask=wall_mask,
+                wall_mask=orientation_evidence_mask,
                 intr=bundle.intr,
                 direct_normal_fail_closed_on_quality_failure=bool(rule_value(
                     rules, ["wall_plane_fit", "direct_normal_fail_closed_on_quality_failure"], True
@@ -4224,8 +4344,8 @@ async def analyze_hanging_mvp(
             "gravity_contract": "multi_reference_camera_coordinate_consensus_v3",
             "semantic_coordinate_contract": "joint_2d_pixel_grid_hypotheses_with_scene_and_image_evidence_v4",
             "projection_contract": "project_3d_wall_corners_once_with_preprojection_shape_feedback_v5",
-            "metric3d_orientation_contract": "depth_hierarchy_then_stable_direct_normal_shape_feedback_v4",
-            "wall_fragment_contract": "trusted_sam_component_lineage_and_fail_closed_material_review_v1",
+            "metric3d_orientation_contract": "semantic_art_peel_then_depth_supported_material_mode_v5",
+            "wall_fragment_contract": "trusted_sam_lineage_plus_orientation_mode_isolation_v2",
             "render_contract": "fullspace_identity_locked_shadow_v2",
             "worker_result_contract": "render_review_is_completed_review_v1",
         },
