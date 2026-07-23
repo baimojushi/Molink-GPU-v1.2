@@ -2846,6 +2846,37 @@ async def analyze_hanging_mvp(
             if _overlap <= 0:
                 continue
             _occupied_bool = _sem_bool.copy()
+            # Foreground objects that are far from the wall plane (not in the
+            # same 3-D band) should not be subtracted from the wall mask for
+            # axis generation — they don't occupy wall space. The V6 proximity
+            # check (wall_proximity_threshold_m) filters them per-candidate
+            # in the hard-constraints section.
+            _sem_role = str(_sem_obj.get("role") or "").lower()
+            _is_foreground = bool(
+                _sem_role == "foreground"
+                or str(_sem_obj.get("label", "")).lower() in {"foreground", "foreground_object", "person", "human", "people"}
+            )
+            if _is_foreground and int(np.count_nonzero(_occupied_bool)) > 0:
+                _fg_pts = points_from_mask(xyz, _occupied_bool.astype(np.uint8) * 255, max_points=50000)
+                _fg_pts = _fg_pts[np.isfinite(_fg_pts).all(axis=1)] if _fg_pts.size else _fg_pts
+                if len(_fg_pts) >= 20:
+                    _fg_dist = np.abs(_fg_pts @ np.array(plane.n, np.float32).reshape(3) + float(plane.d))
+                    _fg_p50 = float(np.percentile(_fg_dist, 50))
+                    _prox = float(rule_value(rules, ["foreground_occlusion_policy", "wall_proximity_threshold_m"], 0.15))
+                    if _fg_p50 > _prox:
+                        # Distant foreground — does not occupy wall space;
+                        # skip subtraction but record for diagnostics.
+                        semantic_occupied_objects.append({
+                            "object_id": _sem_obj.get("object_id"),
+                            "label": _sem_obj.get("label"),
+                            "role": _sem_obj.get("role"),
+                            "wall_overlap_px": _overlap,
+                            "artwork_wall_refit_overlap_px": 0,
+                            "wall_plane_distance_p50_m": _fg_p50,
+                            "wall_plane_distance_threshold_m": _prox,
+                            "candidate_generation_action": "distant_foreground_not_subtracted",
+                        })
+                        continue
             _refit_overlap = int(np.count_nonzero(_sem_bool & (art_wall_refit_mask > 0)))
             _safety_class = str(_sem_obj.get("existing_content_safety_class") or "")
             _is_removable_existing = bool(
