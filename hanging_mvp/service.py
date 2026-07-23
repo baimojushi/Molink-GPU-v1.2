@@ -1915,6 +1915,78 @@ async def analyze_hanging_mvp(
         "warning": "empty semantic cleanup inventory; cleanup masks may be empty because semantic objects were not detected" if not existing_masks and not foreground_masks else None,
     }
 
+    # ---- PROVEN ARTWORK ANCHOR (V22 enhancement) ----
+    _REMOVABLE_EXISTING_ART_LABELS = {"existing_art", "painting", "poster", "framed_art", "artwork"}
+    def _try_proven_artwork_anchor_axis(
+        existing_masks_list, basis_obj, xyz_arr, normal_arr,
+        wall_mask_u8, img_h, img_w,
+    ):
+        """If exactly 1 removable existing_art on this wall → axis at its position."""
+        removable_art_objects = []
+        for _o in existing_masks_list:
+            _safety = str(_o.get("existing_content_safety_class") or "")
+            if _safety == "blocking":
+                continue
+            _role = str(_o.get("role") or "").lower()
+            _label = str(_o.get("label") or "").lower()
+            # canonical_semantic_label
+            if _role != "existing_content" and _label not in _REMOVABLE_EXISTING_ART_LABELS:
+                continue
+            _m = _o.get("mask")
+            if _m is None:
+                continue
+            _mask_b = np.asarray(_m) > 0
+            if _mask_b.shape != (img_h, img_w):
+                continue
+            _wall_olap = int(np.count_nonzero(_mask_b & (wall_mask_u8 > 0)))
+            if _wall_olap <= 0:
+                continue
+            removable_art_objects.append({"obj": _o, "mask": _mask_b, "mask_area": _wall_olap})
+
+        if len(removable_art_objects) != 1:
+            return None
+
+        art = removable_art_objects[0]
+        art_mask = art["mask"]
+
+        origin = np.array(basis_obj.origin, np.float32)
+        u_vec = np.array(basis_obj.u, np.float32)
+        v_vec = np.array(basis_obj.v, np.float32)
+
+        art_pts = points_from_mask(xyz_arr, art_mask.astype(np.uint8) * 255, max_points=100000)
+        art_pts = art_pts[np.isfinite(art_pts).all(axis=1)] if art_pts.size else art_pts
+        if len(art_pts) < 50:
+            return None
+
+        rel = art_pts - origin.reshape(1, 3)
+        s_vals = rel @ u_vec.reshape(3)
+        s_min = float(np.percentile(s_vals, 5))
+        s_max = float(np.percentile(s_vals, 95))
+        s_mid = float(np.median(s_vals))
+
+        # Artwork dominant normal from Metric3D normal map
+        art_norm_px = normal_arr[art_mask]
+        art_norm_px = art_norm_px[np.isfinite(art_norm_px).all(axis=1)]
+        art_normal = None
+        if len(art_norm_px) >= 50:
+            _med = np.median(art_norm_px, axis=0)
+            _n = np.linalg.norm(_med)
+            if _n > 1e-6:
+                art_normal = [float(x) for x in (_med / _n)]
+
+        return {
+            "axis_s_m": s_mid,
+            "proven_artwork_anchor": True,
+            "proven_artwork_s_range_m": [s_min, s_max],
+            "proven_artwork_width_m": float(s_max - s_min),
+            "proven_artwork_normal": art_normal,
+            "proven_artwork_object_id": str(art["obj"].get("object_id") or ""),
+            "component_area_px": art["mask_area"],
+            "component_s_range_m": [s_min, s_max],
+            "source": "proven_artwork_anchor",
+        }
+    # ---- END PROVEN ARTWORK ANCHOR ----
+
     for wall_obj in walls:
         wall_id = wall_obj["object_id"]
         wall_object_registry[wall_id] = wall_obj
@@ -3025,6 +3097,22 @@ async def analyze_hanging_mvp(
                 pass
         # HANGING_POLICY_PATCH_V6_END_STRUCTURAL_GAP_AXES
 
+        # === PROVEN ARTWORK ANCHOR ===
+        # When exactly 1 removable existing_art overlaps with this wall, the
+        # human-chosen location is the ideal candidate.  Replace all axes with
+        # the proven anchor position.  For >1 artwork, fall back to normal flow.
+        _proven_ax = _try_proven_artwork_anchor_axis(
+            existing_masks_list=existing_masks,
+            basis_obj=basis, xyz_arr=xyz, normal_arr=normal,
+            wall_mask_u8=candidate_wall_mask, img_h=h, img_w=w,
+        )
+        if _proven_ax is not None:
+            axes = [_proven_ax]
+            _proven_anchor_active = True
+        else:
+            _proven_anchor_active = False
+        # === END PROVEN ARTWORK ANCHOR ===
+
         if not axes:
             rejected.append({
                 "wall_id": wall_id,
@@ -3737,6 +3825,20 @@ async def analyze_hanging_mvp(
                 "max_recess_behind_wall_ratio": float(max_recess_behind_wall_ratio),
                 "art_depth_rasterized": True,
                 "wall_filter_debug": wall_filter_debug,
+                "proven_artwork_refit": (
+                    {
+                        "active": True,
+                        "axis_source": str(axis_item.get("source", "")),
+                        "artwork_object_id": str(axis_item.get("proven_artwork_object_id", "")),
+                        "anchor_s_range_m": axis_item.get("proven_artwork_s_range_m"),
+                        "anchor_artwork_width_m": axis_item.get("proven_artwork_width_m"),
+                        "artwork_normal": axis_item.get("proven_artwork_normal"),
+                        "artwork_normal_used_for_perspective": bool(axis_item.get("proven_artwork_normal") is not None),
+                        "policy": "single_removable_existing_art_position_used_as_candidate_anchor",
+                    }
+                    if axis_item.get("proven_artwork_anchor")
+                    else None
+                ),
                 "projection_degenerate_guard": {
                     **quad_metrics,
                     "projection_shape_gate": projection_shape_gate,
