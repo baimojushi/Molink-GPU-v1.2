@@ -1929,8 +1929,10 @@ async def analyze_hanging_mvp(
                 continue
             _role = str(_o.get("role") or "").lower()
             _label = str(_o.get("label") or "").lower()
-            # canonical_semantic_label
-            if _role != "existing_content" and _label not in _REMOVABLE_EXISTING_ART_LABELS:
+            _clabel = canonical_semantic_label(str(_o.get("label") or ""))
+            # Only actual art objects (framed_art, painting, poster, artwork)
+            # can serve as proven anchors — not books, hooks, nails, etc.
+            if _clabel not in _REMOVABLE_EXISTING_ART_LABELS:
                 continue
             _m = _o.get("mask")
             if _m is None:
