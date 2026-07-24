@@ -118,31 +118,55 @@ def _resize_to_match(source_path: Path, output_path: Path) -> dict[str, Any]:
         gen_w, gen_h = generated_size
         src_ratio = src_w / src_h
         gen_ratio = gen_w / gen_h
-        crop: dict[str, Any] = {
+        padding: dict[str, Any] = {
             "source_aspect_ratio": src_ratio,
             "generated_aspect_ratio": gen_ratio,
         }
 
         generated_rgb = generated.convert("RGB")
         if abs(src_ratio - gen_ratio) > 1e-6 and gen_w > 0 and gen_h > 0:
-            # Center-crop generated to match source aspect ratio so the
-            # subsequent resize is uniform and content is not distorted.
+            import numpy as np
+            # Pad (not crop) generated to match source aspect ratio, then
+            # uniform-resize to source dimensions.  This preserves all
+            # generated content without cropping.  Edge-repeat padding is
+            # used so the border fills naturally – the padded region is
+            # almost always off-wall (floor, ceiling, adjacent wall) where
+            # the repeated tile is visually unobjectionable.
             if gen_ratio > src_ratio:
-                # Generated is wider: crop horizontal edges.
-                new_gen_w = int(gen_h * src_ratio)
-                if 0 < new_gen_w <= gen_w:
-                    offset_x = (gen_w - new_gen_w) // 2
-                    generated_rgb = generated_rgb.crop((offset_x, 0, offset_x + new_gen_w, gen_h))
-                    crop["aspect_crop_applied"] = True
-                    crop["crop_box"] = [new_gen_w, gen_h]
+                # Generated is relatively wider → pad top and bottom so the
+                # narrower source ratio is achieved.
+                target_h = int(gen_w / src_ratio)
+                if target_h > gen_h:
+                    pad_total = target_h - gen_h
+                    pad_top = pad_total // 2
+                    pad_bottom = pad_total - pad_top
+                    arr = np.array(generated_rgb)
+                    top_pad = arr[:1].repeat(pad_top, axis=0) if pad_top > 0 else None
+                    bot_pad = arr[-1:].repeat(pad_bottom, axis=0) if pad_bottom > 0 else None
+                    parts = [p for p in (top_pad, arr, bot_pad) if p is not None]
+                    arr = np.concatenate(parts, axis=0)
+                    generated_rgb = Image.fromarray(arr)
+                    padding["padding_applied"] = True
+                    padding["padding_box"] = [gen_w, target_h]
+                    padding["pad_top"] = pad_top
+                    padding["pad_bottom"] = pad_bottom
             else:
-                # Generated is taller: crop vertical edges.
-                new_gen_h = int(gen_w / src_ratio)
-                if 0 < new_gen_h <= gen_h:
-                    offset_y = (gen_h - new_gen_h) // 2
-                    generated_rgb = generated_rgb.crop((0, offset_y, gen_w, offset_y + new_gen_h))
-                    crop["aspect_crop_applied"] = True
-                    crop["crop_box"] = [gen_w, new_gen_h]
+                # Generated is relatively taller → pad left and right.
+                target_w = int(gen_h * src_ratio)
+                if target_w > gen_w:
+                    pad_total = target_w - gen_w
+                    pad_left = pad_total // 2
+                    pad_right = pad_total - pad_left
+                    arr = np.array(generated_rgb)
+                    left_pad = arr[:, :1].repeat(pad_left, axis=1) if pad_left > 0 else None
+                    right_pad = arr[:, -1:].repeat(pad_right, axis=1) if pad_right > 0 else None
+                    parts = [p for p in (left_pad, arr, right_pad) if p is not None]
+                    arr = np.concatenate(parts, axis=1)
+                    generated_rgb = Image.fromarray(arr)
+                    padding["padding_applied"] = True
+                    padding["padding_box"] = [target_w, gen_h]
+                    padding["pad_left"] = pad_left
+                    padding["pad_right"] = pad_right
 
         resized = generated_rgb.resize(source_size, Image.Resampling.LANCZOS)
         resized.save(output_path)
@@ -150,7 +174,7 @@ def _resize_to_match(source_path: Path, output_path: Path) -> dict[str, Any]:
         "resized": True,
         "source_size": list(source_size),
         "generated_size": list(generated_size),
-        "crop": crop,
+        "padding": padding,
     }
 
 
