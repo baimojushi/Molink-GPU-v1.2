@@ -4,8 +4,10 @@
 """
 from __future__ import annotations
 
+import json
 import mimetypes
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -75,6 +77,54 @@ def upload_file(local_path: Path, key: str) -> str:
         ExtraArgs={"ContentType": content_type, "CacheControl": "public, max-age=31536000, immutable"},
     )
     return _public_url(key)
+
+
+def upload_terminal_result_envelope(
+    *,
+    prefix: str,
+    result_id: str,
+    job_id: str,
+    order_id: str | None,
+    status: str | None,
+    payload: Dict[str, Any],
+) -> Dict[str, str]:
+    """Persist a terminal result before WebSocket delivery.
+
+    The business server can recover this small control object directly from R2
+    when the WebSocket dies after image upload.  A versioned object is retained
+    for audit, while ``control/result_payload.json`` is the stable recovery key.
+    """
+    clean_prefix = str(prefix or "").strip().strip("/")
+    if not clean_prefix:
+        raise ValueError("terminal result upload requires r2_output_prefix")
+
+    envelope = {
+        "schema_version": 1,
+        "result_id": str(result_id),
+        "job_id": str(job_id),
+        "order_id": str(order_id or ""),
+        "status": str(status or ""),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "payload": payload,
+    }
+    body = json.dumps(envelope, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    client = _get_client()
+    common = {
+        "Bucket": R2_BUCKET,
+        "Body": body,
+        "ContentType": "application/json; charset=utf-8",
+        "CacheControl": "no-store, max-age=0",
+    }
+    versioned_key = f"{clean_prefix}/control/results/{result_id}.json"
+    latest_key = f"{clean_prefix}/control/result_payload.json"
+    client.put_object(Key=versioned_key, **common)
+    client.put_object(Key=latest_key, **common)
+    return {
+        "result_key": latest_key,
+        "result_url": _public_url(latest_key),
+        "versioned_result_key": versioned_key,
+        "versioned_result_url": _public_url(versioned_key),
+    }
 
 
 def upload_all(output_dir: Path, prefix: str) -> Dict[str, Any]:

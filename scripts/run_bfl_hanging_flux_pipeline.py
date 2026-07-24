@@ -1419,9 +1419,9 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             "flux2_mask_sent": not using_apiyi_gpt_image2_vip,
             "final_render_mask_required": not using_apiyi_gpt_image2_vip,
             "final_render_contract": (
-                "gpt-image-2-vip /v1/images/edits with local bounded composite; "
-                "pure-color walls use local crop/composite/QA to enforce edit scope; "
-                "textured candidate walls send the full room and enforce the remote edit scope with a compressed-pixel coordinate matrix prompt"
+                "gpt-image-2-vip full-frame generation with no local crop; "
+                "the provider result is preserved across the room and only the artwork front anchor is restored locally; "
+                "semantic styling zones are QA-only and are never sent as generation masks"
             ) if using_apiyi_gpt_image2_vip else "masked FLUX.2 edit",
             "outputs": [],
             "errors": [],

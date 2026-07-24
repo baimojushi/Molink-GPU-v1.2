@@ -14,7 +14,15 @@ from worker import render_api, result_builder
 WALLPAPER = {"enabled": True, "tone_rgb": [58, 62, 71]}
 
 
-def _make_stage_a_fixture(tmp_path: Path, protect_mode: str = "valid") -> tuple[Path, Path, bytes]:
+def _make_stage_a_fixture(
+    tmp_path: Path,
+    protect_mode: str = "valid",
+    *,
+    include_decor_zone: bool = True,
+    include_wall_zone: bool = True,
+    include_front_region: bool = False,
+    broad_legacy_protect: bool = False,
+) -> tuple[Path, Path, bytes]:
     output_dir = tmp_path / "render"
     final_dir = output_dir / "final_hd"
     final_dir.mkdir(parents=True)
@@ -26,7 +34,10 @@ def _make_stage_a_fixture(tmp_path: Path, protect_mode: str = "valid") -> tuple[
 
     mask = np.zeros((80, 120), dtype=np.uint8)
     if protect_mode != "empty":
-        mask[25:55, 45:75] = 255
+        if broad_legacy_protect:
+            mask[20:60, 40:80] = 255
+        else:
+            mask[25:55, 45:75] = 255
     mask_path = tmp_path / "mount_mask.png"
     Image.fromarray(mask).save(mask_path)
     decor = np.zeros((80, 120), dtype=np.uint8)
@@ -46,16 +57,28 @@ def _make_stage_a_fixture(tmp_path: Path, protect_mode: str = "valid") -> tuple[
     }
     if protect_mode != "missing_field":
         item["stage_b_protect_zone_mask_path"] = "flux_inputs/items/wall_a__candidate_1/stage_b_protect_zone_mask.png"
-    item["stage_b_decor_zone_mask_path"] = "flux_inputs/items/wall_a__candidate_1/stage_b_decor_zone_mask.png"
-    item["stage_b_wall_zone_mask_path"] = "flux_inputs/items/wall_a__candidate_1/stage_b_wall_zone_mask.png"
+    if include_decor_zone:
+        item["stage_b_decor_zone_mask_path"] = "flux_inputs/items/wall_a__candidate_1/stage_b_decor_zone_mask.png"
+    if include_wall_zone:
+        item["stage_b_wall_zone_mask_path"] = "flux_inputs/items/wall_a__candidate_1/stage_b_wall_zone_mask.png"
+    if include_front_region:
+        item["front_region_mask_path"] = "flux_inputs/items/wall_a__candidate_1/front_region_mask.png"
     item["styling_zone_source"] = "sam_support_union"
     manifest = {"artwork_path": "flux_inputs/artwork.png", "items": [item]}
     archive_path = tmp_path / "hanging_result.zip"
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("flux_inputs/manifest.json", json.dumps(manifest))
         archive.write(artwork_path, "flux_inputs/artwork.png")
-        archive.write(decor_path, "flux_inputs/items/wall_a__candidate_1/stage_b_decor_zone_mask.png")
-        archive.write(wall_path, "flux_inputs/items/wall_a__candidate_1/stage_b_wall_zone_mask.png")
+        if include_decor_zone:
+            archive.write(decor_path, "flux_inputs/items/wall_a__candidate_1/stage_b_decor_zone_mask.png")
+        if include_wall_zone:
+            archive.write(wall_path, "flux_inputs/items/wall_a__candidate_1/stage_b_wall_zone_mask.png")
+        if include_front_region:
+            front = np.zeros((80, 120), dtype=np.uint8)
+            front[25:55, 45:75] = 255
+            front_path = tmp_path / "front_region_mask.png"
+            Image.fromarray(front).save(front_path)
+            archive.write(front_path, "flux_inputs/items/wall_a__candidate_1/front_region_mask.png")
         if protect_mode != "missing_file" and protect_mode != "missing_field":
             archive.write(mask_path, "flux_inputs/items/wall_a__candidate_1/stage_b_protect_zone_mask.png")
     return archive_path, output_dir, original_bytes
@@ -362,3 +385,73 @@ def test_result_payload_exposes_pre_styling_url_and_status():
     assert candidate["styling_zone_source"] == "sam_support_union"
     assert candidate["styling_qa"]["passed"] is True
     assert payload["metrics"]["stage_b_call_count"] == 1
+
+
+def test_stage_b_missing_decor_semantic_zone_does_not_mask_or_block_generation(tmp_path, monkeypatch):
+    archive, output_dir, _ = _make_stage_a_fixture(tmp_path, include_decor_zone=False)
+    captured = {}
+
+    class FullFrameProvider:
+        def edit(self, request):
+            captured["mask"] = request.mask
+            captured["metadata"] = dict(request.metadata)
+            out = request.output_dir / request.output_name
+            with Image.open(request.image) as source:
+                styled = np.asarray(source.convert("RGB")).copy()
+            styled[65:72, 10:22] = [68, 104, 82]
+            Image.fromarray(styled).save(out)
+            return SimpleNamespace(image=out, trace={"synthetic": "optional_semantic_zone"})
+
+    monkeypatch.setattr(render_api, "build_image_edit_provider", lambda _name: FullFrameProvider())
+    aggregate = render_api.run_stage_b_pipeline(
+        str(archive),
+        str(output_dir),
+        provider="mock",
+        soft_furnishing_requested=True,
+    )
+
+    assert aggregate["call_count"] == 1
+    assert aggregate["outputs"][0]["styling_status"] == "succeeded"
+    assert captured["mask"] is None
+    assert captured["metadata"]["stage_b_generation_mask_used"] is False
+    assert captured["metadata"]["stage_b_decor_zone_source"] == "full_scene_fallback_diagnostic_zone"
+
+
+def test_stage_b_prefers_exact_front_anchor_over_broad_legacy_protect_zone(tmp_path, monkeypatch):
+    archive, output_dir, _ = _make_stage_a_fixture(
+        tmp_path,
+        include_front_region=True,
+        broad_legacy_protect=True,
+    )
+    captured = {}
+
+    class FrameRelightProvider:
+        def edit(self, request):
+            captured["metadata"] = dict(request.metadata)
+            out = request.output_dir / request.output_name
+            with Image.open(request.image) as source:
+                styled = np.asarray(source.convert("RGB")).copy()
+            # Simulate creative frame/side relighting in the old broad mask ring.
+            styled[20:60, 40:80] = [90, 72, 58]
+            # Simulate artwork repaint; only the exact front must be restored.
+            styled[25:55, 45:75] = [10, 30, 220]
+            styled[66:72, 8:20] = [70, 105, 80]
+            Image.fromarray(styled).save(out)
+            return SimpleNamespace(image=out, trace={"synthetic": "frame_relight"})
+
+    monkeypatch.setenv("MOLINK_STAGE_B_ARTWORK_ANCHOR_ERODE_PX", "0")
+    monkeypatch.setattr(render_api, "build_image_edit_provider", lambda _name: FrameRelightProvider())
+    aggregate = render_api.run_stage_b_pipeline(
+        str(archive),
+        str(output_dir),
+        provider="mock",
+        soft_furnishing_requested=True,
+    )
+
+    final = np.asarray(Image.open(output_dir / "final_hd" / "wall_a__candidate_1.png").convert("RGB"))
+    output = aggregate["outputs"][0]
+    assert output["styling_status"] == "succeeded"
+    assert output["artwork_anchor_source"] == "front_region_mask"
+    assert captured["metadata"]["protected_artwork_mask_source"] == "front_region_mask"
+    assert np.all(final[25:55, 45:75] == [220, 215, 205])
+    assert np.all(final[21:24, 41:44] == [90, 72, 58])

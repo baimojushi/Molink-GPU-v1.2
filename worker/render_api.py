@@ -16,6 +16,7 @@ import zipfile
 from pathlib import Path
 from typing import Any, Dict, Mapping
 
+import cv2
 import numpy as np
 from PIL import Image
 
@@ -175,6 +176,85 @@ def _load_required_stage_b_zone(path: Path | None, size: tuple[int, int], label:
     return mask
 
 
+def _load_optional_stage_b_zone(path: Path | None, size: tuple[int, int]) -> np.ndarray | None:
+    if path is None or not path.is_file():
+        return None
+    width, height = size
+    try:
+        with Image.open(path) as image:
+            mask = np.asarray(image.convert("L").resize((width, height), Image.Resampling.NEAREST), dtype=np.uint8)
+    except Exception:
+        return None
+    mask = np.where(mask > 0, 255, 0).astype(np.uint8)
+    return mask if np.any(mask) else None
+
+
+def _stage_b_anchor_from_manifest(
+    *,
+    extracted: Path,
+    item: Mapping[str, Any],
+    size: tuple[int, int],
+    item_dir: Path,
+) -> tuple[Path, np.ndarray, str]:
+    """Build the only local Stage B protection: the artwork front anchor.
+
+    Prefer the exact front-region mask.  Legacy archives may only contain the
+    old dilated Stage-B protect mask, so polygon/bbox reconstruction is tried
+    before falling back to that broad mask.
+    """
+    width, height = size
+    candidates = [
+        ("front_region_mask", item.get("front_region_mask_path")),
+        ("art_region_mask", item.get("art_region_mask_path")),
+    ]
+    for source, rel in candidates:
+        path = _resolve_extracted_path(extracted, rel)
+        mask = _load_optional_stage_b_zone(path, size)
+        if mask is not None:
+            break
+    else:
+        source = "front_polygon"
+        mask = np.zeros((height, width), dtype=np.uint8)
+        polygon = item.get("front_polygon_px") or item.get("polygon_px") or item.get("target_quad_original")
+        try:
+            points = np.asarray(polygon, dtype=np.float32).reshape(-1, 2)
+            if points.shape[0] >= 3 and np.all(np.isfinite(points)):
+                cv2.fillPoly(mask, [np.round(points).astype(np.int32)], 255)
+        except Exception:
+            pass
+        if not np.any(mask):
+            source = "front_bbox"
+            bbox = item.get("front_bbox_px") or item.get("bbox_px")
+            try:
+                x0, y0, x1, y1 = [int(round(float(v))) for v in list(bbox)[:4]]
+                x0, x1 = sorted((max(0, x0), min(width, x1)))
+                y0, y1 = sorted((max(0, y0), min(height, y1)))
+                if x1 > x0 and y1 > y0:
+                    mask[y0:y1, x0:x1] = 255
+            except Exception:
+                pass
+        if not np.any(mask):
+            source = "legacy_stage_b_protect_zone"
+            legacy_path = _resolve_extracted_path(extracted, item.get("stage_b_protect_zone_mask_path"))
+            legacy = _load_optional_stage_b_zone(legacy_path, size)
+            if legacy is None:
+                raise FileNotFoundError("Stage B requires an artwork front anchor mask or polygon")
+            mask = legacy
+
+    erode_px = max(0, int(os.getenv("MOLINK_STAGE_B_ARTWORK_ANCHOR_ERODE_PX", "0")))
+    if erode_px > 0:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * erode_px + 1, 2 * erode_px + 1))
+        eroded = cv2.erode(mask, kernel)
+        if np.any(eroded):
+            mask = eroded
+            source = f"{source}_eroded_{erode_px}px"
+
+    item_dir.mkdir(parents=True, exist_ok=True)
+    anchor_path = item_dir / "stage_b_artwork_anchor_mask.png"
+    Image.fromarray(mask, mode="L").save(anchor_path)
+    return anchor_path, mask, source
+
+
 def _masked_luma_gradient_metrics(a: np.ndarray, b: np.ndarray, mask: np.ndarray) -> dict[str, Any]:
     """Compare wall illumination/texture gradients while allowing a new base color."""
     weights = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
@@ -259,6 +339,15 @@ def _masked_stage_b_composite_and_qa(
     base_arr = np.asarray(base, dtype=np.int16)
     out_arr = np.asarray(composited, dtype=np.int16)
     protect_arr = np.asarray(protect, dtype=np.uint8) > 0
+    qa_anchor_guard_px = max(0, int(os.getenv("MOLINK_STAGE_B_QA_ARTWORK_GUARD_PX", "8")))
+    if qa_anchor_guard_px > 0:
+        guard_kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (2 * qa_anchor_guard_px + 1, 2 * qa_anchor_guard_px + 1),
+        )
+        artwork_qa_guard = cv2.dilate(protect_arr.astype(np.uint8), guard_kernel) > 0
+    else:
+        artwork_qa_guard = protect_arr.copy()
     changed = np.any(base_arr != out_arr, axis=2)
     delta = np.mean(np.abs(out_arr - base_arr), axis=2)
     protect_changed = int(np.count_nonzero(changed & protect_arr))
@@ -273,11 +362,18 @@ def _masked_stage_b_composite_and_qa(
     scene_changed_ratio = float(np.mean(delta[scene_eval] > scene_changed_delta)) if scene_area else 0.0
     scene_ssim = masked_global_ssim(base_arr, out_arr, scene_eval) if scene_area >= 16 else 0.0
     min_scene_ssim = float(os.getenv("MOLINK_STAGE_B_QA_MIN_SCENE_SSIM", "0.22"))
+    min_scene_changed_ratio_for_ssim = float(
+        os.getenv("MOLINK_STAGE_B_QA_MIN_SCENE_CHANGED_RATIO_FOR_SSIM", "0.20")
+    )
     max_scene_changed_ratio = float(os.getenv("MOLINK_STAGE_B_QA_MAX_SCENE_CHANGED_RATIO", "0.88"))
     if scene_area < 16:
         failures.append("scene_qa_region_too_small")
     else:
-        if scene_ssim < min_scene_ssim:
+        # Global SSIM is unstable on nearly flat rooms when a small accessory
+        # changes a low-variance patch.  Use it only after a material fraction
+        # of the full scene changed; tiny localized edits are governed by the
+        # explicit changed-ratio and goal-effect gates below.
+        if scene_changed_ratio >= min_scene_changed_ratio_for_ssim and scene_ssim < min_scene_ssim:
             failures.append("full_scene_identity_below_threshold")
         if scene_changed_ratio > max_scene_changed_ratio and scene_ssim < 0.55:
             failures.append("full_scene_changed_ratio_above_threshold")
@@ -288,6 +384,7 @@ def _masked_stage_b_composite_and_qa(
         "thresholds": {
             "min_masked_ssim": min_scene_ssim,
             "max_changed_ratio": max_scene_changed_ratio,
+            "min_changed_ratio_for_ssim": min_scene_changed_ratio_for_ssim,
             "changed_pixel_delta": scene_changed_delta,
         },
     }
@@ -297,7 +394,10 @@ def _masked_stage_b_composite_and_qa(
         decor_eval = np.asarray(decor_zone) > 0
         if wallpaper_enabled:
             decor_eval &= ~(np.asarray(wall_zone) > 0)
-        decor_eval &= ~protect_arr
+        # Do not score frame/side relighting or contact-shadow pixels as soft
+        # furnishing changes.  This is a QA-only guard; it is not a generation
+        # mask and it does not roll provider pixels back.
+        decor_eval &= ~artwork_qa_guard
         decor_area = int(np.count_nonzero(decor_eval))
         min_ssim = float(os.getenv("MOLINK_STAGE_B_QA_MIN_DECOR_SSIM", "0.40"))
         max_changed_ratio = float(os.getenv("MOLINK_STAGE_B_QA_MAX_DECOR_CHANGED_RATIO", "0.70"))
@@ -333,7 +433,7 @@ def _masked_stage_b_composite_and_qa(
             content_quality["decor"] = {"area_px": decor_area, "status": "too_small"}
 
     if wallpaper_enabled:
-        wall_eval = (np.asarray(wall_zone) > 0) & ~protect_arr
+        wall_eval = (np.asarray(wall_zone) > 0) & ~artwork_qa_guard
         wall_area = int(np.count_nonzero(wall_eval))
         min_gradient_correlation = float(os.getenv("MOLINK_STAGE_B_QA_MIN_WALL_GRADIENT_CORRELATION", "0.45"))
         max_gradient_energy_ratio = float(os.getenv("MOLINK_STAGE_B_QA_MAX_WALL_GRADIENT_ENERGY_RATIO", "4.0"))
@@ -404,6 +504,7 @@ def _masked_stage_b_composite_and_qa(
         "zones_used_as_generation_masks": False,
         "artwork_protection": protection_trace,
         "protect_changed_pixel_count": protect_changed,
+        "artwork_qa_guard_px": qa_anchor_guard_px,
         "content_quality": content_quality,
         "effective_change_detected": bool(effective_change_detected),
         "failures": failures,
@@ -531,22 +632,42 @@ def run_stage_b_pipeline(
             try:
                 with Image.open(stage_a_path) as source:
                     size = tuple(int(v) for v in source.size)
-                decor_zone = np.zeros((size[1], size[0]), dtype=np.uint8)
-                wall_zone = np.zeros((size[1], size[0]), dtype=np.uint8)
-                if soft_furnishing_requested:
-                    decor_path = _resolve_extracted_path(extracted, item.get("stage_b_decor_zone_mask_path"))
-                    decor_zone = _load_required_stage_b_zone(decor_path, size, "decor support zone mask")
-                if normalized_wallpaper:
-                    wall_path = _resolve_extracted_path(extracted, item.get("stage_b_wall_zone_mask_path"))
-                    wall_zone = _load_required_stage_b_zone(wall_path, size, "wall zone mask")
-                protect_path = _resolve_extracted_path(
-                    extracted,
-                    item.get("stage_b_protect_zone_mask_path"),
-                )
-                protect_zone = _load_required_stage_b_zone(protect_path, size, "protected artwork/frame zone mask")
-
                 item_dir = output_root / asset_id / "stage_b"
                 item_dir.mkdir(parents=True, exist_ok=True)
+
+                protect_path, protect_zone, protect_source = _stage_b_anchor_from_manifest(
+                    extracted=extracted,
+                    item=item,
+                    size=size,
+                    item_dir=item_dir,
+                )
+
+                decor_zone = np.zeros((size[1], size[0]), dtype=np.uint8)
+                wall_zone = np.zeros((size[1], size[0]), dtype=np.uint8)
+                decor_zone_source = "not_requested"
+                wall_zone_source = "not_requested"
+                if soft_furnishing_requested:
+                    decor_path = _resolve_extracted_path(extracted, item.get("stage_b_decor_zone_mask_path"))
+                    loaded_decor = _load_optional_stage_b_zone(decor_path, size)
+                    if loaded_decor is not None:
+                        decor_zone = loaded_decor
+                        decor_zone_source = "semantic_diagnostic_zone"
+                    else:
+                        # Generation is full-frame and must not fail because an
+                        # older semantic archive lacks an advisory QA mask.
+                        decor_zone[:] = 255
+                        decor_zone[protect_zone > 0] = 0
+                        decor_zone_source = "full_scene_fallback_diagnostic_zone"
+                if normalized_wallpaper:
+                    wall_path = _resolve_extracted_path(extracted, item.get("stage_b_wall_zone_mask_path"))
+                    loaded_wall = _load_optional_stage_b_zone(wall_path, size)
+                    if loaded_wall is not None:
+                        wall_zone = loaded_wall
+                        wall_zone_source = "semantic_wall_diagnostic_zone"
+                    else:
+                        wall_zone[:] = 255
+                        wall_zone[protect_zone > 0] = 0
+                        wall_zone_source = "full_scene_fallback_wall_diagnostic_zone"
                 artwork_context = dict(item.get("artwork_analysis") or {}) if isinstance(item.get("artwork_analysis"), dict) else {}
                 artwork_context["physical_width_m"] = item.get("artwork_physical_width_m")
                 artwork_context["physical_height_m"] = item.get("artwork_physical_height_m")
@@ -575,12 +696,15 @@ def run_stage_b_pipeline(
                         "full_space_coordinate_prompt_requested": True,
                         "full_space_render_reason": "styling_creativity_no_generation_mask",
                         "protected_artwork_mask_path": str(protect_path),
+                        "protected_artwork_mask_source": protect_source,
                         "front_polygon_px": item.get("front_polygon_px") or item.get("polygon_px") or item.get("target_quad_original"),
                         "front_bbox_px": item.get("front_bbox_px") or item.get("bbox_px"),
                         "mount_bbox_px": item.get("mount_bbox_px"),
                         "stage_b_generation_mask_used": False,
                         "stage_b_zones_usage": "qa_and_goal_evaluation_only",
                         "stage_b_zone_source": item.get("styling_zone_source") or aggregate["zone_source"],
+                        "stage_b_decor_zone_source": decor_zone_source,
+                        "stage_b_wall_zone_source": wall_zone_source,
                     },
                 )
                 composited_path = item_dir / "styled_masked_composite.png"
@@ -610,6 +734,9 @@ def run_stage_b_pipeline(
                 record.update({
                     "styling_status": "succeeded",
                     "styling_zone_source": item.get("styling_zone_source") or aggregate["zone_source"],
+                    "artwork_anchor_source": protect_source,
+                    "decor_zone_source": decor_zone_source,
+                    "wall_zone_source": wall_zone_source,
                     "prompt_path": str(item_dir / "prompt.txt"),
                     "qa": qa,
                     "trace": dict(result.trace),

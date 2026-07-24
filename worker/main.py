@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import asdict
+import hashlib
 import json
 import os
 import tempfile
@@ -31,8 +32,6 @@ WORKER_SECRET = os.getenv("WORKER_SECRET", "")
 INSTANCE_ID = os.getenv("AUTODL_INSTANCE_ID", os.getenv("INSTANCE_ID", "autodl-local"))
 
 # --- molink worker config debug begin ---
-import hashlib
-
 def _molink_fp(value):
     value = str(value or "")
     return hashlib.sha256(value.encode()).hexdigest()[:12] if value else "(empty)"
@@ -53,8 +52,14 @@ if not WORKER_SECRET:
 GPU_MODEL = os.getenv("GPU_MODEL", "TITAN Xp")
 GPU_COUNT = int(os.getenv("GPU_COUNT", "1"))
 IDLE_TIMEOUT_S = int(os.getenv("IDLE_TIMEOUT_S", "300"))
-WORKER_VERSION = os.getenv("WORKER_VERSION", "1.1.0")
+WORKER_VERSION = os.getenv("WORKER_VERSION", "1.1.1")
 ETA_PROTOCOL_V2_ENABLED = os.getenv("ETA_PROTOCOL_V2_ENABLED", "1").strip().lower() not in {"", "0", "false", "no", "off"}
+WS_RECONNECT_DELAY_S = float(os.getenv("WORKER_WS_RECONNECT_DELAY_S", "5"))
+WS_OPEN_TIMEOUT_S = float(os.getenv("WORKER_WS_OPEN_TIMEOUT_S", "30"))
+WS_CLOSE_TIMEOUT_S = float(os.getenv("WORKER_WS_CLOSE_TIMEOUT_S", "5"))
+RESULT_ACK_RETRY_S = float(os.getenv("WORKER_RESULT_ACK_RETRY_S", "15"))
+RESULT_ACK_MAX_WAIT_S = float(os.getenv("WORKER_RESULT_ACK_MAX_WAIT_S", "900"))
+RESULT_SPOOL_DIR = Path(os.getenv("WORKER_RESULT_SPOOL_DIR", "/root/autodl-tmp/molink-result-spool"))
 
 
 def _truthy_env(name: str, default: str = "0") -> bool:
@@ -252,6 +257,7 @@ class Worker:
         self.idle_since: float | None = None
         self._shutdown_task: asyncio.Task | None = None
         self._current_job_id: str | None = None
+        self._current_job_task: asyncio.Task | None = None
         self._executed_jobs: set[str] = set()
         self._causal_engine = None
         self._causal_base_delta: dict = {}
@@ -263,25 +269,168 @@ class Worker:
         )
         self._eta_emitter: ProgressEmitter | None = None
 
+        # The pipeline must outlive a single WebSocket connection.  Keep the
+        # active socket behind a small transport layer so reconnecting never
+        # cancels an in-flight render and terminal results can be replayed.
+        self._ws = None
+        self._ws_ready = asyncio.Event()
+        self._send_lock = asyncio.Lock()
+        self._latest_progress: dict[str, dict] = {}
+        self._pending_results: dict[str, dict] = {}
+        self._result_ack_waiters: dict[str, asyncio.Event] = {}
+        self._spool_dir = RESULT_SPOOL_DIR
+        try:
+            self._spool_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            self._spool_dir = Path(tempfile.gettempdir()) / "molink-result-spool"
+            self._spool_dir.mkdir(parents=True, exist_ok=True)
+            print(f"[worker/result-spool] fallback to {self._spool_dir}: {exc}", flush=True)
+        self._load_spooled_results()
+
     async def _create_ws(self):
-        """Create a fresh WebSocket connection to the business server."""
+        """Create a fresh WebSocket connection to the business server.
+
+        Protocol-level client pings are intentionally disabled.  Long local
+        image operations can stall the asyncio loop long enough to trigger the
+        library's aggressive 10-second ping timeout even though the business
+        connection is healthy.  The application heartbeat and server-side
+        protocol ping provide liveness without killing a valid in-flight job.
+        """
         url = f"{MOLINK_WS_URL}?token={WORKER_SECRET}"
-        return await websockets.connect(url, ping_interval=30, ping_timeout=10, max_size=None)
+        return await websockets.connect(
+            url,
+            ping_interval=None,
+            ping_timeout=None,
+            open_timeout=WS_OPEN_TIMEOUT_S,
+            close_timeout=WS_CLOSE_TIMEOUT_S,
+            max_size=None,
+            max_queue=128,
+        )
+
+    def _attach_ws(self, ws) -> None:
+        self._ws = ws
+        self._ws_ready.set()
+
+    def _detach_ws(self, ws) -> None:
+        if self._ws is ws:
+            self._ws = None
+            self._ws_ready.clear()
+
+    async def _send_json(
+        self,
+        payload: dict,
+        *,
+        wait_for_connection: bool = False,
+        timeout_s: float = 10.0,
+        explicit_ws=None,
+    ) -> bool:
+        if explicit_ws is None and wait_for_connection:
+            try:
+                await asyncio.wait_for(self._ws_ready.wait(), timeout=max(0.1, float(timeout_s)))
+            except asyncio.TimeoutError:
+                return False
+        ws = explicit_ws or self._ws
+        if ws is None:
+            return False
+        try:
+            async with self._send_lock:
+                await ws.send(json.dumps(payload, ensure_ascii=False))
+            return True
+        except Exception as exc:
+            if explicit_ws is None and self._ws is ws:
+                self._ws_ready.clear()
+            print(f"[worker/ws] send failed type={payload.get('type')} error={exc}", flush=True)
+            return False
 
     async def register(self, ws) -> None:
-        await ws.send(json.dumps({
+        status = "busy" if self._current_job_id else "idle"
+        sent = await self._send_json({
             "type": "register",
             "instance_id": INSTANCE_ID,
             "gpu_model": GPU_MODEL,
             "gpu_count": GPU_COUNT,
             "worker_version": WORKER_VERSION,
+            "transport_protocol_version": 2,
             "precision": self._resource.get("precision"),
             "benchmark_score": self._resource.get("benchmark_score"),
             "services": ["metric3d", "semantic", "hanging", "bfl"],
-        }))
-        print(f"[worker] 已注册 {INSTANCE_ID} ({GPU_MODEL})")
+            "connection_role": "primary",
+            "status": status,
+            "current_job_id": self._current_job_id,
+            "resume_inflight_job": bool(self._current_job_id),
+            "pending_result_ids": sorted(self._pending_results.keys()),
+        }, explicit_ws=ws)
+        if not sent:
+            raise RuntimeError("worker register send failed")
+        print(f"[worker] 已注册 {INSTANCE_ID} ({GPU_MODEL}) status={status} current_job_id={self._current_job_id}")
 
-    async def send_result(self, ws, job, payload) -> None:
+    @staticmethod
+    def _result_id(job: dict, payload: dict) -> str:
+        canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:24]
+        return f"{job.get('job_id') or 'job'}:{digest}"
+
+    def _spool_path(self, result_id: str) -> Path:
+        safe = hashlib.sha256(result_id.encode("utf-8")).hexdigest()
+        return self._spool_dir / f"{safe}.json"
+
+    def _persist_result_envelope_local(self, envelope: dict) -> None:
+        result_id = str(envelope.get("result_id") or "")
+        if not result_id:
+            return
+        path = self._spool_path(result_id)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(envelope, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, path)
+
+    def _load_spooled_results(self) -> None:
+        for path in sorted(self._spool_dir.glob("*.json")):
+            try:
+                envelope = json.loads(path.read_text(encoding="utf-8"))
+                result_id = str(envelope.get("result_id") or "")
+                if not result_id or envelope.get("type") != "result":
+                    raise ValueError("invalid result spool envelope")
+                self._pending_results[result_id] = envelope
+                self._result_ack_waiters[result_id] = asyncio.Event()
+            except Exception as exc:
+                print(f"[worker/result-spool] ignore invalid file={path} error={exc}", flush=True)
+
+    def _ack_result(self, msg: dict) -> None:
+        result_id = str(msg.get("result_id") or "")
+        if not result_id:
+            return
+        if not bool(msg.get("accepted", True)):
+            print(
+                f"[worker/result] server nack result_id={result_id} retryable={msg.get('retryable')} error={msg.get('error')}",
+                flush=True,
+            )
+            return
+        waiter = self._result_ack_waiters.pop(result_id, None)
+        if waiter:
+            waiter.set()
+        self._pending_results.pop(result_id, None)
+        ack_job_id = str(msg.get("job_id") or "")
+        if ack_job_id:
+            self._latest_progress = {
+                key: value
+                for key, value in self._latest_progress.items()
+                if str(value.get("job_id") or "") != ack_job_id
+            }
+        try:
+            self._spool_path(result_id).unlink(missing_ok=True)
+        except Exception:
+            pass
+        print(f"[worker/result] acknowledged result_id={result_id} job_id={msg.get('job_id')}", flush=True)
+
+    async def _flush_deferred_messages(self) -> None:
+        # Send terminal results first.  They are durable and idempotent; progress
+        # is coalesced to the latest event of each protocol after reconnect.
+        for envelope in list(self._pending_results.values()):
+            await self._send_json(envelope, wait_for_connection=False)
+        for payload in list(self._latest_progress.values()):
+            await self._send_json(payload, wait_for_connection=False)
+
+    async def send_result(self, job, payload) -> None:
         result_stage, result_state, result_pct, result_message = result_builder.terminal_progress_contract(
             payload.get("status") if isinstance(payload, dict) else None
         )
@@ -293,84 +442,113 @@ class Worker:
             )
             if bundle:
                 payload["narration_bundle"] = bundle
+
+        result_id = self._result_id(job, payload)
+        payload["transport_result_id"] = result_id
+        envelope = {
+            "type": "result",
+            "result_id": result_id,
+            "result_key": None,
+            "job_id": job["job_id"],
+            "status": payload.get("status"),
+            "order_id": job.get("order_id"),
+            "instance_id": INSTANCE_ID,
+            "payload": payload,
+        }
+        self._pending_results[result_id] = envelope
+        ack_event = self._result_ack_waiters.setdefault(result_id, asyncio.Event())
+        # Write the local durable envelope before any network I/O.  Even a
+        # process crash during the R2 control upload can be replayed next boot.
+        self._persist_result_envelope_local(envelope)
+
+        result_control: dict = {}
+        try:
+            result_control = await asyncio.to_thread(
+                r2_upload.upload_terminal_result_envelope,
+                prefix=job.get("r2_output_prefix") or "",
+                result_id=result_id,
+                job_id=job.get("job_id") or "",
+                order_id=job.get("order_id"),
+                status=payload.get("status"),
+                payload=payload,
+            )
+            payload["transport_result_key"] = result_control.get("result_key")
+            payload["transport_result_url"] = result_control.get("result_url")
+            envelope["result_key"] = result_control.get("result_key")
+            self._persist_result_envelope_local(envelope)
+        except Exception as exc:
+            # Local spool + WebSocket ACK still protect delivery when R2 control
+            # upload is temporarily unavailable.
+            print(f"[worker/result] R2 control envelope upload failed: {exc}", flush=True)
+
         print(
             f"[worker-debug] send_result job_id={job.get('job_id')} order_id={job.get('order_id')} "
-            f"status={payload.get('status')} exit_code={payload.get('exit_code')} "
+            f"result_id={result_id} status={payload.get('status')} exit_code={payload.get('exit_code')} "
             f"candidates={len(payload.get('candidates') or [])} "
             f"final_urls={sum(1 for c in (payload.get('candidates') or []) if c.get('final_image_url'))} "
             f"partial_images={len(payload.get('partial_review_images') or [])} "
             f"error={payload.get('error')}",
             flush=True,
         )
-        try:
-            await ws.send(json.dumps({
-                "type": "result", "job_id": job["job_id"],
-                "status": payload.get("status"), "order_id": job.get("order_id"),
-                "payload": payload,
-            }))
+
+        deadline = time.monotonic() + max(1.0, RESULT_ACK_MAX_WAIT_S)
+        attempt = 0
+        while not ack_event.is_set() and time.monotonic() < deadline:
+            attempt += 1
+            envelope["attempt"] = attempt
+            envelope["sent_at_ms"] = int(time.time() * 1000)
+            sent = await self._send_json(
+                envelope,
+                wait_for_connection=True,
+                timeout_s=min(RESULT_ACK_RETRY_S, 10.0),
+            )
+            if sent:
+                print(f"[worker/result] sent result_id={result_id} attempt={attempt}; awaiting ack", flush=True)
+            try:
+                await asyncio.wait_for(ack_event.wait(), timeout=max(1.0, RESULT_ACK_RETRY_S))
+            except asyncio.TimeoutError:
+                continue
+
+        if ack_event.is_set():
             await self.progress(
-                ws, job, result_stage, result_state, result_pct, result_message,
+                job, result_stage, result_state, result_pct, result_message,
                 causal_delta=_result_delivery_delta(payload),
             )
-        except Exception as exc:
-            # Connection died — reconnect and resend via a fresh connection.
-            print(f"[worker] send_result failed ({exc}), reconnecting to resend result…", flush=True)
-            fresh_ws = None
-            try:
-                fresh_ws = await self._create_ws()
-                await self.register(fresh_ws)
-                await fresh_ws.send(json.dumps({
-                    "type": "result", "job_id": job["job_id"],
-                    "status": payload.get("status"), "order_id": job.get("order_id"),
-                    "payload": payload,
-                }))
-                await self.progress(
-                    fresh_ws, job, result_stage, result_state, result_pct, result_message,
-                    causal_delta=_result_delivery_delta(payload),
-                )
-                print(f"[worker-debug] send_result retransmitted via fresh connection job_id={job.get('job_id')}", flush=True)
-            except Exception as retry_exc:
-                print(f"[worker] send_result retransmit also failed ({retry_exc}), result saved locally only", flush=True)
-            finally:
-                if fresh_ws:
-                    try:
-                        await fresh_ws.close()
-                    except Exception:
-                        pass
+        else:
+            print(
+                f"[worker/result] ack wait exceeded {RESULT_ACK_MAX_WAIT_S}s; durable envelope retained result_id={result_id}",
+                flush=True,
+            )
 
-    async def heartbeat(self, ws) -> None:
+    async def heartbeat(self) -> None:
         while True:
             await asyncio.sleep(30)
-            try:
-                await ws.send(json.dumps({
-                    "type": "heartbeat", "instance_id": INSTANCE_ID,
-                    "status": "busy" if self._current_job_id else "idle",
-                    "current_job_id": self._current_job_id,
-                    "uptime_s": int(time.time() - START_TS),
-                    "resource": self._resource,
-                    "last_seq": self._eta_emitter.seq if self._eta_emitter else 0,
-                    "run_id": self._eta_emitter.run_id if self._eta_emitter else None,
-                    "current_stage_snapshot": self._eta_emitter.heartbeat_snapshot() if self._eta_emitter else None,
-                }))
-            except Exception:
-                return
+            await self._send_json({
+                "type": "heartbeat", "instance_id": INSTANCE_ID,
+                "status": "busy" if self._current_job_id else "idle",
+                "current_job_id": self._current_job_id,
+                "uptime_s": int(time.time() - START_TS),
+                "resource": self._resource,
+                "last_seq": self._eta_emitter.seq if self._eta_emitter else 0,
+                "run_id": self._eta_emitter.run_id if self._eta_emitter else None,
+                "current_stage_snapshot": self._eta_emitter.heartbeat_snapshot() if self._eta_emitter else None,
+            })
 
-    async def _send_progress_payload(self, ws, payload: dict, *, label: str, max_retries: int = 3) -> bool:
+    async def _send_progress_payload(self, payload: dict, *, label: str, max_retries: int = 3) -> bool:
+        self._latest_progress[str(payload.get("type") or label)] = payload
         for attempt in range(max_retries):
-            try:
-                await ws.send(json.dumps(payload, ensure_ascii=False))
+            sent = await self._send_json(payload)
+            if sent:
                 return True
-            except Exception as exc:
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(0.5 * (attempt + 1))
-                    continue
-                print(f"[{label}] failed to send after {max_retries} attempts: {exc}", flush=True)
-                return False
+            if attempt < max_retries - 1:
+                await asyncio.sleep(0.5 * (attempt + 1))
+        print(f"[{label}] failed to send after {max_retries} attempts; queued latest event for reconnect", flush=True)
         return False
 
-    async def progress(self, ws, job, stage, state, pct, message, advisor_message=None, causal_delta=None) -> None:
+    async def progress(self, job, stage, state, pct, message, advisor_message=None, causal_delta=None) -> None:
         payload = {
             "type": "progress",
+            "instance_id": INSTANCE_ID,
             "job_id": job["job_id"],
             "order_id": job.get("order_id"),
             "stage": stage,
@@ -395,9 +573,9 @@ class Worker:
             flush=True,
         )
 
-        legacy_sent = await self._send_progress_payload(ws, payload, label="progress", max_retries=3)
+        legacy_sent = await self._send_progress_payload(payload, label="progress", max_retries=3)
         if not legacy_sent:
-            print("[progress] progress message dropped, pipeline continues", flush=True)
+            print("[progress] connection unavailable; pipeline continues and latest progress will replay", flush=True)
 
         if ETA_PROTOCOL_V2_ENABLED and self._eta_emitter is not None:
             try:
@@ -406,9 +584,10 @@ class Worker:
                     metadata={"legacy_pct": pct, "advisor_message_present": bool(advisor_message)},
                 )
                 for event in events:
-                    sent = await self._send_progress_payload(ws, event, label="progress_v2", max_retries=2)
+                    event.setdefault("instance_id", INSTANCE_ID)
+                    sent = await self._send_progress_payload(event, label="progress_v2", max_retries=2)
                     if not sent:
-                        print("[progress_v2] event dropped, legacy pipeline continues", flush=True)
+                        print("[progress_v2] connection unavailable; latest event queued for reconnect", flush=True)
             except Exception as exc:
                 print(f"[progress_v2] build/send skipped: {exc}", flush=True)
 
@@ -446,21 +625,23 @@ class Worker:
             self._shutdown_task = None
         self.idle_since = None
         self._current_job_id = job["job_id"]
+        self._latest_progress.clear()
         self._eta_emitter = ProgressEmitter(job, self._resource) if ETA_PROTOCOL_V2_ENABLED else None
 
-    async def on_job_complete(self, ws) -> None:
+    async def on_job_complete(self) -> None:
         self._current_job_id = None
+        self._latest_progress.clear()
         self._eta_emitter = None
         self._causal_engine = None
         self._causal_base_delta = {}
         try:
-            await ws.send(json.dumps({"type": "worker_idle", "instance_id": INSTANCE_ID}))
+            await self._send_json({"type": "worker_idle", "instance_id": INSTANCE_ID})
         except Exception as e:
             print(f"[on_job_complete] idle message failed: {e}, countdown starts anyway", flush=True)
         self.idle_since = time.time()
-        self._shutdown_task = asyncio.create_task(self._idle_countdown(ws))
+        self._shutdown_task = asyncio.create_task(self._idle_countdown())
 
-    async def _idle_countdown(self, ws) -> None:
+    async def _idle_countdown(self) -> None:
         if IDLE_TIMEOUT_S <= 0:
             return  # idle shutdown disabled
         try:
@@ -469,15 +650,15 @@ class Worker:
             return
         print(f"[worker] 空闲 {IDLE_TIMEOUT_S}s 无新任务，准备关机")
         try:
-            await ws.send(json.dumps({
+            await self._send_json({
                 "type": "shutting_down", "instance_id": INSTANCE_ID, "reason": "idle_timeout"
-            }))
+            })
         except Exception:
             pass
         await asyncio.sleep(2)
         await autodl_api.stop_self()
 
-    async def run_supplement_job(self, ws, job) -> None:
+    async def run_supplement_job(self, job) -> None:
         """Render selected walls from a persisted hanging_result.zip.
 
         This job intentionally skips Metric3D/Semantic/Hanging and only reuses the
@@ -490,7 +671,7 @@ class Worker:
         print(f"[worker-debug] supplement_job_received job_id={job_id} order_id={job.get('order_id')} targets={job.get('target_wall_ids')}", flush=True)
         await self.on_job_received(job)
         self._reset_causal_engine(job)
-        await ws.send(json.dumps({"type": "job_accepted", "job_id": job["job_id"], "instance_id": INSTANCE_ID}))
+        await self._send_json({"type": "job_accepted", "job_id": job["job_id"], "instance_id": INSTANCE_ID})
         render_provider, render_provider_source = resolve_render_provider(job)
         diag = diagnostics.DiagnosticsRun.create(job)
         diag_tasks: list[asyncio.Task] = []
@@ -513,7 +694,7 @@ class Worker:
             work_dir = Path(td)
             payload_for_diag: dict | None = None
             try:
-                await self.progress(ws, job, "render", "running", 70, "正在根据您点选的墙面补充生成效果图…")
+                await self.progress(job, "render", "running", 70, "正在根据您点选的墙面补充生成效果图…")
                 artifact_url = str(job.get("hanging_result_zip_url") or "").strip()
                 if not artifact_url:
                     raise RuntimeError("supplement job missing hanging_result_zip_url")
@@ -545,7 +726,7 @@ class Worker:
                     )
                 soft_furnishing, wallpaper_recolor = _stage_b_request(job)
                 if soft_furnishing or wallpaper_recolor:
-                    await self.progress(ws, job, "styling", "running", 84, "正在优化空间风格与色彩…")
+                    await self.progress(job, "styling", "running", 84, "正在优化空间风格与色彩…")
                 stage_b_aggregate = await asyncio.to_thread(
                     render_api.run_stage_b_pipeline,
                     str(hanging_zip), str(flux_out),
@@ -556,7 +737,7 @@ class Worker:
                 render_aggregate["stage_b"] = stage_b_aggregate
                 diag_later(diag.write_json, "05_render/render_aggregate.json", render_aggregate)
                 diag_later(diag.copy_tree, flux_out, "05_render/flux_out")
-                await self.progress(ws, job, "r2_upload", "running", 92, "正在上传您点选墙面的补充效果图…")
+                await self.progress(job, "r2_upload", "running", 92, "正在上传您点选墙面的补充效果图…")
                 r2_result = await asyncio.to_thread(r2_upload.upload_all, flux_out, job["r2_output_prefix"])
                 diag_later(diag.write_json, "06_r2_upload/r2_result.json", r2_result)
                 payload_for_diag = result_builder.build(client_res, render_aggregate, r2_result, job)
@@ -569,10 +750,10 @@ class Worker:
                 payload_for_diag["wallpaper_recolor_requested"] = bool(job.get("wallpaper_recolor_requested"))
                 payload_for_diag["stage_a_base_source"] = render_aggregate.get("stage_a_base_source") or job.get("stage_a_base_source")
                 diag_later(diag.write_json, "99_result/result_payload_pre_send.json", payload_for_diag)
-                await self.send_result(ws, job, payload_for_diag)
+                await self.send_result(job, payload_for_diag)
                 await flush_diag_tasks()
                 await asyncio.to_thread(diag.finalize_zip, payload_for_diag, None)
-                await self.on_job_complete(ws)
+                await self.on_job_complete()
             except Exception as exc:  # noqa: BLE001
                 traceback.print_exc()
                 payload_for_diag = {
@@ -587,27 +768,27 @@ class Worker:
                     "candidates": [], "not_recommended": [], "partial_review_images": [],
                     "error": str(exc), "metrics": {"render_provider": render_provider},
                 }
-                await self.send_result(ws, job, payload_for_diag)
+                await self.send_result(job, payload_for_diag)
                 await flush_diag_tasks()
                 await asyncio.to_thread(diag.finalize_zip, payload_for_diag, exc)
-                await self.on_job_complete(ws)
+                await self.on_job_complete()
             finally:
                 if job_id:
                     self._executed_jobs.add(job_id)
 
-    async def run_job(self, ws, job) -> None:
+    async def run_job(self, job) -> None:
         job_id = job.get("job_id")
         if job_id and job_id in self._executed_jobs:
             print(f"[worker] duplicate job_id={job_id} — skipping (already executed)", flush=True)
-            await ws.send(json.dumps({"type": "job_skipped", "job_id": job_id, "instance_id": INSTANCE_ID, "reason": "duplicate"}))
+            await self._send_json({"type": "job_skipped", "job_id": job_id, "instance_id": INSTANCE_ID, "reason": "duplicate"})
             return
         if job.get("job_kind") == "hanging_supplement_render" or job.get("supplement") is True:
-            await self.run_supplement_job(ws, job)
+            await self.run_supplement_job(job)
             return
         print(f"[worker-debug] job_received job_id={job.get('job_id')} order_id={job.get('order_id')} r2_prefix={job.get('r2_output_prefix')}", flush=True)
         await self.on_job_received(job)
         self._reset_causal_engine(job)
-        await ws.send(json.dumps({"type": "job_accepted", "job_id": job["job_id"], "instance_id": INSTANCE_ID}))
+        await self._send_json({"type": "job_accepted", "job_id": job["job_id"], "instance_id": INSTANCE_ID})
         print(f"[worker-debug] job_accepted job_id={job.get('job_id')}", flush=True)
 
         diag = diagnostics.DiagnosticsRun.create(job)
@@ -649,14 +830,14 @@ class Worker:
                     "render_provider_raw": (job.get("render") or {}).get("provider") if isinstance(job.get("render"), dict) else None,
                 })
 
-                await self.progress(ws, job, "metric3d", "running", 15, "正在测量空间深度…")
+                await self.progress(job, "metric3d", "running", 15, "正在测量空间深度…")
                 inputs = await asyncio.to_thread(pipeline.fetch_inputs, job, work_dir)
                 diag_later(diag.copy_file, inputs.get("room"), "01_inputs/room.jpg")
                 diag_later(diag.copy_file, inputs.get("artwork"), "01_inputs/artwork.png")
                 metric_zip = await asyncio.to_thread(pipeline.call_metric3d, inputs["room"], work_dir)
                 diag_later(diag.copy_file, metric_zip, "01_inputs/metric3d.zip")
 
-                await self.progress(ws, job, "semantic", "running", 35, "正在识别墙面与结构信息…")
+                await self.progress(job, "semantic", "running", 35, "正在识别墙面与结构信息…")
                 scene_profile = (job.get("rules_overrides") or {}).get("scene_profile", "home")
                 semantics = None
                 try:
@@ -682,7 +863,7 @@ class Worker:
                 semantic_delta = {"space": _count_semantic_space(semantic_payload)}
                 if isinstance(semantic_payload.get("light"), dict):
                     semantic_delta["light"] = semantic_payload.get("light")
-                await self.progress(ws, job, "hanging", "running", 55, "正在筛选安全挂画位置…", causal_delta=semantic_delta)
+                await self.progress(job, "hanging", "running", 55, "正在筛选安全挂画位置…", causal_delta=semantic_delta)
                 rules_json = pipeline.build_rules_overrides(job)
                 if rules_json:
                     diag_later(diag.write_text, "04_hanging/rules_overrides.json", rules_json)
@@ -703,7 +884,7 @@ class Worker:
                 client_res = await asyncio.to_thread(pipeline.extract_client_result, hanging_zip)
                 diag_later(diag.write_json, "04_hanging/client_result.json", client_res)
                 await self.progress(
-                    ws, job, "hanging", "running", 60,
+                    job, "hanging", "running", 60,
                     "已完成挂画方案筛选，正在进入效果图渲染…",
                     advisor_message=_advisor_progress_from_client_result(client_res),
                     causal_delta=_best_plan_delta(client_res),
@@ -712,13 +893,13 @@ class Worker:
                 exit_code = str(client_res.get("exit_code", ""))
                 if exit_code.startswith("FAILED") or exit_code == "PARTIAL_ALL_REJECTED_WITH_REASONS":
                     payload_for_diag = result_builder.build_failed_payload(job, client_res)
-                    await self.send_result(ws, job, payload_for_diag)
+                    await self.send_result(job, payload_for_diag)
                     await flush_diag_tasks()
                     await asyncio.to_thread(diag.finalize_zip, payload_for_diag, None)
-                    await self.on_job_complete(ws)
+                    await self.on_job_complete()
                     return
 
-                await self.progress(ws, job, "render", "running", 65, "几何分析完成，正在生成高保真效果图…")
+                await self.progress(job, "render", "running", 65, "几何分析完成，正在生成高保真效果图…")
                 limit = (job.get("render") or {}).get("global_limit") if isinstance(job.get("render"), dict) else None
                 flux_out = work_dir / "flux_out"
                 render_aggregate = await asyncio.to_thread(
@@ -726,7 +907,7 @@ class Worker:
                     str(hanging_zip), str(flux_out), provider=render_provider, limit=limit
                 )
                 if soft_furnishing or wallpaper_recolor:
-                    await self.progress(ws, job, "styling", "running", 82, "正在优化空间风格与色彩…")
+                    await self.progress(job, "styling", "running", 82, "正在优化空间风格与色彩…")
                 stage_b_aggregate = await asyncio.to_thread(
                     render_api.run_stage_b_pipeline,
                     str(hanging_zip), str(flux_out),
@@ -738,7 +919,7 @@ class Worker:
                 diag_later(diag.write_json, "05_render/render_aggregate.json", render_aggregate)
                 diag_later(diag.copy_tree, flux_out, "05_render/flux_out")
 
-                await self.progress(ws, job, "r2_upload", "running", 90, "上传效果图中…")
+                await self.progress(job, "r2_upload", "running", 90, "上传效果图中…")
                 r2_result = await asyncio.to_thread(r2_upload.upload_all, flux_out, job["r2_output_prefix"])
                 diag_later(diag.write_json, "06_r2_upload/r2_result.json", r2_result)
 
@@ -748,10 +929,10 @@ class Worker:
                 if hanging_artifact_key:
                     payload_for_diag["hanging_result_zip_key"] = hanging_artifact_key
                 diag_later(diag.write_json, "99_result/result_payload_pre_send.json", payload_for_diag)
-                await self.send_result(ws, job, payload_for_diag)
+                await self.send_result(job, payload_for_diag)
                 await flush_diag_tasks()
                 await asyncio.to_thread(diag.finalize_zip, payload_for_diag, None)
-                await self.on_job_complete(ws)
+                await self.on_job_complete()
             except Exception as exc:  # noqa: BLE001
                 run_error = exc
                 traceback.print_exc()
@@ -761,13 +942,42 @@ class Worker:
                     "candidates": [], "not_recommended": [], "partial_review_images": [],
                     "error": str(exc), "metrics": {},
                 }
-                await self.send_result(ws, job, payload_for_diag)
+                await self.send_result(job, payload_for_diag)
                 await flush_diag_tasks()
                 await asyncio.to_thread(diag.finalize_zip, payload_for_diag, exc)
-                await self.on_job_complete(ws)
+                await self.on_job_complete()
             finally:
                 if job_id:
                     self._executed_jobs.add(job_id)
+
+    def _start_job(self, job: dict) -> None:
+        job_id = str(job.get("job_id") or "")
+        if self._current_job_task and not self._current_job_task.done():
+            reason = "duplicate" if job_id and job_id == self._current_job_id else "worker_busy"
+            asyncio.create_task(self._send_json({
+                "type": "job_skipped",
+                "job_id": job_id,
+                "instance_id": INSTANCE_ID,
+                "reason": reason,
+                "current_job_id": self._current_job_id,
+            }))
+            print(f"[worker] reject dispatched job_id={job_id}: {reason} current={self._current_job_id}", flush=True)
+            return
+
+        task = asyncio.create_task(self.run_job(job), name=f"molink-job-{job_id or 'unknown'}")
+        self._current_job_task = task
+
+        def _done(done: asyncio.Task) -> None:
+            if self._current_job_task is done:
+                self._current_job_task = None
+            try:
+                error = done.exception()
+            except asyncio.CancelledError:
+                error = None
+            if error is not None:
+                print(f"[worker] unhandled job task error job_id={job_id}: {error}", flush=True)
+
+        task.add_done_callback(_done)
 
     async def listen(self, ws) -> None:
         async for raw in ws:
@@ -777,28 +987,36 @@ class Worker:
                 continue
             mtype = msg.get("type")
             if mtype == "job_dispatch":
-                await self.run_job(ws, msg)
+                self._start_job(msg)
             elif mtype == "ping":
-                await ws.send(json.dumps({"type": "pong", "instance_id": INSTANCE_ID}))
+                await self._send_json({"type": "pong", "instance_id": INSTANCE_ID, "client_ts": int(time.time() * 1000)})
+            elif mtype == "result_ack":
+                self._ack_result(msg)
             elif mtype == "cancel":
                 print(f"[worker] 收到取消（暂不中断在途作业）: {msg.get('job_id')}")
 
 
 async def connect_with_retry() -> None:
     worker = Worker()
+    heartbeat_task = asyncio.create_task(worker.heartbeat(), name="molink-heartbeat")
     while True:
+        ws = None
         try:
-            url = f"{MOLINK_WS_URL}?token={WORKER_SECRET}"
-            async with websockets.connect(url, ping_interval=30, ping_timeout=10, max_size=None) as ws:
-                await worker.register(ws)
-                hb = asyncio.create_task(worker.heartbeat(ws))
-                try:
-                    await worker.listen(ws)
-                finally:
-                    hb.cancel()
+            ws = await worker._create_ws()
+            worker._attach_ws(ws)
+            await worker.register(ws)
+            await worker._flush_deferred_messages()
+            await worker.listen(ws)
         except Exception as exc:  # noqa: BLE001
-            print(f"[worker] ws 断开: {exc}，5s 后重连")
-            await asyncio.sleep(5)
+            print(f"[worker] ws 断开: {exc}，{WS_RECONNECT_DELAY_S:g}s 后重连", flush=True)
+        finally:
+            if ws is not None:
+                worker._detach_ws(ws)
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
+        await asyncio.sleep(max(0.5, WS_RECONNECT_DELAY_S))
 
 
 START_TS = time.time()
