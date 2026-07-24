@@ -58,8 +58,11 @@ def build_remove_mask_for_hardpaste(
 ) -> np.ndarray:
     """Build a candidate-scoped erase mask.
 
-    Existing wall content is limited to the candidate wall. Foreground objects
-    such as people are global because they are image-level delivery defects.
+    Existing wall content is limited to the candidate wall.  Foreground objects
+    are similarly constrained to the candidate wall area so that off-wall
+    furniture (chair, sofa, table) is not unnecessarily erased.  People and
+    objects in front of the wall still safely overlap the wall mask and are
+    correctly included in the erase scope.
 
     For the legacy hard_paste -> erase order, protect_art_region=True avoids
     erasing the newly pasted artwork. For the corrected v7 order
@@ -80,7 +83,15 @@ def build_remove_mask_for_hardpaste(
         existing = cv2.bitwise_and(existing, wall)
     remove = cv2.bitwise_or(remove, existing)
     if remove_foreground_global:
-        remove = cv2.bitwise_or(remove, union_original_masks(foreground_masks, original_size_wh))
+        fg = union_original_masks(foreground_masks, original_size_wh)
+        # Constrain foreground erase to the candidate wall area, matching the
+        # behaviour for existing-wall-content masks above.  This prevents
+        # foreground objects (chair, sofa, table) that sit away from the
+        # target wall from being unnecessarily erased.  People in front of
+        # the wall still safely overlap the wall mask.
+        if current_wall_mask is not None:
+            fg = cv2.bitwise_and(fg, wall)
+        remove = cv2.bitwise_or(remove, fg)
     if dilate_px > 0 and np.count_nonzero(remove):
         k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * dilate_px + 1, 2 * dilate_px + 1))
         remove = cv2.dilate(remove, k)

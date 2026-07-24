@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 from typing import Any
@@ -7,6 +8,28 @@ from typing import Any
 import cv2
 import numpy as np
 from PIL import Image
+
+logger = logging.getLogger(__name__)
+
+
+def _env_truthy(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def _skip_artwork_protection() -> bool:
+    return _env_truthy("MOLINK_SKIP_ARTWORK_PROTECTION")
+
+
+def _passthrough_provider_render(src: Path, dst: Path) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_name(f".{dst.name}.tmp")
+    try:
+        import shutil
+        shutil.copy2(src, tmp)
+        tmp.replace(dst)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def _load_rgb(path: Path) -> np.ndarray:
@@ -67,7 +90,22 @@ def enforce_protected_artwork_composite(
     (normally 1-2 px) is useful for Stage A render recovery because it keeps the
     artwork interior fixed while letting the generated edge lighting meet the
     generated wall naturally.
+
+    When the env var ``MOLINK_SKIP_ARTWORK_PROTECTION`` is set to a truthy
+    value the function is bypassed: the provider render is copied verbatim to
+    the output path and a ``bypassed`` trace is returned.
     """
+    if _skip_artwork_protection():
+        _passthrough_provider_render(provider_render_path, output_path)
+        logger.warning("enforce_protected_artwork_composite BYPASSED via MOLINK_SKIP_ARTWORK_PROTECTION")
+        return {
+            "enabled": False,
+            "mode": "bypassed_via_env_var",
+            "reason": "MOLINK_SKIP_ARTWORK_PROTECTION is set",
+            "provider_passthrough": True,
+            "output_path": str(output_path),
+        }
+
     with Image.open(authoritative_image_path) as source_image:
         source = np.asarray(source_image.convert("RGB"), dtype=np.uint8)
     with Image.open(provider_render_path) as render_image:

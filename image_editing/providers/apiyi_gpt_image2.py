@@ -84,15 +84,74 @@ def _write_apiyi_image(data: Mapping[str, Any], output_path: Path, *, timeout_s:
     raise RuntimeError(f"APIYI image response has neither b64_json nor url: {json.dumps(data, ensure_ascii=False)[:2000]}")
 
 
+def _best_vip_size(w: int, h: int) -> str:
+    """Pick the VIP_SIZE whose aspect ratio is closest to *w* × *h*.
+
+    Falls back to ``"auto"`` when no fixed size can be resolved (e.g. zero
+    dimension), letting the endpoint choose its default.
+    """
+    if w < 1 or h < 1:
+        return "auto"
+    target_ratio = w / h
+    best = "auto"
+    best_diff = float("inf")
+    for candidate in VIP_SIZES:
+        cw_str, ch_str = candidate.split("x", 1)
+        cw, ch = int(cw_str), int(ch_str)
+        if cw < 1 or ch < 1:
+            continue
+        diff = abs(cw / ch - target_ratio)
+        if diff < best_diff:
+            best_diff = diff
+            best = candidate
+    return best
+
+
 def _resize_to_match(source_path: Path, output_path: Path) -> dict[str, Any]:
     with Image.open(source_path) as source, Image.open(output_path) as generated:
         source_size = tuple(source.size)
         generated_size = tuple(generated.size)
         if source_size == generated_size:
             return {"resized": False, "source_size": list(source_size), "generated_size": list(generated_size)}
-        resized = generated.convert("RGB").resize(source_size, Image.Resampling.LANCZOS)
+
+        src_w, src_h = source_size
+        gen_w, gen_h = generated_size
+        src_ratio = src_w / src_h
+        gen_ratio = gen_w / gen_h
+        crop: dict[str, Any] = {
+            "source_aspect_ratio": src_ratio,
+            "generated_aspect_ratio": gen_ratio,
+        }
+
+        generated_rgb = generated.convert("RGB")
+        if abs(src_ratio - gen_ratio) > 1e-6 and gen_w > 0 and gen_h > 0:
+            # Center-crop generated to match source aspect ratio so the
+            # subsequent resize is uniform and content is not distorted.
+            if gen_ratio > src_ratio:
+                # Generated is wider: crop horizontal edges.
+                new_gen_w = int(gen_h * src_ratio)
+                if 0 < new_gen_w <= gen_w:
+                    offset_x = (gen_w - new_gen_w) // 2
+                    generated_rgb = generated_rgb.crop((offset_x, 0, offset_x + new_gen_w, gen_h))
+                    crop["aspect_crop_applied"] = True
+                    crop["crop_box"] = [new_gen_w, gen_h]
+            else:
+                # Generated is taller: crop vertical edges.
+                new_gen_h = int(gen_w / src_ratio)
+                if 0 < new_gen_h <= gen_h:
+                    offset_y = (gen_h - new_gen_h) // 2
+                    generated_rgb = generated_rgb.crop((0, offset_y, gen_w, offset_y + new_gen_h))
+                    crop["aspect_crop_applied"] = True
+                    crop["crop_box"] = [gen_w, new_gen_h]
+
+        resized = generated_rgb.resize(source_size, Image.Resampling.LANCZOS)
         resized.save(output_path)
-    return {"resized": True, "source_size": list(source_size), "generated_size": list(generated_size)}
+    return {
+        "resized": True,
+        "source_size": list(source_size),
+        "generated_size": list(generated_size),
+        "crop": crop,
+    }
 
 
 def _maybe_compress_upload(path: Path, tmp_dir: Path, *, max_bytes: int, enabled: bool) -> Path:
@@ -1218,6 +1277,20 @@ class ApiyiGptImage2Client:
             "prompt": prompt,
         }
         size = _validate_size(str(request.metadata.get("size") or self.size or "auto"))
+        # When ``auto`` is selected for a full-frame render, automatically
+        # pick the closest VIP_SIZE that matches the input image aspect ratio
+        # so the model does not generate a square output that then needs to be
+        # stretched.
+        if (size == "auto" or not size) and output_scope in {
+            "full_space_artwork_anchor",
+            "full_space_styling_artwork_protected",
+        }:
+            try:
+                source_img = Image.open(image)
+                src_w, src_h = source_img.size
+                size = _best_vip_size(src_w, src_h)
+            except Exception:
+                size = "auto"
         if size:
             data["size"] = size
         if self.response_format:

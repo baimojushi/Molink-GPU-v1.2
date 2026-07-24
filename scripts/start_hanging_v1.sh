@@ -31,6 +31,7 @@ if [ -f "$ROOT/.env" ]; then
   source "$ROOT/.env"
 fi
 export ALLOW_UNAUTH_LOCAL="${ALLOW_UNAUTH_LOCAL:-1}"
+export MOLINK_SKIP_ARTWORK_PROTECTION="${MOLINK_SKIP_ARTWORK_PROTECTION:-1}"
 if [ -z "${API_KEY:-}" ] && [ -n "${VLM_API_KEY:-}" ]; then
   export API_KEY="$VLM_API_KEY"
 fi

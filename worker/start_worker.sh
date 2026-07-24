@@ -19,6 +19,7 @@ export GPU_COUNT="${GPU_COUNT:-1}"
 export PYTHONUNBUFFERED=1
 # Disable idle auto-shutdown for dev environment (set to 0 = never shutdown)
 export IDLE_TIMEOUT_S="${IDLE_TIMEOUT_S:-0}"
+export MOLINK_SKIP_ARTWORK_PROTECTION="${MOLINK_SKIP_ARTWORK_PROTECTION:-1}"
 
 mkdir -p "$APP/logs"
 
