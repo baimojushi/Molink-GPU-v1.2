@@ -29,6 +29,7 @@ from hanging_mvp.render_qa import (
 from image_editing.pipeline import cleanup_objects, render_hanging
 from image_editing.provider_registry import build_image_edit_provider
 from image_editing.providers import ImageEditResult
+from image_editing.providers.apiyi_gpt_image2 import remove_padding_from_image
 
 
 MOCK_PROVIDER_WARNING = (
@@ -2059,6 +2060,10 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                         })
                     final_path = final_dir / f"{asset_id}.png"
                     shutil.copyfile(selected_render_result.image, final_path)
+                    # Crop out any padded borders added by the provider adapter
+                    # so the delivered image contains only real generated content.
+                    resize_trace = (selected_render_result.trace or {}).get("resize_to_input_size") or {}
+                    remove_padding_from_image(final_path, resize_trace)
                     production_usable = not using_mock_provider
                 else:
                     partial_dir = output_dir / "partial_review"

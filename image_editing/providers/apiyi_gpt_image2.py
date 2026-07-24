@@ -170,12 +170,50 @@ def _resize_to_match(source_path: Path, output_path: Path) -> dict[str, Any]:
 
         resized = generated_rgb.resize(source_size, Image.Resampling.LANCZOS)
         resized.save(output_path)
+
+    # If padding was applied, compute where the original (non-padded) generated
+    # content sits within the final resized image, so callers can remove the
+    # padding before delivery.
+    if padding.get("padding_applied"):
+        padded_w, padded_h = padding["padding_box"]
+        scale_x = src_w / padded_w
+        scale_y = src_h / padded_h
+        l = int(padding.get("pad_left", 0) * scale_x)
+        t = int(padding.get("pad_top", 0) * scale_y)
+        r = int((padding.get("pad_left", 0) + gen_w) * scale_x)
+        b = int((padding.get("pad_top", 0) + gen_h) * scale_y)
+        padding["content_bbox"] = [l, t, r, b]
+
     return {
         "resized": True,
         "source_size": list(source_size),
         "generated_size": list(generated_size),
         "padding": padding,
     }
+
+
+def remove_padding_from_image(image_path: Path, resize_trace: dict[str, Any]) -> None:
+    """Crop out padded border rows/columns added by ``_resize_to_match``.
+
+    This is a no-op when the resize trace contains no padding information.
+    The image file is modified **in-place**.
+    """
+    padding = (resize_trace or {}).get("padding") or {}
+    bbox = padding.get("content_bbox")
+    if not bbox:
+        return
+    l, t, r, b = bbox
+    if r <= l or b <= t:
+        return
+    tmp = image_path.with_name(f".{image_path.name}.crop_tmp")
+    try:
+        with Image.open(image_path) as img:
+            cropped = img.crop((l, t, r, b))
+            cropped.save(tmp)
+        tmp.replace(image_path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def _maybe_compress_upload(path: Path, tmp_dir: Path, *, max_bytes: int, enabled: bool) -> Path:
