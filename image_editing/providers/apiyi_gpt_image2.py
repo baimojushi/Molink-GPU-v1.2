@@ -166,14 +166,15 @@ def _build_full_space_coordinate_prompt(
     *,
     original_size_wh: tuple[int, int],
     sent_size_wh: tuple[int, int],
+    contract_mode: str = "render_artwork_anchor",
 ) -> tuple[str, dict[str, Any]]:
-    """Build a remote coordinate lock in the exact pixels of the uploaded image.
+    """Build a protected artwork anchor in uploaded-image pixel coordinates.
 
-    The API易 image-edit endpoint does not expose a mask field.  For textured
-    walls we intentionally send the full room instead of a crop, so the only
-    remote edit boundary is text.  The model sees the compressed upload, not the
-    original file, therefore all prompt coordinates must be scaled to that upload
-    size.
+    The endpoint has no native mask field.  We intentionally send the complete
+    room and use coordinates only to identify the immutable artwork footprint;
+    the coordinates are *not* an edit mask.  This preserves full-scene context
+    and avoids crop/paste boundaries while still giving the model a precise
+    placement anchor.
     """
     ow, oh = int(original_size_wh[0]), int(original_size_wh[1])
     sw, sh = int(sent_size_wh[0]), int(sent_size_wh[1])
@@ -189,10 +190,10 @@ def _build_full_space_coordinate_prompt(
         sx=sx,
         sy=sy,
     )
-    edit_polygon = mount_polygon or front_polygon
+    protected_polygon = mount_polygon or front_polygon
     front_bbox = _scale_bbox_for_sent_image(metadata.get("front_bbox_px") or metadata.get("bbox_px"), sx=sx, sy=sy)
     mount_bbox = _scale_bbox_for_sent_image(metadata.get("mount_bbox_px"), sx=sx, sy=sy)
-    edit_bbox = mount_bbox or front_bbox
+    protected_bbox = mount_bbox or front_bbox
 
     matrix: dict[str, Any] = {
         "coordinate_space": "pixels_in_the_exact_compressed_image_1_sent_to_api",
@@ -201,20 +202,30 @@ def _build_full_space_coordinate_prompt(
         "scale_from_original_to_sent": [sx, sy],
         "front_polygon_px": front_polygon,
         "front_bbox_px": front_bbox,
-        "edit_polygon_px": edit_polygon,
-        "edit_bbox_px": edit_bbox,
+        "protected_artwork_polygon_px": protected_polygon,
+        "protected_artwork_bbox_px": protected_bbox,
+        "contract_mode": str(contract_mode),
     }
     # Drop empty fields from the text payload but keep trace context explicit.
     compact = {k: v for k, v in matrix.items() if v is not None}
     matrix_json = json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
+    if str(contract_mode) == "styling_artwork_protected":
+        action_text = (
+            "这些坐标只定义不可移动、不可替换、不可重绘的挂画占位，不是生图编辑区域。"
+            "除该挂画占位外，可根据原始 styling 指令在完整房间内自由完成软装和整体配色；"
+            "新增物体必须有真实支撑关系，不得改变门窗、墙体、天花、地面、主要家具和相机透视。"
+        )
+    else:
+        action_text = (
+            "这些坐标只定义挂画的几何与身份锚点，不是生图编辑区域。"
+            "必须保持挂画中心、四角、尺寸、透视和画芯身份；允许在完整画面上下文中完成边框/侧面受光、"
+            "接触阴影、墙面反射和必要的低频全局曝光色温协调。不要重新设计房间或改变建筑与家具几何。"
+        )
     text = (
-        "\n\nFULL-SPACE REMOTE COORDINATE LOCK. 图1是完整房间图，不是局部裁剪。"
+        "\n\nFULL-SPACE PROTECTED ARTWORK ANCHOR. 图1是完整房间图，不是局部裁剪。"
         "以下坐标全部是你实际收到的压缩后图1像素坐标，不是原图坐标，也不是归一化坐标："
-        f"{matrix_json}。"
-        "只允许在 edit_polygon_px / edit_bbox_px 所限定的挂画对象、边侧、接触阴影和极窄融合边缘内做渲染；"
-        "该坐标范围以外的墙面纹理、肌理、光影分界、门窗、地面、天花、家具、结构线、镜头畸变和构图必须保持不变。"
-        "不要移动、缩放、拉伸、重画、复制或替换挂画。不要矫正透视畸变、镜头畸变、墙面线条、房间结构或相机视角；"
-        "保持当前照片中的自然透视和畸变。"
+        f"{matrix_json}。{action_text}"
+        "不要矫正透视畸变、镜头畸变、墙面线条、房间结构或相机视角；保持当前照片中的自然透视和畸变。"
     )
     return text, {**matrix, "prompt_json": compact, "enabled": True}
 
@@ -1035,8 +1046,32 @@ class ApiyiGptImage2Client:
         # A request-scoped override avoids mutating global provider behavior.
         requested_mask_edit_mode = str(request.metadata.get("mask_edit_mode") or self.mask_edit_mode)
         normalized_mask_edit_mode = requested_mask_edit_mode.replace("-", "_").strip().lower()
+        full_space_edit_mode = str(request.metadata.get("full_space_edit_mode") or "").strip().lower()
+        explicit_full_space_mode = full_space_edit_mode in {
+            "render_artwork_anchor",
+            "styling_artwork_protected",
+        }
         full_space_coordinate_prompt_requested = bool(request.metadata.get("full_space_coordinate_prompt_requested"))
-        if request.mask and full_space_coordinate_prompt_requested:
+        if explicit_full_space_mode:
+            target_for_api = image
+            output_scope = (
+                "full_space_styling_artwork_protected"
+                if full_space_edit_mode == "styling_artwork_protected"
+                else "full_space_artwork_anchor"
+            )
+            mask_trace.update({
+                "mask_enforcement": "full_frame_generation_with_prompt_artwork_anchor_and_local_protection",
+                "mask_enforced_locally": False,
+                "local_crop_disabled": True,
+                "remote_coordinate_matrix_sent": True,
+                "pixel_coordinate_matrix_sent": True,
+                "remote_edit_region_control": "none_coordinates_identify_protected_artwork_not_edit_region",
+                "full_space_image_sent": True,
+                "full_space_edit_mode": full_space_edit_mode,
+                "protected_artwork_mask_path": request.metadata.get("protected_artwork_mask_path"),
+                "reason": request.metadata.get("full_space_render_reason") or "explicit_no_crop_full_frame_contract",
+            })
+        elif request.mask and full_space_coordinate_prompt_requested:
             target_for_api = image
             output_scope = "full_space_coordinate_prompt"
             mask_trace.update({
@@ -1146,12 +1181,21 @@ class ApiyiGptImage2Client:
 
         coordinate_prompt = ""
         coordinate_prompt_trace: dict[str, Any] = {"enabled": False}
-        if output_scope == "full_space_coordinate_prompt":
+        if output_scope in {
+            "full_space_coordinate_prompt",
+            "full_space_artwork_anchor",
+            "full_space_styling_artwork_protected",
+        }:
             try:
                 coordinate_prompt, coordinate_prompt_trace = _build_full_space_coordinate_prompt(
                     request.metadata,
                     original_size_wh=_image_size_wh(target_for_api),
                     sent_size_wh=_image_size_wh(target_upload_path),
+                    contract_mode=(
+                        "styling_artwork_protected"
+                        if output_scope == "full_space_styling_artwork_protected"
+                        else "render_artwork_anchor"
+                    ),
                 )
             except Exception as exc:
                 coordinate_prompt_trace = {"enabled": False, "error": str(exc)}
@@ -1293,17 +1337,28 @@ class ApiyiGptImage2Client:
             "mask_local_composite": output_scope in {"mask_local_composite", "mask_photometric_composite", "mask_wall_rgb_only_composite"},
             "mask_photometric_composite": output_scope == "mask_photometric_composite",
             "mask_wall_rgb_only_composite": output_scope == "mask_wall_rgb_only_composite",
-            "full_space_coordinate_prompt": output_scope == "full_space_coordinate_prompt",
+            "full_space_coordinate_prompt": output_scope in {
+                "full_space_coordinate_prompt",
+                "full_space_artwork_anchor",
+                "full_space_styling_artwork_protected",
+            },
+            "full_space_artwork_anchor": output_scope == "full_space_artwork_anchor",
+            "full_space_styling_artwork_protected": output_scope == "full_space_styling_artwork_protected",
             "mask_enforced_locally": output_scope in {"mask_local_composite", "mask_photometric_composite", "mask_wall_rgb_only_composite"},
             "mask_contract": (
                 "API易 gpt-image-2-vip image-edit endpoint has no multipart mask field. "
-                "For pure-color walls the adapter enforces bounded repaint locally by cropping the mask bbox and compositing/QA outside the remote request. "
-                "For textured candidate walls the adapter sends the full room image and uses a prompt-side pixel coordinate matrix in the exact compressed upload coordinate space. "
+                "Stage A render and Stage B styling use explicit full-space modes: the complete room is sent, no local crop is made, "
+                "and the prompt-side pixel matrix identifies a protected artwork anchor rather than an editable region. "
+                "Legacy request-scoped mask modes remain available for unrelated callers. "
                 "In photometric crop mode, artwork core pixels are not hard-restored from hard-paste; "
                 "they receive only low-frequency exposure/color transfer from the generated crop, while direct generated pixels are limited to the edge/shadow region. "
                 "In wall_rgb_only mode, the GPT Image crop is preserved and only wall RGB outside the object mask is corrected."
             ),
-            "remote_coordinate_matrix_sent": output_scope == "full_space_coordinate_prompt",
+            "remote_coordinate_matrix_sent": output_scope in {
+                "full_space_coordinate_prompt",
+                "full_space_artwork_anchor",
+                "full_space_styling_artwork_protected",
+            },
             "mask_adapter": mask_trace,
             "local_composite": composite_trace,
             "apiyi_images_edit_request": True,
@@ -1381,6 +1436,31 @@ class ApiyiGptImage2Client:
                     "不要新增、移动、缩放、复制、替换画作，不要改变画芯图案，不要改边框颜色、厚度、样式或开口。"
                     "不要矫正透视畸变、镜头畸变、墙面线条或相机视角。输出保持图1的构图比例，便于回贴到原图。"
                 )
+        elif output_scope == "full_space_artwork_anchor":
+            prefix = (
+                "修改图1。图1是完整房间画面，不是局部裁剪；输出必须保持完整房间构图和图1比例。"
+                "目标是把当前硬贴挂画真正渲染成与现场一致的实体挂画，而不是尽量不改。"
+                "不可变项：挂画中心、四个投影角点、外轮廓、尺寸、透视、画芯构图与主体身份，以及房间建筑结构、主要家具几何和相机视角。"
+                "允许且必须完成：边框与可见侧面的环境受光、材质高光/粗糙度表现、墙面接触阴影、反射色污染、窄边缘遮挡融合，"
+                "以及必要的低频全画面曝光和色温协调。允许画芯发生合理的低频环境明暗变化，但不得改写图案、人物、文字或构图。"
+                "不要新增第二幅画，不要移动、缩放、拉伸、旋转、替换或重新设计挂画；不要重新设计房间。"
+            )
+            if mount_policy.get("precompose_frame_sides"):
+                vis = "、".join(visible_side_edges) if visible_side_edges else "现有可见侧面"
+                hid = "、".join(hidden_side_edges) if hidden_side_edges else "其余边"
+                prefix += (
+                    f"当前只有{vis}可以表现厚度；隐藏边例如{hid}不得新增厚度条、卡纸或四周包边。"
+                    "可以重新计算现有可见侧面的光照，但不能改变其几何。"
+                )
+        elif output_scope == "full_space_styling_artwork_protected":
+            prefix = (
+                "修改图1。图1是完整房间画面，不是局部裁剪；输出必须保持完整房间构图和图1比例。"
+                "这是全空间 styling 任务，不提供用于限制创作范围的编辑 mask。"
+                "挂画占位是唯一受保护区域：保持挂画中心、四角、尺寸、透视、画芯内容和画框身份，不得移动、替换、复制或重绘。"
+                "除挂画外，可根据原始 styling 指令在完整空间内自由增加协调软装、调整墙面颜色和完成整体光影融合。"
+                "新增物体必须落在真实可支撑表面并符合尺度、遮挡和透视；不得改变门窗、墙体、天花、地面、主要家具和相机几何。"
+                "必须产生清晰可见但不过度的 styling 效果，不要返回近似原图的无效结果。"
+            )
         elif output_scope == "full_space_coordinate_prompt":
             prefix = (
                 "修改图1。图1是完整房间画面，不是局部裁剪；输出也必须保持完整房间构图和图1比例。"
@@ -1420,8 +1500,9 @@ class ApiyiGptImage2VipRenderProvider:
     """Hybrid provider: keep BFL erase, render final image through APIYI gpt-image-2-vip.
 
     API易 gpt-image-2-vip image-edit endpoint does not expose a mask parameter.
-    This adapter keeps the product's bounded-edit contract by using BFL for the
-    cleanup mask, then using local mask crop/composite for the final render mask.
+    Cleanup still uses BFL's native mask.  Stage A and Stage B use full-frame
+    requests with a protected artwork anchor; legacy local crop/composite modes
+    remain available only for callers that explicitly request them.
     """
 
     def __init__(

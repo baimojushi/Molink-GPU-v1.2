@@ -10,7 +10,11 @@ from hanging_mvp.candidate_safety import (
     evaluate_wall_support_gate,
     semantic_axis_policy,
 )
-from hanging_mvp.render_qa import enforce_identity_locked_shadow_composite, evaluate_mask_anchored_render_qa
+from hanging_mvp.render_qa import (
+    enforce_identity_locked_shadow_composite,
+    enforce_protected_artwork_composite,
+    evaluate_mask_anchored_render_qa,
+)
 from hanging_mvp.hardpaste import warp_artwork_to_quad
 
 
@@ -143,6 +147,34 @@ def test_full_space_identity_lock_restores_core_and_scope_but_keeps_neutral_shad
     assert qa["passed"] is True
     assert qa["core_masked_ssim"] == 1.0
     assert qa["core_color_delta"] == 0.0
+
+
+def test_full_frame_protected_artwork_composite_keeps_provider_everywhere_else(tmp_path: Path):
+    source = np.zeros((64, 80, 3), np.uint8) + 180
+    source[20:44, 28:52] = [220, 35, 45]
+    provider = np.clip(source.astype(np.int16) + 18, 0, 255).astype(np.uint8)
+    provider[20:44, 28:52] = [20, 40, 230]
+    provider[48:54, 18:62] = [95, 95, 95]
+    protect = np.zeros((64, 80), np.uint8)
+    protect[20:44, 28:52] = 255
+
+    source_path = _save(tmp_path / "source.png", source)
+    provider_path = _save(tmp_path / "provider.png", provider)
+    protect_path = _save(tmp_path / "protect.png", protect)
+    output_path = tmp_path / "protected.png"
+    trace = enforce_protected_artwork_composite(
+        authoritative_image_path=source_path,
+        provider_render_path=provider_path,
+        protect_mask_path=protect_path,
+        output_path=output_path,
+        feather_inside_px=0,
+    )
+    output = np.asarray(Image.open(output_path).convert("RGB"), dtype=np.uint8)
+    assert np.array_equal(output[protect > 0], source[protect > 0])
+    assert np.array_equal(output[protect == 0], provider[protect == 0])
+    assert trace["local_crop_used"] is False
+    assert trace["outside_protect_restored"] is False
+    assert trace["provider_pixels_outside_protect_preserved"] is True
 
 
 def test_supersampled_hardpaste_supports_tiny_artwork_without_empty_mask():

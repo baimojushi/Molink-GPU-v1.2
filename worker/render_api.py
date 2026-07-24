@@ -25,7 +25,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 from scripts import run_bfl_hanging_flux_pipeline as bfl  # noqa: E402
 from hanging_mvp.flux_export import build_stage_b_prompt  # noqa: E402
-from hanging_mvp.render_qa import masked_global_ssim  # noqa: E402
+from hanging_mvp.render_qa import enforce_protected_artwork_composite, masked_global_ssim  # noqa: E402
 from image_editing.pipeline import render_hanging  # noqa: E402
 from image_editing.provider_registry import build_image_edit_provider  # noqa: E402
 from semantic_mvp.vlm_client import parse_styling_analysis_with_vlm  # noqa: E402
@@ -224,45 +224,93 @@ def _masked_stage_b_composite_and_qa(
     wall_zone: np.ndarray,
     soft_furnishing_requested: bool,
     wallpaper_enabled: bool,
+    wallpaper_target_rgb: list[int] | tuple[int, int, int] | None = None,
 ) -> dict[str, Any]:
+    """Protect only the artwork after an unrestricted full-frame styling call.
+
+    ``decor_zone`` and ``wall_zone`` are diagnostic/goal-evaluation regions;
+    they are never used to crop, mask, or composite the provider output.  This
+    lets the model place accessories in physically plausible volumes beyond the
+    original support segmentation while the mounted artwork remains immutable.
+    """
     with Image.open(stage_a_path) as base_image, Image.open(generated_path) as generated_image:
+        base_size = tuple(base_image.size)
+        generated_size = tuple(generated_image.size)
+    if generated_size != base_size:
+        return {
+            "passed": False,
+            "reason": "provider_output_size_mismatch",
+            "stage_a_size": list(base_size),
+            "generated_size": list(generated_size),
+        }
+
+    protection_trace = enforce_protected_artwork_composite(
+        authoritative_image_path=stage_a_path,
+        provider_render_path=generated_path,
+        protect_mask_path=protect_mask_path,
+        output_path=output_path,
+        feather_inside_px=0.0,
+    )
+    with Image.open(stage_a_path) as base_image, Image.open(output_path) as output_image, Image.open(protect_mask_path) as protect_image:
         base = base_image.convert("RGB")
-        generated = generated_image.convert("RGB")
-        if generated.size != base.size:
-            return {
-                "passed": False,
-                "reason": "provider_output_size_mismatch",
-                "stage_a_size": list(base.size),
-                "generated_size": list(generated.size),
-            }
-        with Image.open(protect_mask_path) as protect_image:
-            protect = protect_image.convert("L").resize(base.size, Image.Resampling.NEAREST)
-        protect_arr = np.asarray(protect, dtype=np.uint8) > 0
-        composited = base.copy()
-        composited.paste(generated, (0, 0))
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        composited.save(output_path)
+        composited = output_image.convert("RGB")
+        protect = protect_image.convert("L").resize(base.size, Image.Resampling.NEAREST)
 
     base_arr = np.asarray(base, dtype=np.int16)
     out_arr = np.asarray(composited, dtype=np.int16)
+    protect_arr = np.asarray(protect, dtype=np.uint8) > 0
     changed = np.any(base_arr != out_arr, axis=2)
-    protect_changed = int(np.count_nonzero(changed & protect_arr))
     delta = np.mean(np.abs(out_arr - base_arr), axis=2)
+    protect_changed = int(np.count_nonzero(changed & protect_arr))
     failures: list[str] = []
     content_quality: dict[str, Any] = {}
 
+    # Whole-frame guard: creativity is welcome, a complete unrelated rewrite is
+    # not.  This gate is intentionally broad and does not impose a spatial mask.
+    scene_eval = ~protect_arr
+    scene_area = int(np.count_nonzero(scene_eval))
+    scene_changed_delta = float(os.getenv("MOLINK_STAGE_B_QA_SCENE_CHANGED_PIXEL_DELTA", "18"))
+    scene_changed_ratio = float(np.mean(delta[scene_eval] > scene_changed_delta)) if scene_area else 0.0
+    scene_ssim = masked_global_ssim(base_arr, out_arr, scene_eval) if scene_area >= 16 else 0.0
+    min_scene_ssim = float(os.getenv("MOLINK_STAGE_B_QA_MIN_SCENE_SSIM", "0.22"))
+    max_scene_changed_ratio = float(os.getenv("MOLINK_STAGE_B_QA_MAX_SCENE_CHANGED_RATIO", "0.88"))
+    if scene_area < 16:
+        failures.append("scene_qa_region_too_small")
+    else:
+        if scene_ssim < min_scene_ssim:
+            failures.append("full_scene_identity_below_threshold")
+        if scene_changed_ratio > max_scene_changed_ratio and scene_ssim < 0.55:
+            failures.append("full_scene_changed_ratio_above_threshold")
+    content_quality["scene"] = {
+        "area_px": scene_area,
+        "masked_ssim": scene_ssim,
+        "changed_ratio": scene_changed_ratio,
+        "thresholds": {
+            "min_masked_ssim": min_scene_ssim,
+            "max_changed_ratio": max_scene_changed_ratio,
+            "changed_pixel_delta": scene_changed_delta,
+        },
+    }
+
+    effective_change_detected = False
     if soft_furnishing_requested:
-        decor_eval = (np.asarray(decor_zone) > 0)
+        decor_eval = np.asarray(decor_zone) > 0
         if wallpaper_enabled:
             decor_eval &= ~(np.asarray(wall_zone) > 0)
+        decor_eval &= ~protect_arr
         decor_area = int(np.count_nonzero(decor_eval))
-        min_ssim = float(os.getenv("MOLINK_STAGE_B_QA_MIN_DECOR_SSIM", "0.60"))
-        max_changed_ratio = float(os.getenv("MOLINK_STAGE_B_QA_MAX_DECOR_CHANGED_RATIO", "0.45"))
+        min_ssim = float(os.getenv("MOLINK_STAGE_B_QA_MIN_DECOR_SSIM", "0.40"))
+        max_changed_ratio = float(os.getenv("MOLINK_STAGE_B_QA_MAX_DECOR_CHANGED_RATIO", "0.70"))
+        min_changed_ratio = float(os.getenv("MOLINK_STAGE_B_QA_MIN_DECOR_CHANGED_RATIO", "0.003"))
         min_changed_ratio_for_ssim = float(os.getenv("MOLINK_STAGE_B_QA_MIN_CHANGED_RATIO_FOR_SSIM", "0.08"))
         changed_delta = float(os.getenv("MOLINK_STAGE_B_QA_CHANGED_PIXEL_DELTA", "24"))
         if decor_area >= 16:
             decor_ssim = masked_global_ssim(base_arr, out_arr, decor_eval)
             decor_changed_ratio = float(np.mean(delta[decor_eval] > changed_delta))
+            if decor_changed_ratio < min_changed_ratio:
+                failures.append("decor_effect_below_minimum")
+            else:
+                effective_change_detected = True
             if decor_changed_ratio >= min_changed_ratio_for_ssim and decor_ssim < min_ssim:
                 failures.append("decor_masked_ssim_below_threshold")
             if decor_changed_ratio > max_changed_ratio:
@@ -271,8 +319,10 @@ def _masked_stage_b_composite_and_qa(
                 "area_px": decor_area,
                 "masked_ssim": decor_ssim,
                 "changed_ratio": decor_changed_ratio,
+                "zone_usage": "diagnostic_and_goal_evaluation_only_not_generation_mask",
                 "thresholds": {
                     "min_masked_ssim": min_ssim,
+                    "min_changed_ratio": min_changed_ratio,
                     "max_changed_ratio": max_changed_ratio,
                     "min_changed_ratio_for_ssim": min_changed_ratio_for_ssim,
                     "changed_pixel_delta": changed_delta,
@@ -283,12 +333,20 @@ def _masked_stage_b_composite_and_qa(
             content_quality["decor"] = {"area_px": decor_area, "status": "too_small"}
 
     if wallpaper_enabled:
-        wall_eval = (np.asarray(wall_zone) > 0)
+        wall_eval = (np.asarray(wall_zone) > 0) & ~protect_arr
         wall_area = int(np.count_nonzero(wall_eval))
         min_gradient_correlation = float(os.getenv("MOLINK_STAGE_B_QA_MIN_WALL_GRADIENT_CORRELATION", "0.45"))
         max_gradient_energy_ratio = float(os.getenv("MOLINK_STAGE_B_QA_MAX_WALL_GRADIENT_ENERGY_RATIO", "4.0"))
+        min_wall_changed_ratio = float(os.getenv("MOLINK_STAGE_B_QA_MIN_WALL_CHANGED_RATIO", "0.02"))
+        min_target_improvement = float(os.getenv("MOLINK_STAGE_B_QA_MIN_WALL_TARGET_IMPROVEMENT", "0.08"))
+        wall_changed_delta = float(os.getenv("MOLINK_STAGE_B_QA_WALL_CHANGED_PIXEL_DELTA", "10"))
         if wall_area >= 32:
             wall_metrics = _masked_luma_gradient_metrics(base_arr, out_arr, wall_eval)
+            wall_changed_ratio = float(np.mean(delta[wall_eval] > wall_changed_delta))
+            if wall_changed_ratio < min_wall_changed_ratio:
+                failures.append("wall_recolor_effect_below_minimum")
+            else:
+                effective_change_detected = True
             if (
                 not wall_metrics["flat_base_wall"]
                 and wall_metrics["gradient_correlation"] < min_gradient_correlation
@@ -296,12 +354,38 @@ def _masked_stage_b_composite_and_qa(
                 failures.append("wall_luma_gradient_correlation_below_threshold")
             if wall_metrics["gradient_energy_ratio"] > max_gradient_energy_ratio:
                 failures.append("wall_gradient_energy_ratio_above_threshold")
+
+            target_metrics: dict[str, Any] = {"enabled": False}
+            if isinstance(wallpaper_target_rgb, (list, tuple)) and len(wallpaper_target_rgb) >= 3:
+                target = np.asarray(list(wallpaper_target_rgb)[:3], dtype=np.float32)
+                base_median = np.median(base_arr[wall_eval].astype(np.float32), axis=0)
+                styled_median = np.median(out_arr[wall_eval].astype(np.float32), axis=0)
+                before_distance = float(np.linalg.norm(base_median - target))
+                after_distance = float(np.linalg.norm(styled_median - target))
+                improvement = float((before_distance - after_distance) / max(before_distance, 1.0))
+                target_metrics = {
+                    "enabled": True,
+                    "target_rgb": [int(v) for v in target.tolist()],
+                    "base_median_rgb": [float(v) for v in base_median.tolist()],
+                    "styled_median_rgb": [float(v) for v in styled_median.tolist()],
+                    "distance_before": before_distance,
+                    "distance_after": after_distance,
+                    "relative_improvement": improvement,
+                    "min_relative_improvement": min_target_improvement,
+                }
+                if before_distance > 8.0 and improvement < min_target_improvement:
+                    failures.append("wall_target_color_not_approached")
             content_quality["wall"] = {
                 "area_px": wall_area,
                 **wall_metrics,
+                "changed_ratio": wall_changed_ratio,
+                "target_color": target_metrics,
+                "zone_usage": "diagnostic_and_goal_evaluation_only_not_generation_mask",
                 "thresholds": {
                     "min_gradient_correlation": min_gradient_correlation,
                     "max_gradient_energy_ratio": max_gradient_energy_ratio,
+                    "min_changed_ratio": min_wall_changed_ratio,
+                    "changed_pixel_delta": wall_changed_delta,
                 },
             }
         else:
@@ -309,12 +393,19 @@ def _masked_stage_b_composite_and_qa(
             content_quality["wall"] = {"area_px": wall_area, "status": "too_small"}
 
     if protect_changed:
-        failures.append("protected_pixels_changed")
+        failures.append("protected_pixels_changed_after_local_restore")
+    if (soft_furnishing_requested or wallpaper_enabled) and not effective_change_detected:
+        failures.append("styling_no_effect")
     return {
         "passed": not failures,
-        "reason": "ok" if not failures else "content_or_spatial_quality_gate_failed",
+        "reason": "ok" if not failures else "content_or_effect_quality_gate_failed",
+        "generation_scope": "full_frame_unmasked",
+        "generation_mask_used": False,
+        "zones_used_as_generation_masks": False,
+        "artwork_protection": protection_trace,
         "protect_changed_pixel_count": protect_changed,
         "content_quality": content_quality,
+        "effective_change_detected": bool(effective_change_detected),
         "failures": failures,
         "output_size": list(composited.size),
     }
@@ -348,11 +439,12 @@ def run_stage_b_pipeline(
     normalized_wallpaper = normalize_wallpaper_recolor(wallpaper_recolor)
     requested = bool(soft_furnishing_requested or normalized_wallpaper)
     aggregate: Dict[str, Any] = {
-        "version": 2,
+        "version": 3,
         "requested": requested,
         "soft_furnishing_requested": bool(soft_furnishing_requested),
         "wallpaper_recolor": normalized_wallpaper,
-        "zone_source": "hanging_semantic_sam_or_bbox_export",
+        "zone_source": "qa_only_hanging_semantic_sam_or_bbox_export",
+        "generation_scope": "full_frame_unmasked_with_artwork_protection",
         "provider": normalize_render_provider(provider),
         "call_count": 0,
         "outputs": [],
@@ -470,6 +562,7 @@ def run_stage_b_pipeline(
                     provider_adapter,
                     stage_a_path,
                     prompt,
+                    art_mask=None,
                     output_dir=item_dir,
                     output_name="styled.png",
                     metadata={
@@ -478,6 +571,15 @@ def run_stage_b_pipeline(
                         "candidate_id": item.get("candidate_id"),
                         "wall_id": item.get("wall_id"),
                         "stage_b_single_call": True,
+                        "full_space_edit_mode": "styling_artwork_protected",
+                        "full_space_coordinate_prompt_requested": True,
+                        "full_space_render_reason": "styling_creativity_no_generation_mask",
+                        "protected_artwork_mask_path": str(protect_path),
+                        "front_polygon_px": item.get("front_polygon_px") or item.get("polygon_px") or item.get("target_quad_original"),
+                        "front_bbox_px": item.get("front_bbox_px") or item.get("bbox_px"),
+                        "mount_bbox_px": item.get("mount_bbox_px"),
+                        "stage_b_generation_mask_used": False,
+                        "stage_b_zones_usage": "qa_and_goal_evaluation_only",
                         "stage_b_zone_source": item.get("styling_zone_source") or aggregate["zone_source"],
                     },
                 )
@@ -491,6 +593,7 @@ def run_stage_b_pipeline(
                     wall_zone=wall_zone,
                     soft_furnishing_requested=bool(soft_furnishing_requested),
                     wallpaper_enabled=bool(normalized_wallpaper),
+                    wallpaper_target_rgb=(normalized_wallpaper or {}).get("tone_rgb"),
                 )
                 if not qa.get("passed"):
                     record.update({

@@ -177,11 +177,12 @@ def build_render_prompt(
     artwork_mount_policy: Mapping[str, Any] | None = None,
     flux2_input_mode: str | None = None,
 ) -> str:
-    """Build a conservative FLUX.2 edit prompt.
+    """Build a full-context render prompt with an immutable artwork anchor.
 
-    The downstream BFL adapter must send a per-item flux2_edit_mask.  The
-    bbox/polygon text remains a human-readable lock instruction, while the
-    mask is the hard edit-region constraint that prevents whole-room rewrites.
+    Geometry and artwork identity are hard constraints.  Lighting, contact
+    shadow, frame/side material response, edge occlusion and low-frequency scene
+    adaptation are positive requirements.  The prompt intentionally does not
+    ask a full-frame provider to behave like a pixel-locked local inpaint.
     """
     risk = candidate.get("risk_level") or candidate.get("hard_constraints", {}).get("risk_assessment", {}).get("risk_level")
     bbox, polygon, mount_bbox = _quad_bbox_and_polygon(candidate)
@@ -190,20 +191,16 @@ def build_render_prompt(
 
     if input_mode == "dual_erased_room_plus_target":
         input_contract = (
-            "Image 1 is the cleaned hard-paste target after object removal and is the authoritative canvas. "
-            "Image 2 is the already-erased clean room reference, never the raw original room. "
-            "Use Image 1 for exact artwork placement, artwork content, outer bounds, core image size, crop, aspect ratio, and perspective. "
-            "Use Image 2 only for cleaned wall texture, lighting, perspective context, and unchanged room details. "
-            "Do not restore any removed person, old artwork, wall label, hook, nail, shelf, or clutter from any reference. "
-            "Respect the supplied edit mask: only the masked mounted-artwork edge/shadow region may change. "
+            "Image 1 is the cleaned hard-paste target and is the authoritative final composition. "
+            "Image 2 is the already-erased clean room reference and may be used only to infer wall material, ambient light, and background continuity. "
+            "Never restore removed people, old art, labels, hooks, shelves, or clutter from Image 2. "
         )
     elif input_mode == "dual_original_plus_target":
         input_contract = (
-            "Legacy manifest warning: raw original-room dual references must be downgraded by the pipeline. "
-            "Treat Image 1 as the only authoritative cleaned hard-paste target. "
+            "Legacy dual-original input is not authoritative. Treat Image 1 as the only cleaned target composition. "
         )
     else:
-        input_contract = "Image 1 is the cleaned hard-paste target after object removal and is authoritative. "
+        input_contract = "Image 1 is the cleaned hard-paste target and is the authoritative final composition. "
 
     region_parts = []
     if bbox is not None:
@@ -212,82 +209,54 @@ def build_render_prompt(
         region_parts.append(f"front_polygon_px={polygon}")
     if mount_bbox is not None and mount_bbox != bbox:
         region_parts.append(f"mount_bbox_px={mount_bbox}")
-    region_text = "; ".join(region_parts) if region_parts else "the visible pasted artwork region in the target image"
+    region_text = "; ".join(region_parts) if region_parts else "the visible pasted artwork footprint in Image 1"
 
     mount_policy = artwork_mount_policy if isinstance(artwork_mount_policy, Mapping) else (candidate.get("artwork_mount_policy") if isinstance(candidate.get("artwork_mount_policy"), Mapping) else {})
     visible_side_faces = mount_policy.get("visible_side_faces_original") if isinstance(mount_policy.get("visible_side_faces_original"), Sequence) else []
     visible_side_edges = [
         str(face.get("source_edge"))
         for face in visible_side_faces
-        if isinstance(face, Mapping) and face.get("source_edge")
+        if isinstance(face, Mapping) and face.get("source_edge") in {"left", "right", "top", "bottom"}
     ]
-    visible_side_edges = [edge for edge in visible_side_edges if edge in {"left", "right", "top", "bottom"}]
-    visible_side_text = ", ".join(visible_side_edges) if visible_side_edges else "the already visible side faces"
     hidden_side_edges = [edge for edge in ("left", "right", "top", "bottom") if edge not in visible_side_edges]
+    visible_side_text = ", ".join(visible_side_edges) if visible_side_edges else "the already visible side faces"
     hidden_side_text = ", ".join(hidden_side_edges) if hidden_side_edges else "the remaining perimeter"
+
     if mount_policy.get("precompose_frame_sides"):
         frame_rule = (
-            "The artwork target already includes deterministic 3D frame side faces / artwork side faces generated from the original artwork edge colors. "
-            "Treat the visible front artwork, border/frame if present, and generated side faces as identity-locked. "
+            "The hard-paste already contains deterministic 3D frame side faces with the correct visible thickness geometry. "
             f"Only these side faces are visible and allowed to remain visible: {visible_side_text}. "
             f"Do not invent a perimeter border or thickness strip on hidden edges such as {hidden_side_text}. "
-            "Do not add, redraw, thicken, restyle, recolor, shrink, replace, or reinterpret the side faces or frame; do not add mat board; do not create a black matte surround; do not add a thin border around all four edges. "
-            "Do not change the front artwork, side color, side thickness, mounted geometry, or painting core size. "
-            "Only render subtle contact shadow, local light consistency, and edge blending around the mounted object."
+            "Do not add, redraw, thicken, thin, recolor, restyle, or replace the existing frame/side geometry, and do not add mat board. "
+            "Relight the existing side faces and frame material naturally, but do not alter their geometry, opening, or thickness. "
         )
     elif frame_known:
         frame_rule = (
-            "The artwork image contains a visible frame or border. Keep that frame exactly. "
-            "Do not replace, redraw, recolor, thicken, thin, sharpen into a graphic border, or add mat board. "
-            "Do not change the frame opening, inner crop, or painting core size. "
-            "Only add subtle mounting shadow and local light consistency if needed."
+            "The artwork image contains a visible frame or border. Keep that frame exactly. Do not add mat board. "
+            "Preserve the existing physical frame geometry, opening, and identity. "
+            "You may change only its physically plausible illumination, highlight, roughness appearance, and contact shadow. "
         )
     else:
         frame_rule = (
-            "No reliable physical frame was detected in the artwork image. "
-            "Do not invent a decorative frame, heavy border, black matte surround, or mat board. "
-            "You may render only subtle natural object thickness, canvas edge, mounting depth, contact shadow, and lighting if visually appropriate. "
-            "Keep the painting core size, crop, content, aspect ratio, and placement fixed."
+            "Do not invent a decorative frame or mat. If the artwork is frameless, retain a subtle plausible canvas/object edge only where supported by the current geometry. "
         )
-    mask_lock_rule = (
-        "HARD EDIT MASK: the provided mask is mandatory. Do not edit pixels outside that mask. "
-        "Do not edit any non-artwork room region, wall, window, floor, door, or architecture. "
-        "Never add duplicate paintings, extra frames, people, labels, hooks, or wall decorations outside the mask. "
-    )
-    size_lock_rule = (
-        "STRICT SIZE LOCK: preserve the painting core image dimensions inside the target polygon. "
-        "Do not shrink, enlarge, recrop, extend, compress, stretch, zoom, or pad the painting core. "
-        "The visible artwork core must keep the same pixel footprint, aspect ratio, and boundary alignment as the hard-paste target. "
-        "Inside the painting core, only low-frequency exposure / brightness / lightness adaptation is allowed; "
-        "do not change high-frequency artwork structure, brush strokes, figures, symbols, layout, subject identity, or small interior shapes. "
-        "INTRINSIC COLOR LOCK: do not recolor the painting, frame, border, mat, liner, or surround. Preserve the intrinsic base color of all artwork components. "
-        "The visible frame or border is also identity-locked: keep its color, thickness, opening, proportions, and geometry unchanged. "
-        "Any frame treatment must stay outside the painting core and must not consume or expand the painted image area. "
-    )
-    conservative_edit_rule = (
-        "CONSERVATIVE EDIT PROFILE: perform the minimum possible edit. "
-        "Prioritize lighting integration over generation. "
-        "Treat the task as photometric compositing, not repainting. "
-        "Only apply low-frequency achromatic light / shadow / brightness modulation derived from the environment. "
-        "Do not directly change intrinsic colors. If unsure, leave the current pixels unchanged. "
-    )
 
     base = (
-        "Task: make the pasted artwork look naturally mounted on the wall while keeping its placement fixed. "
+        "Task: turn the hard-pasted artwork into a convincing physically mounted object using the complete room context. "
         f"{input_contract}"
-        f"The artwork placement is authoritative: {region_text}. "
-        f"{mask_lock_rule}"
-        "Do not move, resize, recrop, rotate, restyle, replace, redraw, or reinterpret the artwork. "
-        "Keep the artwork center, outer bounds, painting core size, scale, aspect ratio, crop, content, and perspective exactly the same as the hard-paste target. "
-        f"{size_lock_rule}"
-        f"{conservative_edit_rule}"
-        "Only blend local lighting over the visible artwork object itself. "
-        "Within the mounted object, any allowed change must be photometric-only, low-frequency, and achromatic with respect to intrinsic color. "
-        "Do not edit non-artwork pixels, wall texture, windows, doors, wall corners, floor, ceiling, architectural lines, lens perspective, or camera. "
-        "Do not remove or alter anything outside the artwork region. "
-        "Do not correct perspective distortion, lens distortion, wall lines, room structure, or camera viewpoint; preserve the original photo perspective exactly. "
-        f"{frame_rule} "
-        "FINAL SIZE LOCK AFTER FRAME RULE: keep the painting core pixel footprint exactly unchanged; do not expand the artwork or any frame-like surround into the editable wall area."
+        f"PROTECTED ARTWORK ANCHOR: {region_text}. "
+        "Immutable geometry: keep the artwork center, four projected corners, outer footprint, scale, aspect ratio, crop, and perspective fixed. "
+        "Immutable identity: keep the painting composition, subjects, symbols, text, and high-frequency structure recognizable and unchanged. "
+        "STRICT SIZE LOCK: Do not change the painting core size. Do not move, resize, rotate, stretch, duplicate, replace, or redesign the artwork. "
+        f"{frame_rule}"
+        "ALLOWED CHANGES: physically plausible low-frequency exposure and color-temperature adaptation on the artwork core; "
+        "frame and visible-side relighting; material highlights and roughness response; narrow edge occlusion; wall bounce; and contact/cast shadow around the mount. "
+        "REQUIRED RESULT: create a visible but restrained contact shadow consistent with the room lights, make frame/side lighting agree with the wall, "
+        "and remove the flat pasted-on appearance. A near-no-op result is not acceptable. "
+        "Preserve room identity, architecture, furniture geometry, camera viewpoint, lens perspective, and existing structural lines. "
+        "Do not redesign the room or introduce new decorations during this render pass. "
+        "Do not correct perspective distortion, lens distortion, wall lines, room structure, or camera viewpoint. "
+        "FINAL SIZE LOCK AFTER FRAME RULE: keep the painting core footprint and projected boundary fixed after all frame and lighting work. "
     )
     metadata = f" Candidate id: {candidate.get('candidate_id')}; wall id: {candidate.get('wall_id')}; risk level: {risk}; flux2_input_mode: {input_mode}."
     if extra_prompt:
@@ -310,10 +279,10 @@ def build_stage_b_prompt(
         return ""
 
     parts = [
-        "Stage B spatial styling edit. HARD CONSTRAINTS:",
-        "1. Do not change the geometry of doors, windows, ceiling, floor, walls, furniture, architectural lines, camera viewpoint, or perspective.",
-        "2. Preserve existing light-source positions, shadow directions, and material structure; any lighting adjustment must be low-frequency and subtle.",
-        "3. Keep every artwork and frame pixel unchanged.",
+        "Stage B full-space styling edit. Use the complete room image as the creative canvas; no spatial edit mask is supplied.",
+        "IMMUTABLE ARTWORK ANCHOR: keep the mounted artwork center, four corners, footprint, scale, perspective, composition, and frame identity fixed. Do not move, replace, duplicate, or repaint it.",
+        "Preserve doors, windows, wall/ceiling/floor geometry, major furniture geometry, architectural lines, camera viewpoint, and perspective.",
+        "Create a clearly visible but coherent styling result. A no-op or near-identical return is not acceptable.",
     ]
     next_number = 4
     if soft_furnishing:
@@ -352,7 +321,7 @@ def build_stage_b_prompt(
         }.get(style, "stylistically neutral")
         palette_text = f"abstracted accent RGB values {accents[:2]} and neutral RGB {neutral}"
         parts.extend([
-            f"{next_number}. Add only {count_text} restrained small accessories on the supplied editable floor/furniture support regions. Keep the artwork as the dominant focal point.",
+            f"{next_number}. Add {count_text} restrained small accessories anywhere in the complete room where a physically valid floor, sofa, chair, shelf, or tabletop support exists. Keep the artwork as the dominant focal point.",
             f"{next_number + 1}. Allowed categories are cushions, a small plant or floral arrangement, a small object, a table runner, or a small rug. Do not add or replace large furniture.",
             f"{next_number + 2}. Use a {style_words} vocabulary and materials such as {material_words}. Coordinate through {palette_text}.",
             f"{next_number + 3}. Do not copy the artwork's image, recognizable pattern, composition, figures, symbols, or color-block layout onto any accessory. Only use abstracted color, texture, shape, and line relationships.",
@@ -375,7 +344,7 @@ def build_stage_b_prompt(
         except (TypeError, ValueError):
             rgb = [58, 62, 71]
         parts.extend([
-            f"{next_number}. Recolor only the wall zone to rgb({rgb[0]}, {rgb[1]}, {rgb[2]}), preserving the original wall's illumination gradients, shadows, and texture instead of applying a flat fill.",
+            f"{next_number}. Recolor only the existing wall surfaces to rgb({rgb[0]}, {rgb[1]}, {rgb[2]}), preserving each wall's illumination gradients, shadows, seams, reflections, and texture instead of applying a flat fill.",
             f"{next_number + 1}. Keep baseboards, corners, switches, outlets, seams, and material grain unchanged. Add no wallpaper pattern, molding, graphic, or wall decoration.",
         ])
         next_number += 2
@@ -384,9 +353,9 @@ def build_stage_b_prompt(
                 f"{next_number}. Keep the new accessories harmonious with rgb({rgb[0]}, {rgb[1]}, {rgb[2]}) without reducing the artwork's visual priority."
             )
     if artwork_analysis.get("has_frame") is True:
-        parts.append("Final artwork lock: preserve the complete visible physical frame, its opening, thickness, color, and all artwork pixels exactly.")
+        parts.append("Final artwork anchor: preserve the complete visible physical frame, opening, thickness geometry, footprint, and artwork identity; do not move or redesign it.")
     else:
-        parts.append("Final artwork lock: preserve the complete artwork footprint and all artwork pixels exactly; do not invent a frame or mat.")
+        parts.append("Final artwork anchor: preserve the complete artwork footprint and identity; do not move it or invent a frame or mat.")
     return "\n".join(parts)
 
 

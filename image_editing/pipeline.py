@@ -44,16 +44,20 @@ def render_hanging(
     output_name: str | None = None,
     metadata: Mapping[str, Any] | None = None,
 ) -> ImageEditResult:
-    """Run final render with an explicit bounded-edit mask.
+    """Run a render edit with either a mask or an explicit full-space mode.
 
-    The production contract is: final rendering may only affect the provided
-    mask region. Providers that support native inpainting may send the mask to
-    the remote model. Providers without a mask field, such as API易 GPT Image 2
-    VIP image-edit, must enforce the same contract locally by crop/composite.
+    Native inpainting providers may receive ``art_mask``.  Full-space providers
+    without a mask field can instead use ``metadata['full_space_edit_mode']``;
+    in that contract the complete room is generated and the caller protects the
+    artwork anchor after generation.  No local crop is implied by this helper.
     """
     mask_meta = {
         "final_edit_mask": str(art_mask) if art_mask else None,
-        "usage": "bounded_final_render_mask_for_provider_and_mask_anchored_qa" if art_mask else "missing_required_final_edit_mask",
+        "usage": (
+            "bounded_final_render_mask_for_provider_and_mask_anchored_qa"
+            if art_mask
+            else "full_space_or_unmasked_render_contract"
+        ),
     }
     refs = list(references or [])
     if artwork_reference is not None:

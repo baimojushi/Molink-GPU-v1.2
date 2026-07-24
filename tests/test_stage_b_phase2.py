@@ -94,9 +94,9 @@ def test_algorithmic_styling_analysis_honors_fixed_wall_tone(tmp_path):
 def test_stage_b_pipeline_calls_zero_or_once_per_asset_for_all_combinations(tmp_path):
     combinations = [
         (False, None, 0, "not_requested"),
-        (True, None, 1, "succeeded"),
-        (False, WALLPAPER, 1, "succeeded"),
-        (True, WALLPAPER, 1, "succeeded"),
+        (True, None, 1, "qa_rejected_fallback_to_plain"),
+        (False, WALLPAPER, 1, "qa_rejected_fallback_to_plain"),
+        (True, WALLPAPER, 1, "qa_rejected_fallback_to_plain"),
     ]
     for index, (soft, wallpaper, calls, status) in enumerate(combinations):
         case_dir = tmp_path / str(index)
@@ -112,6 +112,42 @@ def test_stage_b_pipeline_calls_zero_or_once_per_asset_for_all_combinations(tmp_
         assert aggregate["call_count"] == calls
         assert aggregate["outputs"][0]["styling_status"] == status
         assert (output_dir / "pre_styling_hd" / "wall_a__candidate_1.png").exists()
+
+
+def test_stage_b_full_frame_generation_uses_no_mask_and_restores_only_artwork(tmp_path, monkeypatch):
+    archive, output_dir, _ = _make_stage_a_fixture(tmp_path)
+    captured = {}
+
+    class FullFrameCreativeProvider:
+        def edit(self, request):
+            captured["mask"] = request.mask
+            captured["metadata"] = dict(request.metadata)
+            out = request.output_dir / request.output_name
+            with Image.open(request.image) as source:
+                styled = np.asarray(source.convert("RGB")).copy()
+            # A valid small accessory outside the artwork.
+            styled[65:72, 10:22] = [72, 108, 84]
+            # Simulate the model repainting the artwork; local protection must
+            # restore this without rolling back the rest of the full frame.
+            styled[25:55, 45:75] = [10, 20, 230]
+            Image.fromarray(styled).save(out)
+            return SimpleNamespace(image=out, trace={"synthetic": "full_frame_creative"})
+
+    monkeypatch.setattr(render_api, "build_image_edit_provider", lambda _name: FullFrameCreativeProvider())
+    aggregate = render_api.run_stage_b_pipeline(
+        str(archive),
+        str(output_dir),
+        provider="mock",
+        soft_furnishing_requested=True,
+    )
+    final = np.asarray(Image.open(output_dir / "final_hd" / "wall_a__candidate_1.png").convert("RGB"))
+    assert aggregate["outputs"][0]["styling_status"] == "succeeded"
+    assert captured["mask"] is None
+    assert captured["metadata"]["full_space_edit_mode"] == "styling_artwork_protected"
+    assert captured["metadata"]["stage_b_generation_mask_used"] is False
+    assert np.all(final[25:55, 45:75] == [220, 215, 205])
+    assert np.all(final[65:72, 10:22] == [72, 108, 84])
+    assert aggregate["outputs"][0]["qa"]["generation_mask_used"] is False
 
 
 def test_stage_b_failure_keeps_stage_a_and_marks_fallback(tmp_path, monkeypatch):

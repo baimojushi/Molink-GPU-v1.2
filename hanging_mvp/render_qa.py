@@ -44,6 +44,104 @@ def _chroma_delta(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return np.mean(np.abs(cb - ca), axis=2)
 
 
+def enforce_protected_artwork_composite(
+    *,
+    authoritative_image_path: Path,
+    provider_render_path: Path,
+    protect_mask_path: Path,
+    output_path: Path,
+    feather_inside_px: float = 0.0,
+) -> dict[str, Any]:
+    """Keep the provider's full-frame generation while protecting the artwork.
+
+    This is deliberately the inverse of the legacy identity-locked shadow
+    compositor.  The provider render is the authoritative full-frame result;
+    only the supplied artwork protection region is restored from the Stage A
+    image.  No crop is made, no outside-edit pixels are rolled back, and no
+    provider contribution is reduced to a synthetic shadow.
+
+    ``feather_inside_px`` creates an *inside-only* transition.  Pixels outside
+    the protection mask always remain provider pixels, so there is no pasted
+    crop rectangle or halo.  With a value of zero the protected region is
+    restored exactly, which is appropriate for Stage B styling.  A small value
+    (normally 1-2 px) is useful for Stage A render recovery because it keeps the
+    artwork interior fixed while letting the generated edge lighting meet the
+    generated wall naturally.
+    """
+    with Image.open(authoritative_image_path) as source_image:
+        source = np.asarray(source_image.convert("RGB"), dtype=np.uint8)
+    with Image.open(provider_render_path) as render_image:
+        render = np.asarray(render_image.convert("RGB"), dtype=np.uint8)
+
+    height, width = source.shape[:2]
+    if render.shape[:2] != (height, width):
+        render = cv2.resize(render, (width, height), interpolation=cv2.INTER_LANCZOS4)
+    protect = _load_mask(Path(protect_mask_path), (height, width))
+    if not np.any(protect):
+        raise ValueError("protected-artwork composite requires a non-empty protection mask")
+
+    feather = max(0.0, float(feather_inside_px))
+    if feather <= 0.0:
+        alpha = protect.astype(np.float32)
+    else:
+        # OpenCV's distance transform is positive only inside the mask.  The
+        # first inside pixel receives a partial source weight and the weight
+        # reaches 1.0 deeper inside, avoiding a hard generated/original seam.
+        distance = cv2.distanceTransform(protect.astype(np.uint8), cv2.DIST_L2, 5)
+        alpha = np.clip(distance / max(feather, 1e-6), 0.0, 1.0).astype(np.float32)
+        alpha[~protect] = 0.0
+
+    alpha_rgb = alpha[..., None]
+    composed = np.clip(
+        render.astype(np.float32) * (1.0 - alpha_rgb)
+        + source.astype(np.float32) * alpha_rgb,
+        0.0,
+        255.0,
+    ).astype(np.uint8)
+
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    tmp_output = output.with_name(f".{output.name}.tmp")
+    try:
+        with tmp_output.open("wb") as handle:
+            Image.fromarray(composed, mode="RGB").save(handle, format="PNG")
+            handle.flush()
+            os.fsync(handle.fileno())
+        tmp_output.replace(output)
+    except Exception:
+        tmp_output.unlink(missing_ok=True)
+        raise
+
+    exact_lock = protect & (alpha >= 0.999)
+    transition = protect & (alpha > 0.001) & (alpha < 0.999)
+    outside = ~protect
+    provider_delta = np.mean(
+        np.abs(render.astype(np.int16) - source.astype(np.int16)), axis=2
+    )
+    return {
+        "enabled": True,
+        "mode": "full_frame_provider_with_protected_artwork_v1",
+        "output_path": str(output),
+        "authoritative_image_path": str(authoritative_image_path),
+        "provider_render_path": str(provider_render_path),
+        "protect_mask_path": str(protect_mask_path),
+        "full_frame_provider_preserved": True,
+        "local_crop_used": False,
+        "outside_protect_restored": False,
+        "provider_pixels_outside_protect_preserved": True,
+        "protected_area_px": int(np.count_nonzero(protect)),
+        "exact_lock_area_px": int(np.count_nonzero(exact_lock)),
+        "transition_area_px": int(np.count_nonzero(transition)),
+        "feather_inside_px": float(feather),
+        "provider_changed_ratio_outside_protect": (
+            float(np.mean(provider_delta[outside] > 1.0)) if np.any(outside) else 0.0
+        ),
+        "provider_mean_delta_outside_protect": (
+            float(np.mean(provider_delta[outside])) if np.any(outside) else 0.0
+        ),
+    }
+
+
 def enforce_identity_locked_shadow_composite(
     *,
     hard_paste_path: Path,
@@ -182,7 +280,9 @@ def enforce_identity_locked_shadow_composite(
             borderType=cv2.BORDER_REPLICATE,
         )
         projected_alpha = np.clip(projected_alpha, 0.0, 1.0)
-        projected_region = edit & ~mount
+        yy, xx = np.indices(mount.shape)
+        directional_half_space = (yy >= int(ys.min())) & (xx >= int(xs.min()))
+        projected_region = edit & ~protected & directional_half_space
         fallback_darkening = abs(float(fallback_shadow_max_darkening_delta))
         shadow_field = np.where(projected_region, -fallback_darkening * projected_alpha, 0.0).astype(np.float32)
         shadow_source = "mask_projected_contact_shadow"

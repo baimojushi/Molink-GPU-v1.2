@@ -22,7 +22,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from hanging_mvp.hardpaste import load_rgba, save_rgb, warp_artwork_mount_to_geometry, warp_artwork_to_quad
-from hanging_mvp.render_qa import enforce_identity_locked_shadow_composite, evaluate_mask_anchored_render_qa
+from hanging_mvp.render_qa import (
+    enforce_protected_artwork_composite,
+    evaluate_mask_anchored_render_qa,
+)
 from image_editing.pipeline import cleanup_objects, render_hanging
 from image_editing.provider_registry import build_image_edit_provider
 from image_editing.providers import ImageEditResult
@@ -1663,7 +1666,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                     )
                 prompt_for_render = "\n\n".join(part for part in prompt_parts if part)
 
-                full_space_texture_render, wall_texture_gate_trace = _render_full_space_texture_gate(
+                _full_space_texture_render, wall_texture_gate_trace = _render_full_space_texture_gate(
                     image_path=hard_paste_after_erase,
                     edit_mask_path=render_mask,
                     object_mask_path=render_object_mask,
@@ -1675,11 +1678,17 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                     edge_p95_threshold=max(0.1, _env_float("MOLINK_RENDER_TEXTURE_GATE_EDGE_P95", 5.5)),
                     chroma_std_threshold=max(0.1, _env_float("MOLINK_RENDER_TEXTURE_GATE_CHROMA_STD", 2.6)),
                 )
-                full_space_coordinate_prompt_requested = bool(using_apiyi_gpt_image2_vip and full_space_texture_render)
+                # APIYI has no native mask field.  Always keep the complete room
+                # as model input; crop/composite creates visible seams on textured
+                # walls and removes the long-range lighting context needed for a
+                # convincing mount.  The numeric polygon is now a protected
+                # artwork anchor, not a remote edit mask.
+                full_space_coordinate_prompt_requested = bool(using_apiyi_gpt_image2_vip)
                 if full_space_coordinate_prompt_requested:
-                    render_input_semantics["final_render_scope"] = "full_space_image_with_remote_pixel_coordinate_matrix_prompt"
-                    render_input_semantics["mask_crop_disabled_reason"] = "candidate_wall_texture_not_pure_color"
+                    render_input_semantics["final_render_scope"] = "full_space_image_with_protected_artwork_anchor"
+                    render_input_semantics["mask_crop_disabled_reason"] = "no_local_crop_product_policy"
                     render_input_semantics["coordinate_space"] = "exact_compressed_api_upload_pixels"
+                    render_input_semantics["coordinate_semantics"] = "protected_artwork_anchor_not_edit_region"
                 else:
                     render_input_semantics["final_render_scope"] = "local_mask_crop_composite_or_native_mask"
 
@@ -1691,7 +1700,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                     provider,
                     render_primary,
                     prompt_for_render,
-                    art_mask=render_mask,
+                    art_mask=None if using_apiyi_gpt_image2_vip else render_mask,
                     references=render_refs,
                     output_dir=item_dir,
                     output_name="03_flux2_render.png" if sequence_mode.startswith("v7") else "02_flux2_render.png",
@@ -1708,7 +1717,9 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                         "render_light_hint": render_light_hint_trace,
                         "wall_texture_gate": wall_texture_gate_trace,
                         "full_space_coordinate_prompt_requested": full_space_coordinate_prompt_requested,
-                        "full_space_render_reason": "candidate_wall_texture_not_pure_color" if full_space_coordinate_prompt_requested else None,
+                        "full_space_edit_mode": "render_artwork_anchor" if full_space_coordinate_prompt_requested else None,
+                        "full_space_render_reason": "no_local_crop_product_policy" if full_space_coordinate_prompt_requested else None,
+                        "protected_artwork_mask_path": str(qa_art_mask),
                         "remote_pixel_coordinate_matrix_supported": bool(using_apiyi_gpt_image2_vip),
                         "remote_pixel_coordinate_matrix_sent": bool(full_space_coordinate_prompt_requested),
                         "front_polygon_px": render_front_polygon_px,
@@ -1742,33 +1753,22 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                 )
                 post_render_identity_lock_trace: dict[str, Any] = {
                     "enabled": False,
-                    "reason": "provider_output_did_not_use_unmasked_full_space_mode",
+                    "reason": "provider_output_did_not_use_full_space_artwork_anchor_mode",
                 }
                 raw_render_trace = dict(render_result.trace or {})
                 if using_apiyi_gpt_image2_vip and bool(
-                    raw_render_trace.get("full_space_coordinate_prompt")
+                    raw_render_trace.get("full_space_artwork_anchor")
+                    or raw_render_trace.get("full_space_coordinate_prompt")
                     or raw_render_trace.get("remote_coordinate_matrix_sent")
                 ):
-                    identity_locked_path = item_dir / "03_flux2_render.identity_locked.png"
+                    identity_locked_path = item_dir / "03_flux2_render.artwork_protected.png"
                     try:
-                        post_render_identity_lock_trace = enforce_identity_locked_shadow_composite(
-                            hard_paste_path=hard_paste_after_erase,
+                        post_render_identity_lock_trace = enforce_protected_artwork_composite(
+                            authoritative_image_path=hard_paste_after_erase,
                             provider_render_path=render_result.image,
-                            artwork_front_mask_path=qa_art_mask,
-                            mount_mask_path=render_object_mask,
-                            edit_mask_path=render_mask,
+                            protect_mask_path=qa_art_mask,
                             output_path=identity_locked_path,
-                            protect_dilate_px=max(0, int(os.getenv("MOLINK_FULLSPACE_IDENTITY_PROTECT_DILATE_PX", "4"))),
-                            shadow_min_darkening_delta=float(args.qa_shadow_min_darkening_delta),
-                            shadow_max_brighten_delta=float(args.qa_shadow_max_brighten_delta),
-                            shadow_max_chroma_delta=float(args.qa_shadow_max_chroma_delta),
-                            shadow_max_darkening_delta=max(0.0, _env_float("MOLINK_FULLSPACE_SHADOW_MAX_DARKENING", 24.0)),
-                            shadow_blur_px=max(0.0, _env_float("MOLINK_FULLSPACE_SHADOW_BLUR_PX", 1.25)),
-                            shadow_min_component_area_px=max(1, int(os.getenv("MOLINK_FULLSPACE_SHADOW_MIN_COMPONENT_AREA_PX", "4"))),
-                            provider_identity_trusted=bool(raw_provider_render_size_qa.get("passed")),
-                            fallback_shadow_max_darkening_delta=max(
-                                0.0, _env_float("MOLINK_FULLSPACE_FALLBACK_SHADOW_MAX_DARKENING", 14.0)
-                            ),
+                            feather_inside_px=max(0.0, _env_float("MOLINK_FULLSPACE_ARTWORK_PROTECT_FEATHER_PX", 2.0)),
                         )
                         render_result = ImageEditResult(
                             image=identity_locked_path,
@@ -1776,10 +1776,12 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                                 **raw_render_trace,
                                 "provider_output_path": str(raw_render_trace.get("output_path") or render_result.image),
                                 "output_path": str(identity_locked_path),
-                                "output_scope": "full_space_identity_locked_shadow_composite",
-                                "mask_enforced_locally": True,
-                                "mask_local_composite": True,
+                                "output_scope": "full_space_provider_with_protected_artwork",
+                                "mask_enforced_locally": False,
+                                "mask_local_composite": False,
                                 "identity_lock_enforced_locally": True,
+                                "artwork_anchor_enforced_locally": True,
+                                "provider_full_frame_preserved_outside_artwork": True,
                                 "post_render_identity_lock": post_render_identity_lock_trace,
                             },
                         )
@@ -1791,12 +1793,12 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                         }
                         aggregate["warnings"].append({
                             "asset_id": asset_id,
-                            "mode": "full_space_identity_lock_failed",
-                            "message": f"Full-space identity lock failed for {asset_id}: {identity_lock_exc}",
+                            "mode": "full_space_artwork_protection_failed",
+                            "message": f"Full-space artwork protection failed for {asset_id}: {identity_lock_exc}",
                         })
 
-                # Delivery QA runs on the deterministic local composite. The raw
-                # provider QA remains visible in trace so repainting is auditable.
+                # Delivery QA runs after protecting only the artwork footprint.
+                # Every provider pixel outside that footprint remains intact.
                 primary_render_size_qa = _run_mask_anchored_qa(
                     args,
                     hard_paste=hard_paste_after_erase,
@@ -1805,7 +1807,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                 )
                 post_render_photometric_lock_trace = {
                     "enabled": False,
-                    "reason": "superseded_by_identity_locked_shadow_composite",
+                    "reason": "superseded_by_full_frame_provider_with_protected_artwork",
                     "identity_lock_enabled": bool(post_render_identity_lock_trace.get("enabled")),
                     "qa_result": primary_render_size_qa,
                 }
@@ -1888,13 +1890,14 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                 if not bool(primary_render_size_qa.get("passed")) and flux2_input_mode == "dual_erased_room_plus_target":
                     fallback_prompt = (
                         f"{prompt} SAFE FALLBACK: use this single cleaned hard-paste input as the only authoritative canvas. "
-                        "Do not use any reference image. Preserve the exact painting-core pixel footprint, preserve the visible frame/border appearance, and allow only low-frequency achromatic light/shadow and brightness adaptation. Do not change intrinsic colors and do not edit any non-artwork region."
+                        "Do not use any reference image. Keep the artwork anchor fixed, but still produce visible frame/side relighting, contact shadow, wall bounce, and edge integration. "
+                        "Preserve room identity and geometry; do not return a near-no-op result."
                     )
                     fallback_result = render_hanging(
                         provider,
                         hard_paste_after_erase,
                         fallback_prompt,
-                        art_mask=render_mask,
+                        art_mask=None if using_apiyi_gpt_image2_vip else render_mask,
                         references=[],
                         output_dir=item_dir,
                         output_name="03c_flux2_render_single_fallback.png",
@@ -1905,9 +1908,17 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                             **_render_edit_runtime_metadata(args),
                             "sequence_mode": sequence_mode,
                             "flux2_input_mode": "single_after_erase_hardpaste_size_qa_fallback",
+                            "full_space_edit_mode": "render_artwork_anchor" if using_apiyi_gpt_image2_vip else None,
+                            "full_space_coordinate_prompt_requested": bool(using_apiyi_gpt_image2_vip),
+                            "full_space_render_reason": "no_local_crop_size_qa_fallback" if using_apiyi_gpt_image2_vip else None,
+                            "protected_artwork_mask_path": str(qa_art_mask),
+                            "front_polygon_px": render_front_polygon_px,
+                            "front_bbox_px": render_front_bbox_px,
+                            "mount_bbox_px": render_mount_bbox_px,
+                            "target_quad_original": quad,
                             "art_region_mask_usage": "front_region_mask_for_core_qa; selected_render_mask_sent_to_provider",
-                        "render_mask_path": str(render_mask),
-                        "render_mask_source": render_mask_source,
+                            "render_mask_path": str(render_mask),
+                            "render_mask_source": render_mask_source,
                             "qa_art_mask_path": str(qa_art_mask),
                             "qa_art_mask_source": qa_art_mask_source,
                             "art_region_mask_path": str(art_region_mask),
@@ -1918,6 +1929,28 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                             "size_qa_fallback": True,
                         },
                     )
+                    if using_apiyi_gpt_image2_vip:
+                        fallback_raw_trace = dict(fallback_result.trace or {})
+                        fallback_protected_path = item_dir / "03c_flux2_render_single_fallback.artwork_protected.png"
+                        fallback_protect_trace = enforce_protected_artwork_composite(
+                            authoritative_image_path=hard_paste_after_erase,
+                            provider_render_path=fallback_result.image,
+                            protect_mask_path=qa_art_mask,
+                            output_path=fallback_protected_path,
+                            feather_inside_px=max(0.0, _env_float("MOLINK_FULLSPACE_ARTWORK_PROTECT_FEATHER_PX", 2.0)),
+                        )
+                        fallback_result = ImageEditResult(
+                            image=fallback_protected_path,
+                            trace={
+                                **fallback_raw_trace,
+                                "provider_output_path": str(fallback_raw_trace.get("output_path") or fallback_result.image),
+                                "output_path": str(fallback_protected_path),
+                                "output_scope": "full_space_provider_with_protected_artwork",
+                                "artwork_anchor_enforced_locally": True,
+                                "provider_full_frame_preserved_outside_artwork": True,
+                                "post_render_identity_lock": fallback_protect_trace,
+                            },
+                        )
                     fallback_size_qa = _run_mask_anchored_qa(
                         args,
                         hard_paste=hard_paste_after_erase,
@@ -1962,7 +1995,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                         "gpt_image2_vip_mask_photometric_composite"
                         if bool(selected_trace.get("mask_photometric_composite"))
                         else (
-                            "gpt_image2_vip_full_space_identity_locked_shadow_composite"
+                                "gpt_image2_vip_full_space_provider_with_protected_artwork"
                             if selected_identity_lock
                             else (
                                 "gpt_image2_vip_full_space_coordinate_prompt"
