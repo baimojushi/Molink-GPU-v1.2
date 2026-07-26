@@ -766,6 +766,9 @@ class Worker:
                     "stage_a_base_source": job.get("stage_a_base_source"),
                     "status": "failed", "exit_code": "FAILED_SUPPLEMENT_RENDER",
                     "candidates": [], "not_recommended": [], "partial_review_images": [],
+                    "failure_context": result_builder.build_failure_context(
+                        "FAILED_SUPPLEMENT_RENDER", "failed", stage="supplement_render"
+                    ),
                     "error": str(exc), "metrics": {"render_provider": render_provider},
                 }
                 await self.send_result(job, payload_for_diag)
@@ -940,6 +943,9 @@ class Worker:
                     "job_id": job["job_id"], "order_id": job.get("order_id"),
                     "status": "failed", "exit_code": "FAILED_WORKER_EXCEPTION",
                     "candidates": [], "not_recommended": [], "partial_review_images": [],
+                    "failure_context": result_builder.build_failure_context(
+                        "FAILED_WORKER_EXCEPTION", "failed", stage="worker"
+                    ),
                     "error": str(exc), "metrics": {},
                 }
                 await self.send_result(job, payload_for_diag)

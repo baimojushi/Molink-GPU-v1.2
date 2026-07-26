@@ -87,6 +87,75 @@ def _status_from_exit(
     return "failed"
 
 
+def build_failure_context(
+    exit_code: str | None,
+    status: str | None,
+    *,
+    not_recommended: List[Dict[str, Any]] | None = None,
+    stage: str | None = None,
+) -> Dict[str, Any] | None:
+    """Return a public-safe failure classification for the business client.
+
+    The business side still owns final copy.  This payload only identifies the
+    failure family and never exposes stack traces, provider bodies, or secrets.
+    """
+    code = str(exit_code or "").strip().upper()
+    normalized_status = str(status or "").strip().lower()
+    joined = f"{normalized_status} {code}"
+    reason_code = code or "FAILED_UNKNOWN"
+
+    if normalized_status in {"succeeded", "succeeded_partial"}:
+        return None
+    if "MISSING_ARTWORK_DIMENSIONS" in code or "ARTWORK_SIZE" in code:
+        return {
+            "category": "service", "source": "artwork_dimensions",
+            "reason_code": reason_code,
+            "public_reason": "缺少作品的实际尺寸，无法可靠计算挂画比例与高度。",
+            "public_suggestion": "请补充包含画框外沿的作品宽度和高度后重新提交。",
+        }
+    if normalized_status == "no_safe_wall" or "ALL_REJECTED" in code or "NO_SAFE_WALL" in code:
+        first_reason = ""
+        for item in not_recommended or []:
+            reasons = item.get("reasons") if isinstance(item, dict) else None
+            if isinstance(reasons, list) and reasons:
+                first_reason = str(reasons[0] or "").strip()
+                if first_reason:
+                    break
+        return {
+            "category": "service", "source": "safe_area",
+            "reason_code": reason_code,
+            "public_reason": first_reason or "当前照片中没有同时满足留白、比例与安全间距的挂画位置。",
+            "public_suggestion": "建议尝试更小尺寸的作品、其他墙面，或补拍包含更多完整墙面的照片。",
+        }
+    if any(token in code for token in ("CLEARANCE", "CURTAIN", "WINDOW", "DOOR", "FURNITURE", "STRUCTURAL")):
+        return {
+            "category": "service", "source": "structural_clearance",
+            "reason_code": reason_code,
+            "public_reason": "候选位置与门窗、窗帘、家具或墙面边界的安全间距不足。",
+            "public_suggestion": "建议选择更小作品、换一面墙，或补拍更宽的空间照片。",
+        }
+    if any(token in code for token in ("GEOMETRY", "METRIC", "DEPTH", "NORMAL", "PLANE", "PERSPECTIVE", "SEMANTIC", "PROJECTION")):
+        return {
+            "category": "service", "source": "geometry",
+            "reason_code": reason_code,
+            "public_reason": "照片中的透视、深度或墙面结构证据不足，无法安全确定挂画位置。",
+            "public_suggestion": "请从更正面的角度重拍，保持镜头水平，并避免超广角、强反光和严重遮挡。",
+        }
+    if normalized_status == "render_review" or any(token in joined for token in ("PARTIAL_NO_FLUX", "PARTIAL_HARDPASTE", "RENDER_REVIEW", "QA_")):
+        return {
+            "category": "service", "source": "render_quality",
+            "reason_code": reason_code,
+            "public_reason": "方案计算已完成，但生成结果未达到光影、作品一致性或空间可信度要求。",
+            "public_suggestion": "系统没有交付不可靠的图片；建议更换更清晰、视角更正的照片后重试。",
+        }
+    return {
+        "category": "program", "source": str(stage or "worker"),
+        "reason_code": reason_code,
+        "public_reason": "系统在处理过程中遇到异常，未能自动完成本次呈现。",
+        "public_suggestion": "问题已经记录，将转入人工处理。",
+    }
+
+
 def _index_partials(partial_images: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     """按标准 asset_id 索引 partial_review 图。
 
@@ -257,6 +326,11 @@ def build(
         deliverable_count=final_url_count,
         promoted_partial_count=promoted_partial_count,
     )
+    failure_context = build_failure_context(
+        exit_code, status,
+        not_recommended=client_result.get("not_recommended", []),
+        stage="render",
+    )
 
     return {
         "job_id": job.get("job_id"),
@@ -267,6 +341,7 @@ def build(
         "not_recommended": client_result.get("not_recommended", []),
         "partial_review_images": partial_images,
         "error": None,
+        "failure_context": failure_context,
         "metrics": {
             "render_provider": _actual_render_provider(render_aggregate, job),
             "actual_render_provider": _actual_render_provider(render_aggregate, job),
@@ -288,6 +363,11 @@ def build(
 def build_failed_payload(job: Dict[str, Any], client_result: Dict[str, Any]) -> Dict[str, Any]:
     exit_code = client_result.get("exit_code", "FAILED_UNKNOWN")
     status = "no_safe_wall" if exit_code == "PARTIAL_ALL_REJECTED_WITH_REASONS" else "failed"
+    failure_context = build_failure_context(
+        exit_code, status,
+        not_recommended=client_result.get("not_recommended", []),
+        stage="hanging",
+    )
     return {
         "job_id": job.get("job_id"),
         "order_id": job.get("order_id"),
@@ -297,6 +377,7 @@ def build_failed_payload(job: Dict[str, Any], client_result: Dict[str, Any]) -> 
         "not_recommended": client_result.get("not_recommended", []),
         "partial_review_images": [],
         "error": None,
+        "failure_context": failure_context,
         "metrics": {
             "render_provider": _job_requested_render_provider(job),
             "actual_render_provider": _job_requested_render_provider(job),

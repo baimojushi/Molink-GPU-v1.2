@@ -381,6 +381,15 @@ _status_one() {
 }
 
 do_start() {
+  # 确保 cron 守护进程运行（Metric3D 看门狗依赖）
+  if ! pgrep -x cron >/dev/null 2>&1; then
+    if command -v cron >/dev/null 2>&1; then
+      /usr/sbin/cron
+      echo "[start:cron] cron daemon started"
+    fi
+  else
+    echo "[skip:cron] already running"
+  fi
   for spec in "${SERVICE_SPECS[@]}"; do
     IFS='|' read -r name _port _health _scripts _kind <<< "$spec"
     if _service_enabled "$name"; then
