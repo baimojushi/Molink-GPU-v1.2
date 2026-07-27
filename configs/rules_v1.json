@@ -461,6 +461,18 @@
       "value": 0.75,
       "notes": "After enforcing gravity orthogonality, at least this fraction of the raw line-consensus cohort must remain inliers; the old 6.77-degree residual regression fails this gate."
     },
+    "horizontal_structure_conflict_min_independent_bands": {
+      "value": 3,
+      "notes": "V26: a numerically coherent Hough family may vote in a depth/direct-normal yaw conflict only when it contains at least three independent physical seam/panel bands. Multiple fragments of one glossy edge count as one band."
+    },
+    "horizontal_structure_conflict_max_dominant_band_length_fraction": {
+      "value": 0.72,
+      "notes": "V26: reject conflict voting when one physical line band contributes more than this fraction of inlier length; this catches one reflected top edge split into many Hough fragments."
+    },
+    "horizontal_structure_near_wall_vp_margin_ratio": {
+      "value": 0.25,
+      "notes": "V26: a finite horizontal VP closer than this fraction of the wall bbox size is diagnostic-only unless the structural family is independently supported. Near-wall convergence is commonly marble veining or one broad glossy boundary."
+    },
     "normal_conflict_structure_support_margin_deg": {
       "value": 3.0,
       "notes": "During depth/direct-normal conflict arbitration, wall structure must support one heading by at least this angular margin over the other."

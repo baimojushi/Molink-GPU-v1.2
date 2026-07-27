@@ -1,0 +1,100 @@
+{
+  "version": "v26",
+  "job_id": "job_42b054d1-d7fc-4aca-b106-f68454fc5b9d",
+  "diagnostic_source": "job_42b054d1_diagnostic.zip",
+  "source_limitations": [
+    "diagnostic package contains JSON summaries and overlays but not raw Metric3D depth/normal/intrinsics arrays",
+    "therefore the complete GPU job was not replayed locally"
+  ],
+  "corrected_interpretation": {
+    "segmented_depth_positive_and_negative_yaws_are_one_axis": true,
+    "orientation_period_deg": 180.0,
+    "segmented_cluster_size": 16,
+    "segmented_cluster_coverage": 1.0,
+    "segmented_cluster_p90_deg": 4.04,
+    "note": "~147 deg and ~-30 deg differ by normal sign and represent the same physical wall axis, not orthogonal planes"
+  },
+  "recorded_structure_evidence": {
+    "numerically_reliable_before_v26": true,
+    "raw_line_count": 109,
+    "unique_line_count": 7,
+    "inlier_count": 5,
+    "observed_vanishing_homogeneous_px": [
+      688.2994829093597,
+      490.6666711559739,
+      0.9762307405471802
+    ],
+    "observed_vanishing_point_px": [
+      705.0581940531455,
+      502.6134199389724
+    ],
+    "predicted_vanishing_homogeneous_px": [
+      1190.1003468529102,
+      455.684958978193,
+      0.8341054320335388
+    ],
+    "predicted_vanishing_point_px": [
+      1426.7984611387317,
+      546.3157791302697
+    ],
+    "wall_bbox_xyxy_processed": [
+      398,
+      477,
+      653,
+      730
+    ],
+    "vanishing_point_distance_to_wall_bbox_px": 52.058194053145485,
+    "vanishing_point_distance_to_wall_bbox_ratio": 0.20335232052009955,
+    "independent_physical_band_count": 2,
+    "dominant_band_length_fraction": 0.8600206435831357,
+    "bands": [
+      {
+        "center_offset_px": -100.41165155673403,
+        "line_indices": [
+          4,
+          1,
+          0,
+          2
+        ],
+        "line_count": 4,
+        "length_px": 425.7069461974587
+      },
+      {
+        "center_offset_px": 1.3631729859803632,
+        "line_indices": [
+          3
+        ],
+        "line_count": 1,
+        "length_px": 69.28924880528002
+      }
+    ]
+  },
+  "v26_authority_decision": {
+    "voting_authoritative": false,
+    "failed_gates": [
+      "vanishing_point_too_close_to_wall_body",
+      "insufficient_independent_structural_bands",
+      "single_physical_band_dominates_line_vote"
+    ],
+    "thresholds": {
+      "near_wall_vp_margin_ratio": 0.25,
+      "min_independent_bands": 3,
+      "max_dominant_band_length_fraction": 0.72
+    }
+  },
+  "depth_hierarchy_inputs_from_diagnostic": {
+    "whole_depth_inlier_ratio": 0.98792,
+    "whole_depth_vertical_tilt_deg": 5.507085197558673,
+    "segmented_depth_confident": true,
+    "segmented_cluster_coverage": 1.0,
+    "segmented_cluster_p90_deg": 4.04,
+    "segmented_cluster_cells": 16
+  },
+  "tests": {
+    "focused": "22 passed",
+    "baseline_full": "172 passed, 3 failed",
+    "modified_full": "175 passed, 3 failed",
+    "new_regressions": 3,
+    "new_failures": 0
+  }
+}

@@ -1336,6 +1336,97 @@ def _local_image_direction(vanishing_h: np.ndarray, point_xy: np.ndarray) -> Opt
     return direction / length
 
 
+def _dehomogenize_image_point(point_h: np.ndarray) -> Optional[np.ndarray]:
+    """Return finite pixel coordinates for a homogeneous image point."""
+    value = np.asarray(point_h, dtype=np.float64).reshape(3)
+    if not np.isfinite(value).all() or abs(float(value[2])) < 1e-8:
+        return None
+    point = value[:2] / float(value[2])
+    return point if np.isfinite(point).all() else None
+
+
+def _point_to_bbox_distance_px(point_xy: np.ndarray, bbox_xyxy: Tuple[int, int, int, int]) -> float:
+    """Euclidean distance from a 2-D point to a closed axis-aligned box."""
+    x0, y0, x1, y1 = [float(value) for value in bbox_xyxy]
+    x, y = [float(value) for value in np.asarray(point_xy, dtype=np.float64).reshape(2)]
+    dx = max(x0 - x, 0.0, x - x1)
+    dy = max(y0 - y, 0.0, y - y1)
+    return float(math.hypot(dx, dy))
+
+
+def _parallel_line_support_band_stats(
+    lines: List[Dict[str, Any]],
+    inlier_mask: np.ndarray,
+    center_xy: np.ndarray,
+    cross_axis: np.ndarray,
+    *,
+    box_height_px: float,
+) -> Dict[str, Any]:
+    """Measure how many independent physical line bands support a VP.
+
+    Hough commonly splits one glossy panel edge into several overlapping
+    fragments.  Counting those fragments as independent votes lets one top
+    reflection plus one marble vein form a numerically tight but physically
+    false vanishing family.  Intersect each inlier line with a common image
+    cross-axis through the wall centre, then cluster the resulting offsets.
+    Fragments of the same physical seam collapse into one support band.
+    """
+    center = np.asarray(center_xy, dtype=np.float64).reshape(2)
+    cross = normalize(np.asarray(cross_axis, dtype=np.float64).reshape(2))
+    flags = np.asarray(inlier_mask, dtype=bool).reshape(-1)
+    samples: List[Dict[str, Any]] = []
+    for index, item in enumerate(lines):
+        if index >= len(flags) or not bool(flags[index]):
+            continue
+        line = np.asarray(item["line"], dtype=np.float64).reshape(3)
+        denominator = float(np.dot(line[:2], cross))
+        if abs(denominator) >= 1e-8:
+            offset = -float(np.dot(line[:2], center) + line[2]) / denominator
+        else:
+            midpoint = np.asarray(item["midpoint"], dtype=np.float64).reshape(2)
+            offset = float(np.dot(midpoint - center, cross))
+        samples.append({
+            "line_index": int(index),
+            "offset_px": float(offset),
+            "length_px": float(item.get("length_px", 0.0)),
+        })
+
+    tolerance = max(6.0, 0.07 * float(max(box_height_px, 1.0)))
+    bands: List[Dict[str, Any]] = []
+    for sample in sorted(samples, key=lambda value: value["offset_px"]):
+        if not bands or abs(float(sample["offset_px"]) - float(bands[-1]["center_offset_px"])) > tolerance:
+            bands.append({
+                "center_offset_px": float(sample["offset_px"]),
+                "line_indices": [int(sample["line_index"])],
+                "line_count": 1,
+                "length_px": float(sample["length_px"]),
+            })
+            continue
+        band = bands[-1]
+        old_length = float(band["length_px"])
+        new_length = old_length + float(sample["length_px"])
+        if new_length > EPS:
+            band["center_offset_px"] = (
+                float(band["center_offset_px"]) * old_length
+                + float(sample["offset_px"]) * float(sample["length_px"])
+            ) / new_length
+        band["length_px"] = new_length
+        band["line_count"] = int(band["line_count"]) + 1
+        band["line_indices"].append(int(sample["line_index"]))
+
+    total_length = float(sum(float(band["length_px"]) for band in bands))
+    dominant_fraction = (
+        max(float(band["length_px"]) for band in bands) / max(total_length, EPS)
+        if bands else 1.0
+    )
+    return {
+        "independent_band_count": int(len(bands)),
+        "band_merge_tolerance_px": float(tolerance),
+        "dominant_band_length_fraction": float(dominant_fraction),
+        "bands": bands,
+    }
+
+
 def estimate_wall_horizontal_structure_direction(
     image_rgb: Optional[np.ndarray],
     wall_mask: Optional[np.ndarray],
@@ -1354,6 +1445,9 @@ def estimate_wall_horizontal_structure_direction(
     min_inlier_wall_length_fraction: float = 0.85,
     min_inlier_wall_line_fraction: float = 0.75,
     min_post_projection_inlier_retention: float = 0.75,
+    conflict_min_independent_bands: int = 3,
+    conflict_max_dominant_band_length_fraction: float = 0.72,
+    near_wall_vp_margin_ratio: float = 0.25,
 ) -> Tuple[Optional[np.ndarray], Dict[str, Any]]:
     """Estimate a calibrated wall-horizontal vanishing direction.
 
@@ -1363,7 +1457,10 @@ def estimate_wall_horizontal_structure_direction(
     converted to its calibrated interpretation-plane normal ``K.T @ l``.  The
     common null-space direction is the 3-D vanishing direction, including the
     valid point-at-infinity case.  This avoids unstable finite vanishing-point
-    division for nearly frontal walls.
+    division for nearly frontal walls.  Numerical VP reliability and voting
+    authority are deliberately separate: a glossy edge split into several
+    Hough fragments can be geometrically coherent without representing three
+    independent structural bands.
     """
     if image_rgb is None or wall_mask is None:
         return None, {"reliable": False, "reason": "horizontal_structure_inputs_missing"}
@@ -1648,11 +1745,26 @@ def estimate_wall_horizontal_structure_direction(
     # this evidence when fewer than six lines survived, so eight marble lines
     # became a false strong vote.  Count cannot rescue physically invalid VP
     # geometry: an inside-wall VP never receives directional voting rights.
-    vp_inside_wall_body = False
-    if abs(float(observed_vp[2])) > 1e-8:
-        vp_px = observed_vp[:2] / float(observed_vp[2])
-        if (x0 <= vp_px[0] <= x1 and y0 <= vp_px[1] <= y1):
-            vp_inside_wall_body = True
+    observed_vp_px = _dehomogenize_image_point(observed_vp)
+    predicted_vp_px = _dehomogenize_image_point(expected_vp)
+    vp_inside_wall_body = bool(
+        observed_vp_px is not None
+        and x0 <= float(observed_vp_px[0]) <= x1
+        and y0 <= float(observed_vp_px[1]) <= y1
+    )
+    vp_distance_to_wall_px = (
+        _point_to_bbox_distance_px(observed_vp_px, (x0, y0, x1, y1))
+        if observed_vp_px is not None else None
+    )
+    wall_reference_size_px = float(max(box_w, box_h))
+    vp_distance_to_wall_ratio = (
+        float(vp_distance_to_wall_px) / max(wall_reference_size_px, 1.0)
+        if vp_distance_to_wall_px is not None else None
+    )
+    vp_near_wall_body = bool(
+        vp_distance_to_wall_ratio is not None
+        and vp_distance_to_wall_ratio <= float(near_wall_vp_margin_ratio)
+    )
     predicted_local = _local_image_direction(expected_vp, center_xy)
     observed_local = _local_image_direction(observed_vp, center_xy)
     local_image_angle = _undirected_angle_deg(predicted_local, observed_local) if predicted_local is not None and observed_local is not None else None
@@ -1670,8 +1782,32 @@ def estimate_wall_horizontal_structure_direction(
         and inlier_wall_length_fraction >= float(min_inlier_wall_length_fraction)
         and inlier_wall_line_fraction >= float(min_inlier_wall_line_fraction)
     )
-    correction_confident = bool(
+    support_bands = _parallel_line_support_band_stats(
+        unique,
+        final_inliers,
+        center_xy,
+        cross_axis,
+        box_height_px=float(box_h),
+    )
+    independent_band_count = int(support_bands["independent_band_count"])
+    dominant_band_fraction = float(support_bands["dominant_band_length_fraction"])
+    voting_authoritative = bool(
         reliable
+        and not vp_near_wall_body
+        and independent_band_count >= int(conflict_min_independent_bands)
+        and dominant_band_fraction <= float(conflict_max_dominant_band_length_fraction)
+    )
+    authority_failed_gates: List[str] = []
+    if not reliable:
+        authority_failed_gates.append("horizontal_structure_numerical_quality")
+    if vp_near_wall_body:
+        authority_failed_gates.append("vanishing_point_too_close_to_wall_body")
+    if independent_band_count < int(conflict_min_independent_bands):
+        authority_failed_gates.append("insufficient_independent_structural_bands")
+    if dominant_band_fraction > float(conflict_max_dominant_band_length_fraction):
+        authority_failed_gates.append("single_physical_band_dominates_line_vote")
+    correction_confident = bool(
+        voting_authoritative
         and inlier_count >= int(correction_min_inliers)
         and p90 <= float(correction_max_p90_deg)
         and offset_span >= max(35.0, 0.12 * box_h)
@@ -1690,11 +1826,24 @@ def estimate_wall_horizontal_structure_direction(
         })
     debug = {
         "reliable": reliable,
+        "voting_authoritative": voting_authoritative,
+        "voting_authority_policy": "independent_physical_line_bands_and_vp_separation_v26",
+        "voting_authority_failed_gates": authority_failed_gates,
         "correction_confident": correction_confident,
         "method": "calibrated_image_line_nullspace_ransac_with_gravity_projection",
         "evidence_policy": "authoritative_wall_mask_interior_only_no_ceiling_or_adjacent_trim",
         "vanishing_point_inside_wall_body": vp_inside_wall_body,
+        "vanishing_point_near_wall_body": vp_near_wall_body,
         "vp_penalty_applied": vp_penalty,
+        "near_wall_vp_margin_ratio": float(near_wall_vp_margin_ratio),
+        "vanishing_point_distance_to_wall_bbox_px": vp_distance_to_wall_px,
+        "vanishing_point_distance_to_wall_bbox_ratio": vp_distance_to_wall_ratio,
+        "observed_vanishing_point_px": (
+            [float(x) for x in observed_vp_px] if observed_vp_px is not None else None
+        ),
+        "predicted_vanishing_point_px": (
+            [float(x) for x in predicted_vp_px] if predicted_vp_px is not None else None
+        ),
         "raw_line_count": int(len(detected)),
         "filtered_line_count": int(len(candidates)),
         "unique_line_count": int(len(unique)),
@@ -1708,6 +1857,12 @@ def estimate_wall_horizontal_structure_direction(
         "min_inlier_wall_line_fraction": float(min_inlier_wall_line_fraction),
         "line_offset_span_px": offset_span,
         "min_line_offset_span_px": min_offset_span,
+        "independent_line_band_count": independent_band_count,
+        "min_independent_line_bands_for_conflict_vote": int(conflict_min_independent_bands),
+        "dominant_line_band_length_fraction": dominant_band_fraction,
+        "max_dominant_line_band_length_fraction": float(conflict_max_dominant_band_length_fraction),
+        "line_support_bands": support_bands["bands"],
+        "line_band_merge_tolerance_px": support_bands["band_merge_tolerance_px"],
         "raw_direction_residual_p50_deg": raw_p50,
         "raw_direction_residual_p90_deg": raw_p90,
         "residual_p50_deg": p50,
@@ -1738,6 +1893,8 @@ def estimate_wall_horizontal_structure_direction(
             if vp_inside_wall_body
             else "horizontal_structure_quality_gate_failed"
         )
+    elif not voting_authoritative:
+        debug["authority_reason"] = "numerically_coherent_but_not_independent_structural_evidence"
     return horizontal_direction.astype(np.float32), debug
 
 
@@ -1772,6 +1929,9 @@ def resolve_wall_projection_plane(
     horizontal_structure_min_inlier_wall_length_fraction: float = 0.85,
     horizontal_structure_min_inlier_wall_line_fraction: float = 0.75,
     horizontal_structure_min_post_projection_inlier_retention: float = 0.75,
+    horizontal_structure_conflict_min_independent_bands: int = 3,
+    horizontal_structure_conflict_max_dominant_band_length_fraction: float = 0.72,
+    horizontal_structure_near_wall_vp_margin_ratio: float = 0.25,
     normal_conflict_structure_support_margin_deg: float = 3.0,
     controlled_structural_quorum_enabled: bool = False,
     controlled_structural_quorum_angle_threshold_deg: float = 6.0,
@@ -1950,8 +2110,21 @@ def resolve_wall_projection_plane(
             min_inlier_wall_length_fraction=float(horizontal_structure_min_inlier_wall_length_fraction),
             min_inlier_wall_line_fraction=float(horizontal_structure_min_inlier_wall_line_fraction),
             min_post_projection_inlier_retention=float(horizontal_structure_min_post_projection_inlier_retention),
+            conflict_min_independent_bands=int(horizontal_structure_conflict_min_independent_bands),
+            conflict_max_dominant_band_length_fraction=float(
+                horizontal_structure_conflict_max_dominant_band_length_fraction
+            ),
+            near_wall_vp_margin_ratio=float(horizontal_structure_near_wall_vp_margin_ratio),
         )
     structure_reliable = bool(structure_direction is not None and structure_debug.get("reliable"))
+    # A line family can be numerically coherent yet still be one glossy edge
+    # split into fragments plus a marble vein.  Such evidence remains useful for
+    # diagnostics, but it cannot arbitrate a 20-degree sensor yaw conflict or
+    # veto an independently agreeing whole+segmented depth hierarchy.
+    structure_voting_authoritative = bool(
+        structure_reliable and structure_debug.get("voting_authoritative", True)
+    )
+    structure_debug["resolver_voting_authoritative"] = structure_voting_authoritative
     normal_yaw_conflict = bool(
         not bool(localized_depth_consensus_authorized)
         and yaw_disagreement is not None
@@ -1966,7 +2139,7 @@ def resolve_wall_projection_plane(
     # clearly support exactly one heading.  Visual review is not an arbiter for
     # unresolved metric geometry.
     if normal_yaw_conflict:
-        if not structure_reliable or direct_u is None:
+        if not structure_voting_authoritative or direct_u is None:
             # V19 controlled recovery: a stable direct-normal field remains a
             # material-quality gate, but its disputed yaw is not a vote.  A
             # high-inlier whole-wall depth plane may recover only when a
@@ -2090,7 +2263,7 @@ def resolve_wall_projection_plane(
                         float(direct_vertical_n[2]), float(direct_vertical_n[0])
                     ))
                 structure_yaw_val = None
-                if structure_direction is not None and structure_reliable:
+                if structure_direction is not None and structure_voting_authoritative:
                     structure_normal = normalize(np.cross(structure_direction, g_hat))
                     if float(np.dot(structure_normal, depth_vertical_n)) < 0.0:
                         structure_normal = -structure_normal
@@ -2103,7 +2276,7 @@ def resolve_wall_projection_plane(
                     direct_normal_yaw=direct_normal_yaw_val,
                     direct_normal_confident=bool(normal_debug.get("reliable")),
                     structure_yaw=structure_yaw_val,
-                    structure_confident=structure_reliable,
+                    structure_confident=structure_voting_authoritative,
                     angle_threshold_deg=float(controlled_structural_quorum_angle_threshold_deg),
                 )
                 csq_debug_final = quorum_debug
@@ -2219,7 +2392,7 @@ def resolve_wall_projection_plane(
             chosen_n = corrected_n
             source = "wall_internal_structure_quorum_supports_direct_normal_heading"
             structure_debug["action"] = "structure_heading_wins_three_evidence_quorum"
-    elif structure_reliable:
+    elif structure_voting_authoritative:
         structure_angle = _undirected_angle_deg(structure_direction, expected_u)
         structure_debug["angle_threshold_deg"] = float(horizontal_structure_angle_threshold_deg)
         structure_debug["max_correction_deg"] = float(horizontal_structure_max_correction_deg)

@@ -2550,6 +2550,17 @@ async def analyze_hanging_mvp(
                 horizontal_structure_min_post_projection_inlier_retention=float(rule_value(
                     rules, ["wall_plane_fit", "horizontal_structure_min_post_projection_inlier_retention"], 0.75
                 )),
+                horizontal_structure_conflict_min_independent_bands=int(rule_value(
+                    rules, ["wall_plane_fit", "horizontal_structure_conflict_min_independent_bands"], 3
+                )),
+                horizontal_structure_conflict_max_dominant_band_length_fraction=float(rule_value(
+                    rules,
+                    ["wall_plane_fit", "horizontal_structure_conflict_max_dominant_band_length_fraction"],
+                    0.72,
+                )),
+                horizontal_structure_near_wall_vp_margin_ratio=float(rule_value(
+                    rules, ["wall_plane_fit", "horizontal_structure_near_wall_vp_margin_ratio"], 0.25
+                )),
                 normal_conflict_structure_support_margin_deg=float(rule_value(
                     rules, ["wall_plane_fit", "normal_conflict_structure_support_margin_deg"], 3.0
                 )),
