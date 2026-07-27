@@ -17,6 +17,7 @@ import numpy as np
 from .metric_meta import read_sizes_from_metric3d_zip
 from .polygonize import bbox_to_polygon, scale_bbox, scale_polygon
 from .vlm_client import parse_with_vlm, parse_artwork_frame_with_vlm
+from .spatial_vlm_client import parse_with_spatial_vlm
 from .debug_assets import draw_semantic_wall_debug, png_bytes
 from .sam_refiner import coerce_optional_bool, get_sam_runtime_status, mask_to_polygon, refine_objects_with_sam
 
@@ -2722,7 +2723,7 @@ async def parse_semantics_mvp(
 
         # VLM sees the original image. Some providers still return normalized
         # visual coordinates, so normalize before any SAM or Metric3D alignment.
-        raw = parse_with_vlm(image_bytes, scene_profile, vlm_mode, original_w, original_h)
+        raw = parse_with_spatial_vlm(image_bytes, scene_profile, vlm_mode, original_w, original_h)
         vlm_response_binding = _build_vlm_response_binding(raw, image_bytes)
         raw_is_mock, raw_mock_reason = _semantic_payload_uses_mock({
             "warning": raw.get("warning") if isinstance(raw, dict) else None,
