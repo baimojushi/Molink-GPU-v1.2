@@ -1089,6 +1089,13 @@ def _infer_vlm_bbox_coordinate_space(objects, original_w, original_h, vlm_image_
     if not boxes:
         return 'original_pixels', debug
 
+    # Trust spatial expert VLM declared coordinate space
+    if vlm_image_meta and isinstance(vlm_image_meta, dict) and vlm_image_meta.get("_spatial_vlm_expert"):
+        reported = vlm_image_meta.get("provider_reported_coordinate_space") or ""
+        if reported in ("pixels", "original_pixels"):
+            debug["reason"] = "spatial_vlm_expert_trusted"
+            debug["provider_reported_coordinate_space"] = reported
+            return "original_pixels", debug
     xs = [v for x1, _, x2, _ in boxes for v in (x1, x2)]
     ys = [v for _, y1, _, y2 in boxes for v in (y1, y2)]
     max_x = float(max(xs))

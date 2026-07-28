@@ -63,6 +63,7 @@ def call_spatial_vlm(
     text = data["choices"][0]["message"]["content"]
     result = extract_json(text)
     if isinstance(result, dict):
+        meta["_spatial_vlm_expert"] = True
         result["_vlm_image_meta"] = meta
         result["_vlm_call_audit"] = {
             "provider": "spatial_vlm",
