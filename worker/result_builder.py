@@ -93,6 +93,7 @@ def build_failure_context(
     *,
     not_recommended: List[Dict[str, Any]] | None = None,
     stage: str | None = None,
+    failure_detail: Dict[str, Any] | None = None,
 ) -> Dict[str, Any] | None:
     """Return a public-safe failure classification for the business client.
 
@@ -106,6 +107,25 @@ def build_failure_context(
 
     if normalized_status in {"succeeded", "succeeded_partial"}:
         return None
+    detail = failure_detail if isinstance(failure_detail, dict) else {}
+    if detail.get("category") == "program":
+        return {
+            "category": "program",
+            "source": str(detail.get("source") or stage or "worker"),
+            "reason_code": str(detail.get("exit_code") or reason_code),
+            "public_reason": str(detail.get("public_reason") or "系统在处理过程中遇到异常，未能自动完成本次呈现。"),
+            "public_suggestion": str(
+                detail.get("public_suggestion")
+                or "问题已经记录，我们将在今日内进行人工处理；完成后会通过消息通知，您也可以在历史记录中查看结果。"
+            ),
+        }
+    if any(token in code for token in ("HARDPASTE_REVIEW", "VLM_REVIEW", "HARDPASTE_EXPORT")):
+        return {
+            "category": "program", "source": "hardpaste_review",
+            "reason_code": reason_code,
+            "public_reason": "挂画位置已经完成计算，但视觉复核服务暂时未能完成。",
+            "public_suggestion": "问题已经记录，我们将在今日内进行人工处理；完成后会通过消息通知，您也可以在历史记录中查看结果。",
+        }
     if "MISSING_ARTWORK_DIMENSIONS" in code or "ARTWORK_SIZE" in code:
         return {
             "category": "service", "source": "artwork_dimensions",
@@ -152,7 +172,7 @@ def build_failure_context(
         "category": "program", "source": str(stage or "worker"),
         "reason_code": reason_code,
         "public_reason": "系统在处理过程中遇到异常，未能自动完成本次呈现。",
-        "public_suggestion": "问题已经记录，将转入人工处理。",
+        "public_suggestion": "问题已经记录，我们将在今日内进行人工处理；完成后会通过消息通知，您也可以在历史记录中查看结果。",
     }
 
 
@@ -330,6 +350,7 @@ def build(
         exit_code, status,
         not_recommended=client_result.get("not_recommended", []),
         stage="render",
+        failure_detail=client_result.get("exit_review_failure"),
     )
 
     return {
@@ -367,6 +388,7 @@ def build_failed_payload(job: Dict[str, Any], client_result: Dict[str, Any]) -> 
         exit_code, status,
         not_recommended=client_result.get("not_recommended", []),
         stage="hanging",
+        failure_detail=client_result.get("exit_review_failure"),
     )
     return {
         "job_id": job.get("job_id"),
