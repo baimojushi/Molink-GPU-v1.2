@@ -25,7 +25,7 @@ API_KEY = os.getenv("API_KEY", "")
 ALLOW_UNAUTH_LOCAL = os.getenv("ALLOW_UNAUTH_LOCAL", "").strip().lower() in {"1", "true", "yes", "on"}
 
 app = FastAPI(title="semantic-mvp-bbox-api")
-SEMANTIC_PIPELINE_BUILD_ID = "2026-07-21-semantic-provenance-and-local-wall-guard-v18"
+SEMANTIC_PIPELINE_BUILD_ID = "2026-07-29-qwen3-relative-grid-bbox-mapping-v27"
 
 
 def _allow_mock_semantics() -> bool:
@@ -1089,28 +1089,6 @@ def _infer_vlm_bbox_coordinate_space(objects, original_w, original_h, vlm_image_
     if not boxes:
         return 'original_pixels', debug
 
-    # Trust spatial expert VLM declared coordinate space.
-    # IMPORTANT: the VLM sees the resized sent image, not the original image.
-    # If sent_size differs from original_size, the VLM's pixel coordinates
-    # are in sent-image space and must be scaled back to original pixels.
-    if vlm_image_meta and isinstance(vlm_image_meta, dict) and vlm_image_meta.get("_spatial_vlm_expert"):
-        reported = vlm_image_meta.get("provider_reported_coordinate_space") or ""
-        if reported in ("pixels", "original_pixels"):
-            reported_px = vlm_image_meta.get("provider_reported_image_size_px")
-            if (isinstance(reported_px, (list, tuple))
-                    and len(reported_px) >= 2
-                    and int(reported_px[0]) > 0 and int(reported_px[1]) > 0
-                    and (int(reported_px[0]) != int(original_w) or int(reported_px[1]) != int(original_h))):
-                # VLM saw a resized image (sent_size != original_size);
-                # VLM's pixel coordinates are in sent-image space.
-                debug["reason"] = "spatial_vlm_expert_trusted_sent_image_pixels"
-                debug["provider_reported_coordinate_space"] = reported
-                debug["provider_reported_image_size_px"] = list(reported_px)
-                debug["sent_size"] = list(reported_px)
-                return "sent_image_pixels", debug
-            debug["reason"] = "spatial_vlm_expert_trusted"
-            debug["provider_reported_coordinate_space"] = reported
-            return "original_pixels", debug
     xs = [v for x1, _, x2, _ in boxes for v in (x1, x2)]
     ys = [v for _, y1, _, y2 in boxes for v in (y1, y2)]
     max_x = float(max(xs))
@@ -1118,7 +1096,7 @@ def _infer_vlm_bbox_coordinate_space(objects, original_w, original_h, vlm_image_
     min_x = float(min(xs))
     min_y = float(min(ys))
     max_coord = max(max_x, max_y)
-    vlm_image_meta = vlm_image_meta or {}
+    vlm_image_meta = dict(vlm_image_meta or {})
     sent_size = vlm_image_meta.get("sent_size") if isinstance(vlm_image_meta, dict) else None
     try:
         sent_w = int(sent_size[0]) if isinstance(sent_size, (list, tuple)) and len(sent_size) >= 2 else int(original_w)
@@ -1127,6 +1105,159 @@ def _infer_vlm_bbox_coordinate_space(objects, original_w, original_h, vlm_image_
         sent_w, sent_h = int(original_w), int(original_h)
     sent_w = max(1, sent_w)
     sent_h = max(1, sent_h)
+
+    # Model-family coordinate contracts outrank provider self-report.  Qwen3-VL
+    # grounding uses a relative 1000x1000 grid.  Several OpenAI-compatible
+    # gateways nevertheless echo ``coordinate_space=pixels`` or the uploaded
+    # bitmap size.  Trusting that declaration is the exact failure mode that
+    # compresses every box into the upper-left of the image.
+    coordinate_hint = str(vlm_image_meta.get("bbox_coordinate_hint") or "").strip().lower()
+    if coordinate_hint == "normalized_0_1000":
+        reported_size = vlm_image_meta.get("provider_reported_image_size_px")
+        try:
+            reported_w = int(reported_size[0]) if isinstance(reported_size, (list, tuple)) and len(reported_size) >= 2 else 0
+            reported_h = int(reported_size[1]) if isinstance(reported_size, (list, tuple)) and len(reported_size) >= 2 else 0
+        except Exception:
+            reported_w = reported_h = 0
+
+        def _grid_axis_contract(values, sent_extent, original_extent, reported_extent):
+            boundary_extents = []
+            for extent in (sent_extent, original_extent, reported_extent):
+                extent = float(extent or 0)
+                if extent > 1024.0 and all(abs(extent - prior) > 2.0 for prior in boundary_extents):
+                    boundary_extents.append(extent)
+            grid_values = 0
+            boundary_values = []
+            invalid_values = []
+            for value in values:
+                value = float(value)
+                if -20.0 <= value <= 1024.0:
+                    grid_values += 1
+                    continue
+                matched = None
+                for extent in boundary_extents:
+                    tolerance = max(3.0, extent * 0.008)
+                    if abs(value - extent) <= tolerance:
+                        matched = extent
+                        break
+                if matched is None:
+                    invalid_values.append(value)
+                else:
+                    boundary_values.append({"value": value, "matched_extent": float(matched)})
+            minimum_grid_values = max(4, int(np.ceil(len(values) * 0.55)))
+            return {
+                "accepted": not invalid_values and grid_values >= minimum_grid_values,
+                "grid_value_count": int(grid_values),
+                "minimum_grid_value_count": int(minimum_grid_values),
+                "boundary_values": boundary_values,
+                "invalid_values": invalid_values,
+                "boundary_extents": boundary_extents,
+            }
+
+        x_contract = _grid_axis_contract(xs, sent_w, original_w, reported_w)
+        y_contract = _grid_axis_contract(ys, sent_h, original_h, reported_h)
+        qwen_contract_debug = {
+            "hint": coordinate_hint,
+            "provider_model": vlm_image_meta.get("provider_model"),
+            "request_sent_size": [int(sent_w), int(sent_h)],
+            "provider_reported_image_size_px": [reported_w, reported_h] if reported_w > 0 and reported_h > 0 else None,
+            "x": x_contract,
+            "y": y_contract,
+            "policy": "model_family_relative_grid_with_optional_exact_canvas_edge_sentinels_v2",
+        }
+        debug["model_coordinate_contract"] = qwen_contract_debug
+        if x_contract["accepted"] and y_contract["accepted"]:
+            has_boundary_sentinels = bool(x_contract["boundary_values"] or y_contract["boundary_values"])
+            selected_space = (
+                "normalized_0_1000_with_canvas_boundary_sentinels"
+                if has_boundary_sentinels else "normalized_0_1000"
+            )
+            debug.update({
+                "source_coordinate_space": selected_space,
+                "reason": "qwen3_model_family_relative_1000_grid_contract",
+                "raw_min_x": min_x,
+                "raw_max_x": max_x,
+                "raw_min_y": min_y,
+                "raw_max_y": max_y,
+                "original_size": [int(original_w), int(original_h)],
+                "sent_size": [int(sent_w), int(sent_h)],
+                "coordinate_canvas_size": [1000, 1000],
+                "coordinate_canvas_source": "qwen3_model_family_contract",
+                "scale_x_to_original": float(original_w) / 1000.0,
+                "scale_y_to_original": float(original_h) / 1000.0,
+            })
+            return selected_space, debug
+        debug.update({
+            "model_coordinate_contract_rejected": True,
+            "source_coordinate_space": None,
+            "reason": "qwen3_relative_grid_contract_violated_fail_closed",
+            "raw_min_x": min_x,
+            "raw_max_x": max_x,
+            "raw_min_y": min_y,
+            "raw_max_y": max_y,
+            "original_size": [int(original_w), int(original_h)],
+            "sent_size": [int(sent_w), int(sent_h)],
+            "scale_x_to_original": None,
+            "scale_y_to_original": None,
+        })
+        return None, debug
+
+    # A spatial VLM may legitimately return absolute pixels on an internal
+    # canvas.  Accept that only when the raw boxes fit the declared canvas, the
+    # canvas preserves aspect ratio, and at least one non-boundary coordinate
+    # proves the response is not merely a 0..1000 grid with copied edge values.
+    if vlm_image_meta.get("_spatial_vlm_expert"):
+        reported = str(vlm_image_meta.get("provider_reported_coordinate_space") or "").strip().lower()
+        reported_px = vlm_image_meta.get("provider_reported_image_size_px")
+        try:
+            reported_w = int(reported_px[0]) if isinstance(reported_px, (list, tuple)) and len(reported_px) >= 2 else 0
+            reported_h = int(reported_px[1]) if isinstance(reported_px, (list, tuple)) and len(reported_px) >= 2 else 0
+        except Exception:
+            reported_w = reported_h = 0
+        if reported in ("pixels", "original_pixels") and reported_w > 0 and reported_h > 0:
+            tol_x = max(3.0, reported_w * 0.008)
+            tol_y = max(3.0, reported_h * 0.008)
+            fits_reported = bool(
+                min_x >= -tol_x and min_y >= -tol_y
+                and max_x <= reported_w + tol_x and max_y <= reported_h + tol_y
+            )
+            aspect_original = float(original_w) / max(1.0, float(original_h))
+            aspect_reported = float(reported_w) / max(1.0, float(reported_h))
+            aspect_matches = abs(aspect_original - aspect_reported) <= max(0.03, aspect_original * 0.025)
+            internal_x = [v for v in xs if abs(float(v) - reported_w) > tol_x]
+            internal_y = [v for v in ys if abs(float(v) - reported_h) > tol_y]
+            proves_absolute_pixels = bool(
+                reported_w <= 1120 or reported_h <= 1120
+                or max(internal_x or [0.0]) > 1024.0
+                or max(internal_y or [0.0]) > 1024.0
+            )
+            debug["provider_pixel_canvas_validation"] = {
+                "reported_coordinate_space": reported,
+                "reported_image_size_px": [reported_w, reported_h],
+                "fits_reported_canvas": fits_reported,
+                "aspect_matches_input": aspect_matches,
+                "non_boundary_values_prove_absolute_pixels": proves_absolute_pixels,
+            }
+            if fits_reported and aspect_matches and proves_absolute_pixels:
+                if reported_w == int(original_w) and reported_h == int(original_h):
+                    debug.update({
+                        "reason": "spatial_vlm_validated_original_image_pixels",
+                        "provider_reported_coordinate_space": reported,
+                        "coordinate_canvas_size": [reported_w, reported_h],
+                        "coordinate_canvas_source": "provider_reported_image_size_px",
+                    })
+                    return "original_pixels", debug
+                debug.update({
+                    "reason": "spatial_vlm_validated_provider_canvas_pixels",
+                    "provider_reported_coordinate_space": reported,
+                    "provider_reported_image_size_px": [reported_w, reported_h],
+                    "sent_size": [int(sent_w), int(sent_h)],
+                    "coordinate_canvas_size": [reported_w, reported_h],
+                    "coordinate_canvas_source": "provider_reported_image_size_px",
+                    "scale_x_to_original": float(original_w) / float(reported_w),
+                    "scale_y_to_original": float(original_h) / float(reported_h),
+                })
+                return "sent_image_pixels", debug
 
     debug.update({
         'raw_min_x': min_x,
@@ -1480,6 +1611,38 @@ def _normalize_vlm_bbox_to_original_pixels(bbox, original_w, original_h, coordin
         box = [x1 * float(original_w), y1 * float(original_h), x2 * float(original_w), y2 * float(original_h)]
     elif coordinate_space == 'normalized_0_1000':
         box = [x1 / 1000.0 * float(original_w), y1 / 1000.0 * float(original_h), x2 / 1000.0 * float(original_w), y2 / 1000.0 * float(original_h)]
+    elif coordinate_space == 'normalized_0_1000_with_canvas_boundary_sentinels':
+        vlm_image_meta = dict(vlm_image_meta or {})
+        sent_size = vlm_image_meta.get("sent_size")
+        reported_size = vlm_image_meta.get("provider_reported_image_size_px")
+        try:
+            sent_w = float(sent_size[0]) if isinstance(sent_size, (list, tuple)) and len(sent_size) >= 2 else 0.0
+            sent_h = float(sent_size[1]) if isinstance(sent_size, (list, tuple)) and len(sent_size) >= 2 else 0.0
+        except Exception:
+            sent_w = sent_h = 0.0
+        try:
+            reported_w = float(reported_size[0]) if isinstance(reported_size, (list, tuple)) and len(reported_size) >= 2 else 0.0
+            reported_h = float(reported_size[1]) if isinstance(reported_size, (list, tuple)) and len(reported_size) >= 2 else 0.0
+        except Exception:
+            reported_w = reported_h = 0.0
+
+        def _grid_or_any_canvas_boundary(value, output_extent, candidate_extents):
+            value = float(value)
+            for extent in candidate_extents:
+                extent = float(extent or 0.0)
+                if extent <= 1024.0:
+                    continue
+                tolerance = max(3.0, extent * 0.008)
+                if abs(value - extent) <= tolerance:
+                    return float(output_extent)
+            return value / 1000.0 * float(output_extent)
+
+        box = [
+            _grid_or_any_canvas_boundary(x1, original_w, (sent_w, reported_w, original_w)),
+            _grid_or_any_canvas_boundary(y1, original_h, (sent_h, reported_h, original_h)),
+            _grid_or_any_canvas_boundary(x2, original_w, (sent_w, reported_w, original_w)),
+            _grid_or_any_canvas_boundary(y2, original_h, (sent_h, reported_h, original_h)),
+        ]
     elif coordinate_space == 'normalized_0_1000_with_original_boundary_sentinels':
         def _grid_or_boundary(value, extent):
             extent = float(extent)
@@ -1512,21 +1675,35 @@ def _normalize_vlm_bbox_to_original_pixels(bbox, original_w, original_h, coordin
             return float(value) / 1000.0 * float(original_h)
         box = [x1, _y_grid_or_boundary(y1), x2, _y_grid_or_boundary(y2)]
     elif coordinate_space == 'sent_image_pixels':
-        vlm_image_meta = vlm_image_meta or {}
-        sent_size = vlm_image_meta.get("sent_size") if isinstance(vlm_image_meta, dict) else None
-        try:
-            sent_w = float(sent_size[0]) if isinstance(sent_size, (list, tuple)) and len(sent_size) >= 2 else float(original_w)
-            sent_h = float(sent_size[1]) if isinstance(sent_size, (list, tuple)) and len(sent_size) >= 2 else float(original_h)
-        except Exception:
-            sent_w, sent_h = float(original_w), float(original_h)
-        print(f"[NORM-DEBUG] sent_image_pixels: bbox_raw=[{x1},{y1},{x2},{y2}] orig=[{original_w},{original_h}] sent=[{sent_w},{sent_h}] has_meta={bool(vlm_image_meta)} sent_size_in_meta={sent_size}", flush=True)
+        vlm_image_meta = dict(vlm_image_meta or {})
+        coordinate_canvas_size = vlm_image_meta.get("coordinate_canvas_size")
+        provider_reported_size = vlm_image_meta.get("provider_reported_image_size_px")
+        sent_size = vlm_image_meta.get("sent_size")
+
+        def _valid_canvas(value):
+            return isinstance(value, (list, tuple)) and len(value) >= 2 and float(value[0]) > 0 and float(value[1]) > 0
+
+        # The selected coordinate canvas is distinct from the uploaded request
+        # bitmap.  Qwen-like gateways may internally resize or report a model
+        # canvas; using request ``sent_size`` here caused the 0.75 upper-left
+        # shrink even after inference had identified the provider canvas.
+        if _valid_canvas(coordinate_canvas_size):
+            canvas = coordinate_canvas_size
+        elif (str(vlm_image_meta.get("provider_reported_coordinate_space") or "").lower() in {"pixels", "original_pixels"}
+              and _valid_canvas(provider_reported_size)):
+            canvas = provider_reported_size
+        elif _valid_canvas(sent_size):
+            canvas = sent_size
+        else:
+            canvas = [original_w, original_h]
+        sent_w = float(canvas[0])
+        sent_h = float(canvas[1])
         box = [
             x1 / max(1.0, sent_w) * float(original_w),
             y1 / max(1.0, sent_h) * float(original_h),
             x2 / max(1.0, sent_w) * float(original_w),
             y2 / max(1.0, sent_h) * float(original_h),
         ]
-        print(f"[NORM-DEBUG] result box=[{box[0]:.2f},{box[1]:.2f},{box[2]:.2f},{box[3]:.2f}]", flush=True)
     else:
         box = [x1, y1, x2, y2]
     return _clip_box_xyxy(box, original_w, original_h)
@@ -2622,6 +2799,8 @@ def _build_vlm_objects_in_original_space(raw, original_w, original_h, bbox_coord
             "raw_role": obj.get("role"),
             "bbox_xyxy_vlm_raw": bbox_raw,
             "bbox_coordinate_space": bbox_coordinate_space,
+            "bbox_coordinate_canvas_size": (vlm_image_meta or {}).get("coordinate_canvas_size"),
+            "bbox_coordinate_canvas_source": (vlm_image_meta or {}).get("coordinate_canvas_source"),
             "bbox_xyxy_original": bbox_orig,
             "bbox_xyxy_processed": bbox_orig,
             "polygon": poly_orig,
@@ -2731,6 +2910,29 @@ async def parse_semantics_mvp(
                     "repair_hint": "configure a real VLM provider and rerun from the first semantic call; do not reuse this seed or its geometry proposals",
                 },
             )
+
+        # Coordinate fixes cannot repair a seed whose boxes were already
+        # normalized with the old pixel contract.  Reject stale Qwen3 seeds so
+        # the alignment call cannot silently preserve the upper-left drift.
+        seed_transform = seed_payload.get("image_transform_debug") if isinstance(seed_payload.get("image_transform_debug"), dict) else {}
+        seed_vlm_meta = seed_transform.get("vlm_image_meta") if isinstance(seed_transform.get("vlm_image_meta"), dict) else {}
+        seed_binding = seed_payload.get("vlm_response_binding") if isinstance(seed_payload.get("vlm_response_binding"), dict) else {}
+        seed_model = str(seed_vlm_meta.get("provider_model") or seed_binding.get("model") or "").strip().lower()
+        seed_is_qwen3 = bool(re.search(r"(?:^|[/_.-])qwen[-_ ]?3(?:[./_-]|$)", seed_model) or "qwen3." in seed_model)
+        seed_contract = str(seed_vlm_meta.get("bbox_coordinate_contract_version") or "").strip()
+        seed_coord_source = str((seed_payload.get("vlm_bbox_coordinate_debug") or {}).get("source_coordinate_space") or "").strip()
+        if seed_is_qwen3 and (seed_contract != "model_family_grounding_contract_v2" or not seed_coord_source.startswith("normalized_0_1000")):
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "stale_qwen3_bbox_coordinate_seed",
+                    "reason": "seed_was_created_before_qwen3_relative_grid_mapping_v27",
+                    "provider_model": seed_model,
+                    "seed_coordinate_space": seed_coord_source or None,
+                    "seed_coordinate_contract_version": seed_contract or None,
+                    "repair_hint": "discard semantic_seed_json and rerun the first semantic VLM call from the original room image",
+                },
+            )
         out = _remap_objects_to_processed_space(seed_objects, processed_w, processed_h, sx, sy)
         bbox_coordinate_debug = seed_payload.get("vlm_bbox_coordinate_debug") or bbox_coordinate_debug
         sam_debug = seed_payload.get("sam_debug") or sam_debug
@@ -2798,22 +3000,30 @@ async def parse_semantics_mvp(
         # the production drift happened despite a nominal "pixels" response.
         coordinate_inference_meta["provider_reported_coordinate_space"] = raw.get("coordinate_space")
         coordinate_inference_meta["provider_reported_image_size_px"] = raw.get("image_size_px")
+        audit = raw.get("_vlm_call_audit") if isinstance(raw.get("_vlm_call_audit"), dict) else {}
+        coordinate_inference_meta["provider_model"] = coordinate_inference_meta.get("provider_model") or audit.get("model")
         bbox_coordinate_space, bbox_coordinate_debug = _infer_vlm_bbox_coordinate_space(
             objs, original_w, original_h, coordinate_inference_meta, image_np=image_np
         )
         dynamic_axis_debug = bbox_coordinate_debug.get("dynamic_axis_coordinate_inference") or {}
-        if dynamic_axis_debug.get("fail_closed"):
+        if bbox_coordinate_space is None or dynamic_axis_debug.get("fail_closed"):
             raise HTTPException(
                 status_code=422,
                 detail={
                     "error": "ambiguous_vlm_bbox_coordinate_space",
-                    "reason": dynamic_axis_debug.get("fail_closed_reason"),
+                    "reason": dynamic_axis_debug.get("fail_closed_reason") or bbox_coordinate_debug.get("reason"),
                     "coordinate_debug": bbox_coordinate_debug,
                     "vlm_response_binding": vlm_response_binding,
                     "repair_hint": "do not lower coordinate margins or reuse cached boxes; inspect the same-call raw snapshot and rerun only after the provider returns one auditable canvas",
                 },
             )
-        original_space_objects = _build_vlm_objects_in_original_space(raw, original_w, original_h, bbox_coordinate_space, vlm_image_meta)
+        selected_canvas = bbox_coordinate_debug.get("coordinate_canvas_size")
+        if isinstance(selected_canvas, (list, tuple)) and len(selected_canvas) >= 2:
+            coordinate_inference_meta["coordinate_canvas_size"] = [int(selected_canvas[0]), int(selected_canvas[1])]
+            coordinate_inference_meta["coordinate_canvas_source"] = bbox_coordinate_debug.get("coordinate_canvas_source")
+        original_space_objects = _build_vlm_objects_in_original_space(
+            raw, original_w, original_h, bbox_coordinate_space, coordinate_inference_meta
+        )
 
         # Optional SAM now runs only in original-image space. This lets callers
         # start /parse_semantics_mvp without metric3d_zip while Metric3D is still
