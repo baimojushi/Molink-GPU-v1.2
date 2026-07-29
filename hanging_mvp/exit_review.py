@@ -173,7 +173,7 @@ def review_hardpaste_exit(image_rgb, candidate: Mapping[str, Any], rules: Mappin
             "reasons": ["vlm_review_disabled"],
         }
 
-    if not _vlm_configured():
+    if not _spatial_vlm_configured():
         approved = not (requires_review and block_unreviewed)
         return {
             "enabled": True,

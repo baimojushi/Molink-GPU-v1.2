@@ -1089,10 +1089,25 @@ def _infer_vlm_bbox_coordinate_space(objects, original_w, original_h, vlm_image_
     if not boxes:
         return 'original_pixels', debug
 
-    # Trust spatial expert VLM declared coordinate space
+    # Trust spatial expert VLM declared coordinate space.
+    # IMPORTANT: the VLM sees the resized sent image, not the original image.
+    # If sent_size differs from original_size, the VLM's pixel coordinates
+    # are in sent-image space and must be scaled back to original pixels.
     if vlm_image_meta and isinstance(vlm_image_meta, dict) and vlm_image_meta.get("_spatial_vlm_expert"):
         reported = vlm_image_meta.get("provider_reported_coordinate_space") or ""
         if reported in ("pixels", "original_pixels"):
+            reported_px = vlm_image_meta.get("provider_reported_image_size_px")
+            if (isinstance(reported_px, (list, tuple))
+                    and len(reported_px) >= 2
+                    and int(reported_px[0]) > 0 and int(reported_px[1]) > 0
+                    and (int(reported_px[0]) != int(original_w) or int(reported_px[1]) != int(original_h))):
+                # VLM saw a resized image (sent_size != original_size);
+                # VLM's pixel coordinates are in sent-image space.
+                debug["reason"] = "spatial_vlm_expert_trusted_sent_image_pixels"
+                debug["provider_reported_coordinate_space"] = reported
+                debug["provider_reported_image_size_px"] = list(reported_px)
+                debug["sent_size"] = list(reported_px)
+                return "sent_image_pixels", debug
             debug["reason"] = "spatial_vlm_expert_trusted"
             debug["provider_reported_coordinate_space"] = reported
             return "original_pixels", debug
@@ -1131,6 +1146,30 @@ def _infer_vlm_bbox_coordinate_space(objects, original_w, original_h, vlm_image_
             'scale_y_to_original': float(original_h),
         })
         return 'normalized_0_1', debug
+    # Trust provider-declared pixel coordinates when all bbox values are
+    # consistent with the reported image dimensions.  This handles the case
+    # where a general (non-spatial-expert) VLM returns correct pixel coordinates
+    # but the multi-hypothesis test fails due to coincidental grid alignment.
+    if (vlm_image_meta
+            and isinstance(vlm_image_meta, dict)
+            and vlm_image_meta.get("provider_reported_coordinate_space") in ("pixels", "original_pixels")):
+        reported_size = vlm_image_meta.get("provider_reported_image_size_px")
+        if (isinstance(reported_size, (list, tuple))
+                and len(reported_size) >= 2
+                and int(reported_size[0]) == int(original_w)
+                and int(reported_size[1]) == int(original_h)
+                and min_x >= 0 and min_y >= 0
+                and max_x <= int(original_w)
+                and max_y <= int(original_h)):
+            debug.update({
+                'source_coordinate_space': 'original_pixels',
+                'reason': 'provider_declared_pixels_consistent',
+                'provider_reported_coordinate_space': vlm_image_meta.get("provider_reported_coordinate_space"),
+                'scale_x_to_original': float(original_w),
+                'scale_y_to_original': float(original_h),
+            })
+            return 'original_pixels', debug
+
 
     # Evaluate the known mixed-sentinel failure family before the legacy
     # max-coordinate heuristics below.  A global maximum cannot identify a
@@ -1480,12 +1519,14 @@ def _normalize_vlm_bbox_to_original_pixels(bbox, original_w, original_h, coordin
             sent_h = float(sent_size[1]) if isinstance(sent_size, (list, tuple)) and len(sent_size) >= 2 else float(original_h)
         except Exception:
             sent_w, sent_h = float(original_w), float(original_h)
+        print(f"[NORM-DEBUG] sent_image_pixels: bbox_raw=[{x1},{y1},{x2},{y2}] orig=[{original_w},{original_h}] sent=[{sent_w},{sent_h}] has_meta={bool(vlm_image_meta)} sent_size_in_meta={sent_size}", flush=True)
         box = [
             x1 / max(1.0, sent_w) * float(original_w),
             y1 / max(1.0, sent_h) * float(original_h),
             x2 / max(1.0, sent_w) * float(original_w),
             y2 / max(1.0, sent_h) * float(original_h),
         ]
+        print(f"[NORM-DEBUG] result box=[{box[0]:.2f},{box[1]:.2f},{box[2]:.2f},{box[3]:.2f}]", flush=True)
     else:
         box = [x1, y1, x2, y2]
     return _clip_box_xyxy(box, original_w, original_h)

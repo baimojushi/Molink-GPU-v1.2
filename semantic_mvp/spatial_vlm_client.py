@@ -56,7 +56,7 @@ def call_spatial_vlm(
             },
         ],
     }
-    headers = {"Authorization": f"Bearer {cfg[chr(34) + chr(97) + chr(112) + chr(105) + chr(95) + chr(107) + chr(101) + chr(121) + chr(34)]}", "Content-Type": "application/json"}
+    headers = {"Authorization": f"Bearer {cfg[chr(97) + chr(112) + chr(105) + chr(95) + chr(107) + chr(101) + chr(121)]}", "Content-Type": "application/json"}
     resp = requests.post(cfg["api_url"], headers=headers, json=payload, timeout=cfg["timeout"])
     resp.raise_for_status()
     data = resp.json()

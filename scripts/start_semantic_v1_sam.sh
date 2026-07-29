@@ -1,5 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
+
+# Load production environment and export VLM variables
+if [ -f /etc/molink/gpu.env ]; then
+    source /etc/molink/gpu.env
+    export VLM_PROVIDER VLM_API_URL VLM_API_KEY VLM_MODEL
+    export SPATIAL_VLM_API_URL SPATIAL_VLM_API_KEY SPATIAL_VLM_MODEL SPATIAL_VLM_TIMEOUT_S
+    export API_KEY ALLOW_UNAUTH_LOCAL
+fi
+
 source /root/miniconda3/etc/profile.d/conda.sh 2>/dev/null || source ~/miniconda3/etc/profile.d/conda.sh
 conda activate "${CONDA_ENV:-metric3d}"
 cd "${ROOT:-/opt/molink/hanging}"

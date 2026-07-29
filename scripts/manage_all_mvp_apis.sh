@@ -7,6 +7,8 @@ LOG_DIR="$ROOT/logs"
 PID_DIR="$ROOT/run"
 mkdir -p "$LOG_DIR" "$PID_DIR"
 
+# Load production environment first, then local overrides
+[ -f /etc/molink/gpu.env ] && source /etc/molink/gpu.env
 [ -f "$ROOT/.env.local" ] && source "$ROOT/.env.local"
 
 # name|port|health|fallback-start-scripts|kind
@@ -455,12 +457,13 @@ do_status() {
 
 do_logs() {
   local lines="${MVP_LOG_LINES:-120}"
-  touch "$LOG_DIR/metric3d.log" "$LOG_DIR/semantic.log" "$LOG_DIR/hanging.log"
-  echo "[logs] tail -F three-service logs. Press Ctrl-C to stop watching; services keep running."
+  touch "$LOG_DIR/metric3d.log" "$LOG_DIR/semantic.log" "$LOG_DIR/hanging.log" "$LOG_DIR/worker.log"
+  echo "[logs] tail -F four-service logs (metric3d/semantic/hanging/worker). Press Ctrl-C to stop watching; services keep running."
   tail -n "$lines" -F \
     "$LOG_DIR/metric3d.log" \
     "$LOG_DIR/semantic.log" \
-    "$LOG_DIR/hanging.log"
+    "$LOG_DIR/hanging.log" \
+    "$LOG_DIR/worker.log"
 }
 
 case "$ACTION" in
