@@ -40,14 +40,17 @@ def _extract_json(text: str) -> dict[str, Any]:
     return data
 
 
-def _vlm_configured() -> bool:
-    return bool(os.getenv("VLM_API_URL", "").strip() and os.getenv("VLM_API_KEY", "").strip() and os.getenv("VLM_MODEL", "").strip())
-
-
-def _call_openai_compatible_review(image_rgb, candidate: Mapping[str, Any]) -> dict[str, Any]:
-    api_url = os.getenv("VLM_API_URL", "").strip()
-    api_key = os.getenv("VLM_API_KEY", "").strip()
-    model = os.getenv("VLM_MODEL", "").strip()
+def _spatial_vlm_configured() -> bool:
+    url = os.getenv("SPATIAL_VLM_API_URL", "").strip() or os.getenv("VLM_API_URL", "").strip()
+    key = os.getenv("SPATIAL_VLM_API_KEY", "").strip() or os.getenv("VLM_API_KEY", "").strip()
+    model = os.getenv("SPATIAL_VLM_MODEL", "").strip() or os.getenv("VLM_MODEL", "").strip()
+    return bool(url and key and model)
+    api_url = os.getenv("SPATIAL_VLM_API_URL", "").strip() or os.getenv("VLM_API_URL", "").strip()
+    api_key = os.getenv("SPATIAL_VLM_API_KEY", "").strip() or os.getenv("VLM_API_KEY", "").strip()
+    model = os.getenv("SPATIAL_VLM_MODEL", "").strip() or os.getenv("VLM_MODEL", "").strip()
+    api_url = os.getenv("SPATIAL_VLM_API_URL", "").strip()
+    api_key = os.getenv("SPATIAL_VLM_API_KEY", "").strip()
+    model = os.getenv("SPATIAL_VLM_MODEL", "").strip()
     prompt = {
         "task": "Review whether this hard-pasted artwork placement is safe to send to final photorealistic Flux rendering.",
         "candidate": {
@@ -88,7 +91,7 @@ def _call_openai_compatible_review(image_rgb, candidate: Mapping[str, Any]) -> d
         ],
     }
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    resp = requests.post(api_url, headers=headers, json=payload, timeout=float(os.getenv("VLM_TIMEOUT_S", "120")))
+    resp = requests.post(api_url, headers=headers, json=payload, timeout=float(os.getenv("SPATIAL_VLM_TIMEOUT_S", "120")))
     resp.raise_for_status()
     text = resp.json()["choices"][0]["message"]["content"]
     return _extract_json(text)
@@ -170,7 +173,7 @@ def review_hardpaste_exit(image_rgb, candidate: Mapping[str, Any], rules: Mappin
             "reasons": ["vlm_review_disabled"],
         }
 
-    if not _vlm_configured():
+    if not _spatial_vlm_configured():
         approved = not (requires_review and block_unreviewed)
         return {
             "enabled": True,
@@ -181,7 +184,7 @@ def review_hardpaste_exit(image_rgb, candidate: Mapping[str, Any], rules: Mappin
             "approved": approved,
             "approved_for_flux_render": approved,
             "confidence": None,
-            "reasons": ["VLM_API_URL, VLM_API_KEY and VLM_MODEL are not all configured"],
+            "reasons": ["SPATIAL_VLM_API_URL, SPATIAL_VLM_API_KEY and SPATIAL_VLM_MODEL are not all configured"],
         }
 
     try:

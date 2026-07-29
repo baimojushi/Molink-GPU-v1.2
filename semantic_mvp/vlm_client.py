@@ -24,6 +24,62 @@ from .prompts import (
 _MIME_MAP = {"jpeg": "image/jpeg", "jpg": "image/jpeg", "png": "image/png", "webp": "image/webp", "gif": "image/gif"}
 _VLM_MAX_IMAGE_SIDE = int(os.getenv("VLM_MAX_IMAGE_SIDE", "2048"))
 
+
+def _bbox_coordinate_contract_for_model(model: str) -> tuple[str | None, str]:
+    """Return a model-family coordinate hint and a prompt suffix.
+
+    Qwen3-VL grounding is trained on a relative 1000x1000 coordinate grid.
+    Asking that family for request-image pixels can produce a contradictory
+    payload (``coordinate_space=pixels`` with 0..1000 values), which shifts
+    every box toward the upper-left when downstream code treats the numbers as
+    pixels.  Keep the convention explicit and auditable.
+
+    ``VLM_BBOX_COORDINATE_MODE`` / ``SPATIAL_VLM_BBOX_COORDINATE_MODE`` can
+    override auto-detection for gateways that rename or fine-tune a model.
+    """
+    override = (
+        os.getenv("SPATIAL_VLM_BBOX_COORDINATE_MODE", "").strip().lower()
+        or os.getenv("VLM_BBOX_COORDINATE_MODE", "").strip().lower()
+    )
+    aliases = {
+        "grid": "normalized_0_1000",
+        "1000": "normalized_0_1000",
+        "relative_1000": "normalized_0_1000",
+        "normalized_1000": "normalized_0_1000",
+        "normalized_0_1000": "normalized_0_1000",
+        "pixels": "pixels",
+        "absolute_pixels": "pixels",
+        "auto": "auto",
+        "": "auto",
+    }
+    selected = aliases.get(override, override)
+    model_norm = str(model or "").strip().lower()
+    if selected == "auto":
+        # Qwen3 / Qwen3-VL families use relative 0..1000 grounding
+        # coordinates.  Qwen2.5-VL is intentionally not included because it
+        # uses absolute coordinates on the model-resized image.
+        if re.search(r"(?:^|[/_.-])qwen[-_ ]?3(?:[./_-]|$)", model_norm) or "qwen3." in model_norm:
+            selected = "normalized_0_1000"
+        else:
+            selected = "pixels"
+
+    if selected == "normalized_0_1000":
+        suffix = (
+            "\n\nBOUNDING-BOX COORDINATE CONTRACT (authoritative):\n"
+            "- Return every bbox_xyxy on a relative 1000 x 1000 grid, independent of image resolution.\n"
+            "- x values are in [0,1000] from left to right; y values are in [0,1000] from top to bottom.\n"
+            "- Set coordinate_space to exactly \"normalized_0_1000\".\n"
+            "- Set image_size_px to [1000,1000] because it describes the coordinate canvas, not the uploaded bitmap.\n"
+            "- Do not mix pixel coordinates, resized-image dimensions, or edge sentinels with the 0..1000 grid.\n"
+        )
+        return selected, suffix
+    return "pixels", ""
+
+
+def _augment_bbox_prompt_for_model(user_text: str, model: str) -> tuple[str, str | None]:
+    hint, suffix = _bbox_coordinate_contract_for_model(model)
+    return str(user_text or "") + suffix, hint
+
 def _detect_mime(image_bytes: bytes) -> str:
     # imghdr was removed in Python 3.13.  Use PIL for the small set of formats
     # sent to VLM providers and fall back to JPEG for unknown bytes.
@@ -105,6 +161,7 @@ def call_openai_compatible_with_prompts(
     user_text: str,
     *,
     timeout: int = 120,
+    bbox_coordinate_task: bool = False,
 ) -> Dict[str, Any]:
     api_url = os.getenv("VLM_API_URL", "").strip()
     api_key = os.getenv("VLM_API_KEY", "").strip()
@@ -112,7 +169,16 @@ def call_openai_compatible_with_prompts(
     if not api_url or not api_key or not model:
         raise RuntimeError("VLM_API_URL, VLM_API_KEY and VLM_MODEL are required for openai_compatible mode")
 
+    coordinate_hint = None
+    effective_user_text = user_text
+    if bbox_coordinate_task:
+        effective_user_text, coordinate_hint = _augment_bbox_prompt_for_model(user_text, model)
+
     resized, vlm_image_meta = _resize_image_with_meta(image_bytes, _VLM_MAX_IMAGE_SIDE)
+    vlm_image_meta["provider_model"] = model
+    if coordinate_hint:
+        vlm_image_meta["bbox_coordinate_hint"] = coordinate_hint
+        vlm_image_meta["bbox_coordinate_contract_version"] = "model_family_grounding_contract_v2"
     data_url = image_to_data_url(resized)
     payload = {
         "model": model,
@@ -122,7 +188,7 @@ def call_openai_compatible_with_prompts(
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": user_text},
+                    {"type": "text", "text": effective_user_text},
                     {"type": "image_url", "image_url": {"url": data_url}},
                 ],
             },
@@ -145,7 +211,7 @@ def call_openai_compatible_with_prompts(
             "provider": "openai_compatible",
             "model": model,
             "provider_request_id": data.get("id") or resp.headers.get("x-request-id") or resp.headers.get("request-id"),
-            "prompt_sha256": hashlib.sha256((system_text + "\n" + user_text).encode("utf-8")).hexdigest(),
+            "prompt_sha256": hashlib.sha256((system_text + "\n" + effective_user_text).encode("utf-8")).hexdigest(),
             "provider_message_sha256": hashlib.sha256(str(text).encode("utf-8")).hexdigest(),
         }
     return result
@@ -160,6 +226,7 @@ def call_openai_compatible(image_bytes: bytes, scene_profile: str, width: int, h
         image_bytes,
         system_prompt(scene_profile),
         user_prompt(scene_profile, int(sent_w), int(sent_h)),
+        bbox_coordinate_task=True,
     )
 
 

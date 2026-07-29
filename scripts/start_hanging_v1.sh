@@ -21,6 +21,12 @@ export PYTHONPATH="$ROOT:${PYTHONPATH:-}"
 
 # Optional BFL/VLM env. The hanging service does not call BFL, but the exit gate
 # may reuse VLM env vars and downstream scripts share the same env file.
+if [ -f /etc/molink/gpu.env ]; then
+  source /etc/molink/gpu.env
+  export VLM_PROVIDER VLM_API_URL VLM_API_KEY VLM_MODEL
+  export SPATIAL_VLM_API_URL SPATIAL_VLM_API_KEY SPATIAL_VLM_MODEL SPATIAL_VLM_TIMEOUT_S
+  export API_KEY ALLOW_UNAUTH_LOCAL
+fi
 if [ -f "$ROOT/.env.bfl" ]; then
   # shellcheck disable=SC1091
   source "$ROOT/.env.bfl"

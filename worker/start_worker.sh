@@ -9,6 +9,9 @@ set -a
 [ -f /etc/profile.d/molink-gpu.sh ] && source /etc/profile.d/molink-gpu.sh
 [ -f /etc/molink/gpu.env ] && source /etc/molink/gpu.env
 set +a
+# Activate metric3d conda environment (symlink: /home/molink/miniconda3 -> /opt/miniconda3)
+[ -f ~/miniconda3/etc/profile.d/conda.sh ] && source ~/miniconda3/etc/profile.d/conda.sh && conda activate metric3d
+
 
 # 强制使用 Pro ID 复现
 export AUTODL_INSTANCE_ID="${MANUAL_INSTANCE_ID:-${AUTODL_INSTANCE_ID:-pro-7818bc0d0a9d}}"
