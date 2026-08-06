@@ -1534,6 +1534,10 @@ def estimate_wall_horizontal_structure_direction(
             "canny_thresholds": [canny_low, canny_high],
         }
 
+    # OpenCV >= 5 returns HoughLinesP as (N, 4); OpenCV 4 returned (N, 1, 4).
+    if np.asarray(detected).ndim == 2:
+        detected = np.asarray(detected)[:, None, :]
+
     K = _camera_matrix(intr)
     expected_u = normalize(np.asarray(expected_u_cam, dtype=np.float32).reshape(3)).astype(np.float64)
     g_hat = normalize(np.asarray(g_hat_cam, dtype=np.float32).reshape(3)).astype(np.float64)
