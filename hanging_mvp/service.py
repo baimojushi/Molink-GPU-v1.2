@@ -38,7 +38,7 @@ from .support_context import (
     evaluate_projection_shape_gate,
 )
 from .response_assets import _png_bytes, _draw_overlay, _zip_response
-from .exit_review import review_hardpaste_exit
+from .exit_review import hardpaste_review_runtime_status, review_hardpaste_exit, summarize_hardpaste_review_failures
 from .flux_export import (
     build_flux2_edit_mask, build_remove_mask_for_hardpaste, build_render_prompt, resize_mask_to_original,
     safe_asset_id, select_flux_manifest_items, select_public_candidate_after_exit_gate,
@@ -67,7 +67,7 @@ except Exception:  # pragma: no cover - causal layer is optional at runtime
 API_KEY = os.getenv("API_KEY", "")
 ALLOW_UNAUTH_LOCAL = os.getenv("ALLOW_UNAUTH_LOCAL", "").strip().lower() in {"1", "true", "yes", "on"}
 PORT = int(os.getenv("HANGING_MVP_PORT", "6010"))
-HANGING_PIPELINE_BUILD_ID = "2026-07-23-semantic-art-plane-peel-consensus-v21"
+HANGING_PIPELINE_BUILD_ID = "2026-07-30-hardpaste-exit-review-runtime-repair-v28"
 
 
 def _truthy_env(name: str, default: str = "0") -> bool:
@@ -1310,6 +1310,8 @@ def health():
     return {
         "status": "ok",
         "api": "hanging-art-mvp-geometry-api",
+        "pipeline_build": HANGING_PIPELINE_BUILD_ID,
+        "hardpaste_exit_review": hardpaste_review_runtime_status(),
         "cleanup": {
             "enabled": True,
             "stage": "candidate_wall_cleanup_then_render",
@@ -4589,10 +4591,29 @@ async def analyze_hanging_mvp(
     selected = select_public_candidate_after_exit_gate(candidates, final_hardpaste_assets)
     selected_requires_hardpaste_vlm_review = bool(selected and selected.get("requires_hardpaste_vlm_review"))
     selected_exit_code = "OK_SELECTED_VLM_REVIEWED" if selected_requires_hardpaste_vlm_review else "OK_SELECTED"
+    exit_review_failure = summarize_hardpaste_review_failures(all_hardpaste_reviews)
+    if selected:
+        final_exit_code = selected_exit_code
+        final_status = "ok"
+    elif exit_review_failure:
+        # Geometry produced candidates, but review infrastructure failed.  This
+        # is a program failure, not a service decision that the wall is unsafe.
+        final_exit_code = str(exit_review_failure["exit_code"])
+        final_status = "failed"
+    elif candidates:
+        final_exit_code = "PARTIAL_NO_FLUX_APPROVED_CANDIDATE"
+        final_status = "partial"
+    elif near_miss_candidates:
+        final_exit_code = "PARTIAL_REVIEW_CANDIDATES_ONLY"
+        final_status = "partial"
+    else:
+        final_exit_code = "PARTIAL_ALL_REJECTED_WITH_REASONS"
+        final_status = "partial"
 
     plan = {
-        "status": "ok" if selected else "partial",
-        "exit_code": selected_exit_code if selected else ("PARTIAL_NO_FLUX_APPROVED_CANDIDATE" if candidates else ("PARTIAL_REVIEW_CANDIDATES_ONLY" if near_miss_candidates else "PARTIAL_ALL_REJECTED_WITH_REASONS")),
+        "status": final_status,
+        "exit_code": final_exit_code,
+        "exit_review_failure": exit_review_failure,
         "pipeline_build": {
             "build_id": HANGING_PIPELINE_BUILD_ID,
             "height_contract": "metric_height_authoritative_exact_footprint_v3",

@@ -540,6 +540,9 @@ def build_client_result(
         "status": plan.get("status"),
         "exit_code": plan.get("exit_code"),
         "pipeline_build": plan.get("pipeline_build"),
+        # Public-safe infrastructure classification.  Raw provider exceptions
+        # remain in diagnostic artifacts and are never copied to the business payload.
+        "exit_review_failure": plan.get("exit_review_failure"),
         "public_candidate_policy": "final_manifest_approved_for_flux_render_only" if isinstance(final_manifest_items, list) else "legacy_ranked_candidates",
         "best_plan": plans[0] if plans else None,
         "alternative_plans": plans[1:],
